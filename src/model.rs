@@ -367,6 +367,21 @@ pub struct SearchRegionSpec {
     pub height: u32,
 }
 
+impl SearchRegionSpec {
+    /// Rescales the region from its reference resolution to the actual one.
+    pub fn scaled(self, from_width: u32, from_height: u32, to_width: u32, to_height: u32) -> Self {
+        let scale = |value: u32, from: u32, to: u32| {
+            (u64::from(value) * u64::from(to) / u64::from(from.max(1))) as u32
+        };
+        Self {
+            x: scale(self.x, from_width, to_width),
+            y: scale(self.y, from_height, to_height),
+            width: scale(self.width, from_width, to_width).max(1),
+            height: scale(self.height, from_height, to_height).max(1),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MacroProfile {
     pub name: String,
@@ -664,6 +679,26 @@ mod tests {
         let profile: MacroProfile = serde_json::from_value(value).unwrap();
         assert_eq!(profile.sharing.game_language, "简体中文");
         assert!(profile.sharing.author.is_empty());
+    }
+
+    #[test]
+    fn search_region_scales_proportionally() {
+        let region = SearchRegionSpec {
+            x: 640,
+            y: 360,
+            width: 320,
+            height: 180,
+        };
+        let scaled = region.scaled(1280, 720, 1920, 1080);
+        assert_eq!(
+            scaled,
+            SearchRegionSpec {
+                x: 960,
+                y: 540,
+                width: 480,
+                height: 270,
+            }
+        );
     }
 
     #[test]

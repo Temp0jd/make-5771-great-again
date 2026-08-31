@@ -34,16 +34,30 @@ impl TemplateMatch {
     }
 }
 
+/// Diagnostic result of a template search: the threshold-passing match (if
+/// any) plus the highest similarity seen anywhere, for timeout diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MatchReport {
+    pub matched: Option<TemplateMatch>,
+    /// Best similarity seen in the region even below the threshold; positions
+    /// rejected by the coarse pass contribute their sampled estimate.
+    pub best_score: f32,
+}
+
 /// Finds the closest grayscale template using mean absolute pixel similarity.
 ///
 /// The workflow editor encourages a tight search region, so this deliberately
 /// favors a compact pure-Rust implementation over a large native CV runtime.
-pub fn find_template(
+pub fn find_template_report(
     frame: &GrayImage,
     template: &GrayImage,
     region: SearchRegion,
     threshold: f32,
-) -> Option<TemplateMatch> {
+) -> MatchReport {
+    let empty = MatchReport {
+        matched: None,
+        best_score: 0.0,
+    };
     if template.width() == 0
         || template.height() == 0
         || region.width < template.width()
@@ -51,7 +65,7 @@ pub fn find_template(
         || region.x.saturating_add(region.width) > frame.width()
         || region.y.saturating_add(region.height) > frame.height()
     {
-        return None;
+        return empty;
     }
 
     let threshold = threshold.clamp(0.0, 1.0);
@@ -63,10 +77,13 @@ pub fn find_template(
     let max_y = region.y + region.height - template.height();
     let mut best: Option<TemplateMatch> = None;
     let mut best_diff = u64::MAX;
+    let mut best_score = 0.0_f32;
 
     for y in region.y..=max_y {
         for x in region.x..=max_x {
-            if !passes_coarse_check(frame, template, x, y, threshold) {
+            let coarse = coarse_score(frame, template, x, y);
+            best_score = best_score.max(coarse);
+            if coarse + 0.06 < threshold {
                 continue;
             }
             let abort_at = max_diff.saturating_add(1).min(best_diff);
@@ -74,6 +91,7 @@ pub fn find_template(
                 continue;
             };
             let score = 1.0 - difference as f32 / (pixel_count as f32 * 255.0);
+            best_score = best_score.max(score);
             best_diff = difference;
             best = Some(TemplateMatch {
                 x,
@@ -85,16 +103,13 @@ pub fn find_template(
         }
     }
 
-    best
+    MatchReport {
+        matched: best,
+        best_score,
+    }
 }
 
-fn passes_coarse_check(
-    frame: &GrayImage,
-    template: &GrayImage,
-    origin_x: u32,
-    origin_y: u32,
-    threshold: f32,
-) -> bool {
+fn coarse_score(frame: &GrayImage, template: &GrayImage, origin_x: u32, origin_y: u32) -> f32 {
     // Keep the cheap rejection pass near a fixed sample budget even when the
     // selected template is large. This is the main guard against high CPU use.
     let pixel_count = template.width() as usize * template.height() as usize;
@@ -111,8 +126,7 @@ fn passes_coarse_check(
         }
     }
 
-    let score = 1.0 - difference as f32 / (samples.max(1) as f32 * 255.0);
-    score + 0.06 >= threshold
+    1.0 - difference as f32 / (samples.max(1) as f32 * 255.0)
 }
 
 /// Returns the summed absolute pixel difference at `origin`, bailing out as
@@ -159,7 +173,8 @@ mod tests {
     #[test]
     fn finds_exact_template_and_center() {
         let (frame, template) = synthetic_frame();
-        let found = find_template(&frame, &template, SearchRegion::full(&frame), 0.99)
+        let found = find_template_report(&frame, &template, SearchRegion::full(&frame), 0.99)
+            .matched
             .expect("template should match");
 
         assert_eq!((found.x, found.y), (6, 4));
@@ -177,7 +192,11 @@ mod tests {
             height: 5,
         };
 
-        assert!(find_template(&frame, &template, region, 0.99).is_none());
+        assert!(
+            find_template_report(&frame, &template, region, 0.99)
+                .matched
+                .is_none()
+        );
     }
 
     #[test]
@@ -191,7 +210,11 @@ mod tests {
             height: 2,
         };
 
-        assert!(find_template(&frame, &template, region, 0.8).is_none());
+        assert!(
+            find_template_report(&frame, &template, region, 0.8)
+                .matched
+                .is_none()
+        );
     }
 
     #[test]
@@ -206,9 +229,25 @@ mod tests {
             }
         }
 
-        let found = find_template(&frame, &template, SearchRegion::full(&frame), 0.5)
+        let found = find_template_report(&frame, &template, SearchRegion::full(&frame), 0.5)
+            .matched
             .expect("exact match should be selected");
         assert_eq!((found.x, found.y), (10, 5));
         assert_eq!(found.score, 1.0);
+    }
+
+    #[test]
+    fn report_exposes_best_score_below_threshold() {
+        let (mut frame, template) = synthetic_frame();
+        // Degrade the only match so it lands below a strict threshold.
+        frame.put_pixel(6, 4, Luma([15]));
+        let report = find_template_report(&frame, &template, SearchRegion::full(&frame), 0.99);
+
+        assert!(report.matched.is_none());
+        assert!(
+            report.best_score > 0.9,
+            "best score was {}",
+            report.best_score
+        );
     }
 }

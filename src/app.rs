@@ -1,6 +1,7 @@
 use chrono::Local;
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Stroke, Vec2};
 
+use crate::mascot::Mascots;
 use crate::model::{
     AppTab, BranchAction, BranchActionKind, BranchOutcome, ClickMethod, ConditionExpectation,
     ConditionMatchMode, ConditionOutcome, LogEntry, LogLevel, LoopMode, MacroProfile, RunnerStatus,
@@ -36,6 +37,13 @@ impl NewFlowPreset {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    None,
+    Completed,
+    Failed,
+}
+
 pub struct Make5771App {
     active_tab: AppTab,
     profile: MacroProfile,
@@ -54,6 +62,8 @@ pub struct Make5771App {
     run_started_at: Option<std::time::Instant>,
     last_round_at: Option<std::time::Instant>,
     round_durations: std::collections::VecDeque<u64>,
+    last_run_outcome: RunOutcome,
+    mascots: Mascots,
     countdown_capture_at: Option<std::time::Instant>,
     pending_capture: Option<image::RgbaImage>,
     capture_purpose: CapturePurpose,
@@ -70,6 +80,13 @@ pub struct Make5771App {
     import_confirm_open: bool,
     pending_import_path: Option<std::path::PathBuf>,
     pending_delete_template: Option<u64>,
+    current_profile_path: std::path::PathBuf,
+    profiles_cache: Vec<std::path::PathBuf>,
+    selected_profile: Option<std::path::PathBuf>,
+    pending_open_profile: Option<std::path::PathBuf>,
+    pending_delete_profile: Option<std::path::PathBuf>,
+    save_as_open: bool,
+    save_as_name: String,
 }
 
 impl Make5771App {
@@ -114,6 +131,8 @@ impl Make5771App {
             run_started_at: None,
             last_round_at: None,
             round_durations: std::collections::VecDeque::new(),
+            last_run_outcome: RunOutcome::None,
+            mascots: Mascots::new(&cc.egui_ctx),
             countdown_capture_at: None,
             pending_capture: None,
             capture_purpose: CapturePurpose::NewTemplate,
@@ -130,6 +149,13 @@ impl Make5771App {
             import_confirm_open: false,
             pending_import_path: None,
             pending_delete_template: None,
+            current_profile_path: storage::default_profile_path(),
+            profiles_cache: storage::list_profiles(),
+            selected_profile: Some(storage::default_profile_path()),
+            pending_open_profile: None,
+            pending_delete_profile: None,
+            save_as_open: false,
+            save_as_name: String::new(),
         };
         if let Some(target) = &app.target_window {
             app.push_log(
@@ -171,7 +197,7 @@ impl Make5771App {
                     )
                 } else {
                     format!(
-                        "已连接，但客户区为 {} × {}；流程要求 {} × {}",
+                        "已连接，但客户区为 {} × {}；流程基准为 {} × {}，运行时将按比例缩放模板",
                         target.client_width,
                         target.client_height,
                         self.profile.expected_client_width,
@@ -245,7 +271,7 @@ impl Make5771App {
             },
             message,
         );
-        if let Err(error) = storage::save_profile(&storage::default_profile_path(), &self.profile) {
+        if let Err(error) = storage::save_profile(&self.current_profile_path, &self.profile) {
             self.push_log(LogLevel::Warning, format!("窗口选择未能写入配置：{error}"));
         }
     }
@@ -369,6 +395,7 @@ impl Make5771App {
                     self.run_started_at = Some(std::time::Instant::now());
                     self.last_round_at = self.run_started_at;
                     self.round_durations.clear();
+                    self.last_run_outcome = RunOutcome::None;
                     self.push_log(LogLevel::Success, "流程已开始运行");
                 }
                 RunnerEvent::StepChanged(name) => {
@@ -393,6 +420,7 @@ impl Make5771App {
                 RunnerEvent::TargetReconnected(title) => {
                     self.push_log(LogLevel::Success, format!("已重新连接游戏窗口：{title}"))
                 }
+                RunnerEvent::Notice(message) => self.push_log(LogLevel::Info, message),
                 RunnerEvent::Paused(reason) => {
                     self.runner_status = RunnerStatus::Paused;
                     self.push_log(LogLevel::Warning, reason);
@@ -416,6 +444,7 @@ impl Make5771App {
                     self.runner_status = RunnerStatus::Ready;
                     self.current_step = "等待开始".to_owned();
                     self.run_started_at = None;
+                    self.last_run_outcome = RunOutcome::Completed;
                     self.push_log(LogLevel::Info, format!("流程已停止：{reason}"));
                     self.notify_run_finished("流程已停止", &reason);
                     runner_finished = true;
@@ -424,6 +453,7 @@ impl Make5771App {
                     self.runner_status = RunnerStatus::Ready;
                     self.current_step = "运行失败".to_owned();
                     self.run_started_at = None;
+                    self.last_run_outcome = RunOutcome::Failed;
                     self.toast = Some(error.clone());
                     self.push_log(LogLevel::Warning, format!("运行失败：{error}"));
                     self.notify_run_finished("运行失败", &error);
@@ -496,7 +526,7 @@ impl Make5771App {
             self.toast = Some("待测试的模板不存在".to_owned());
             return;
         };
-        let template = match image::open(&template_asset.path) {
+        let mut template = match image::open(&template_asset.path) {
             Ok(image) => image.into_luma8(),
             Err(error) => {
                 let message = format!("无法读取模板图片：{error}");
@@ -506,12 +536,40 @@ impl Make5771App {
             }
         };
         let frame_gray = image::imageops::grayscale(&frame);
-        let search_region = template_asset
-            .search_region
-            .filter(|_| {
-                template_asset.reference_width == frame.width()
-                    && template_asset.reference_height == frame.height()
-            })
+        // Templates captured at another resolution are scaled to the frame,
+        // matching what the runner does at run time.
+        let reference_width = if template_asset.reference_width > 0 {
+            template_asset.reference_width
+        } else {
+            frame.width()
+        };
+        let reference_height = if template_asset.reference_height > 0 {
+            template_asset.reference_height
+        } else {
+            frame.height()
+        };
+        let mut scaled_region = template_asset.search_region;
+        if reference_width != frame.width() || reference_height != frame.height() {
+            let scale = |value: u32, from: u32, to: u32| {
+                ((u64::from(value) * u64::from(to) + u64::from(from) / 2) / u64::from(from.max(1)))
+                    .max(1) as u32
+            };
+            template = image::imageops::resize(
+                &template,
+                scale(template_asset.width, reference_width, frame.width()),
+                scale(template_asset.height, reference_height, frame.height()),
+                image::imageops::FilterType::Triangle,
+            );
+            scaled_region = scaled_region.map(|region| {
+                region.scaled(
+                    reference_width,
+                    reference_height,
+                    frame.width(),
+                    frame.height(),
+                )
+            });
+        }
+        let search_region = scaled_region
             .map(|region| SearchRegion {
                 x: region.x,
                 y: region.y,
@@ -519,20 +577,21 @@ impl Make5771App {
                 height: region.height,
             })
             .unwrap_or_else(|| SearchRegion::full(&frame_gray));
-        let result = vision::find_template(
+        let report = vision::find_template_report(
             &frame_gray,
             &template,
             search_region,
             self.template_test_threshold,
         );
+        let result = report.matched;
         let log_message = match result {
             Some(found) => format!(
                 "模板“{}”匹配成功，相似度 {:.3}",
                 template_asset.name, found.score
             ),
             None => format!(
-                "模板“{}”未达到阈值 {:.2}",
-                template_asset.name, self.template_test_threshold
+                "模板“{}”未达到阈值 {:.2}（最佳相似度 {:.2}）",
+                template_asset.name, self.template_test_threshold, report.best_score
             ),
         };
         self.push_log(
@@ -550,6 +609,7 @@ impl Make5771App {
             search_region,
             result,
             self.template_test_threshold,
+            self.mascots.ramona_pro.clone(),
         ));
     }
 
@@ -615,8 +675,7 @@ impl Make5771App {
                         reference_height,
                     )),
                 });
-                if let Err(error) =
-                    storage::save_profile(&storage::default_profile_path(), &self.profile)
+                if let Err(error) = storage::save_profile(&self.current_profile_path, &self.profile)
                 {
                     self.push_log(
                         LogLevel::Warning,
@@ -651,8 +710,21 @@ impl Make5771App {
         }
     }
 
+    fn status_mascot(&self) -> &egui::TextureHandle {
+        match self.last_run_outcome {
+            RunOutcome::Completed => &self.mascots.luotan_easy,
+            RunOutcome::Failed => &self.mascots.kekesi_cry,
+            RunOutcome::None => match self.runner_status {
+                RunnerStatus::Ready => &self.mascots.ogier_salute,
+                RunnerStatus::Running => &self.mascots.wanda_work,
+                RunnerStatus::Paused => &self.mascots.turu_sleep,
+                RunnerStatus::Finishing => &self.mascots.agrippa_watch,
+            },
+        }
+    }
+
     fn save_profile(&mut self) {
-        let result = storage::save_profile(&storage::default_profile_path(), &self.profile);
+        let result = storage::save_profile(&self.current_profile_path, &self.profile);
 
         match result {
             Ok(()) => {
@@ -665,6 +737,87 @@ impl Make5771App {
             Err(error) => {
                 self.toast = Some(format!("保存失败：{error}"));
                 self.push_log(LogLevel::Warning, format!("保存失败：{error}"));
+            }
+        }
+    }
+
+    fn refresh_profiles(&mut self) {
+        self.profiles_cache = storage::list_profiles();
+        if self.selected_profile.is_none() {
+            self.selected_profile = Some(self.current_profile_path.clone());
+        }
+    }
+
+    fn open_profile(&mut self, path: &std::path::Path) {
+        if self.workflow_runner.is_some() {
+            self.toast = Some("请先停止当前运行的流程".to_owned());
+            return;
+        }
+        match storage::load_profile(path) {
+            Ok(profile) => {
+                self.profile = profile;
+                self.current_profile_path = path.to_path_buf();
+                self.selected_profile = Some(path.to_path_buf());
+                self.selected_step = self.profile.steps.first().map(|step| step.id);
+                self.target_window = platform::find_target_window(&self.profile.target_window).ok();
+                self.template_draft = None;
+                self.template_test_view = None;
+                let message = format!("已打开流程文件：{}", storage::profile_display_name(path));
+                self.toast = Some(message.clone());
+                self.push_log(LogLevel::Success, message);
+            }
+            Err(error) => {
+                let message = format!("打开流程失败：{error}");
+                self.toast = Some(message.clone());
+                self.push_log(LogLevel::Warning, message);
+            }
+        }
+    }
+
+    fn save_profile_as(&mut self) {
+        let name = safe_file_name(&self.save_as_name);
+        if name.is_empty() {
+            self.toast = Some("流程文件名不能为空".to_owned());
+            return;
+        }
+        let path = std::path::PathBuf::from(format!("profiles/{name}{}", storage::PROFILE_SUFFIX));
+        match storage::save_profile(&path, &self.profile) {
+            Ok(()) => {
+                self.current_profile_path = path.clone();
+                self.selected_profile = Some(path);
+                self.refresh_profiles();
+                let message = format!("已另存为流程文件：{name}");
+                self.toast = Some(message.clone());
+                self.push_log(LogLevel::Success, message);
+            }
+            Err(error) => {
+                let message = format!("另存失败：{error}");
+                self.toast = Some(message.clone());
+                self.push_log(LogLevel::Warning, message);
+            }
+        }
+    }
+
+    fn delete_profile_file(&mut self, path: &std::path::Path) {
+        if self.workflow_runner.is_some() {
+            self.toast = Some("请先停止当前运行的流程".to_owned());
+            return;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                if self.current_profile_path == path {
+                    self.current_profile_path = storage::default_profile_path();
+                }
+                self.selected_profile = None;
+                self.refresh_profiles();
+                let message = format!("已删除流程文件：{}", storage::profile_display_name(path));
+                self.toast = Some(message.clone());
+                self.push_log(LogLevel::Success, message);
+            }
+            Err(error) => {
+                let message = format!("删除流程文件失败：{error}");
+                self.toast = Some(message.clone());
+                self.push_log(LogLevel::Warning, message);
             }
         }
     }
@@ -695,7 +848,7 @@ impl Make5771App {
         if self.new_flow_preset == NewFlowPreset::Blank {
             profile.steps = vec![WorkflowStep::new(1, "新步骤", StepKind::WaitAndClick, 0)];
         }
-        match storage::save_profile(&storage::default_profile_path(), &profile) {
+        match storage::save_profile(&self.current_profile_path, &profile) {
             Ok(()) => {
                 let profile_name = profile.name.clone();
                 self.profile = profile;
@@ -740,9 +893,7 @@ impl Make5771App {
         };
         match storage::import_workflow_package(&path) {
             Ok((profile, summary)) => {
-                if let Err(error) =
-                    storage::save_profile(&storage::default_profile_path(), &profile)
-                {
+                if let Err(error) = storage::save_profile(&self.current_profile_path, &profile) {
                     self.toast = Some(format!("导入后保存失败：{error}"));
                     self.push_log(LogLevel::Warning, format!("导入后保存失败：{error}"));
                     return;
@@ -826,7 +977,7 @@ impl Make5771App {
             .templates
             .retain(|candidate| candidate.id != template_id);
         clear_template_references(&mut updated, &template.path);
-        if let Err(error) = storage::save_profile(&storage::default_profile_path(), &updated) {
+        if let Err(error) = storage::save_profile(&self.current_profile_path, &updated) {
             self.toast = Some(format!("删除模板失败：{error}"));
             self.push_log(LogLevel::Warning, format!("删除模板失败：{error}"));
             return;
@@ -885,17 +1036,26 @@ impl Make5771App {
                 .min(ui.available_width());
             let (drag_rect, drag) =
                 ui.allocate_exact_size(Vec2::new(drag_width, 44.0), Sense::click_and_drag());
+            ui.painter().image(
+                self.mascots.keeper_hi.id(),
+                egui::Rect::from_center_size(
+                    drag_rect.left_center() + Vec2::new(19.0, 0.0),
+                    Vec2::splat(34.0),
+                ),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
             ui.painter().text(
-                drag_rect.left_top(),
+                drag_rect.left_top() + Vec2::new(42.0, 0.0),
                 egui::Align2::LEFT_TOP,
                 "Make 5771 Great Again",
                 egui::FontId::proportional(22.0),
                 theme::LABEL,
             );
             ui.painter().text(
-                drag_rect.left_bottom() - Vec2::new(0.0, 1.0),
+                drag_rect.left_bottom() + Vec2::new(42.0, -1.0),
                 egui::Align2::LEFT_BOTTOM,
-                "Visual Workflow Studio",
+                "Mythag University · Keeper's Terminal",
                 egui::FontId::proportional(11.0),
                 theme::TERTIARY_LABEL,
             );
@@ -1090,6 +1250,9 @@ impl Make5771App {
                 ui.painter().circle_filled(rect.center(), 5.0, status_color);
                 ui.label(RichText::new(self.runner_status.label()).strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add(
+                        egui::Image::new(self.status_mascot()).fit_to_exact_size(Vec2::splat(64.0)),
+                    );
                     ui.label(
                         RichText::new(format!("已完成 {} 局", self.completed_rounds))
                             .color(theme::SECONDARY_LABEL),
@@ -1138,6 +1301,20 @@ impl Make5771App {
 
         ui.add_space(12.0);
         ui.vertical_centered(|ui| {
+            if self.runner_status == RunnerStatus::Ready
+                && self.last_run_outcome == RunOutcome::None
+            {
+                ui.add(
+                    egui::Image::new(&self.mascots.ramona_point)
+                        .fit_to_exact_size(Vec2::splat(72.0)),
+                );
+                ui.add_space(4.0);
+            } else if self.runner_status != RunnerStatus::Ready {
+                ui.add(
+                    egui::Image::new(&self.mascots.wincor_run).fit_to_exact_size(Vec2::splat(72.0)),
+                );
+                ui.add_space(4.0);
+            }
             let text = if self.runner_status == RunnerStatus::Ready {
                 "开始运行"
             } else {
@@ -1168,6 +1345,10 @@ impl Make5771App {
                 if ui.add(theme::primary_button("保存流程")).clicked() {
                     self.save_profile();
                 }
+                ui.add(
+                    egui::Image::new(&self.mascots.dexter_cheers)
+                        .fit_to_exact_size(Vec2::splat(44.0)),
+                );
             });
         });
         ui.horizontal(|ui| {
@@ -1185,6 +1366,46 @@ impl Make5771App {
                     .size(11.0)
                     .color(theme::TERTIARY_LABEL),
             );
+        });
+        ui.horizontal(|ui| {
+            ui.label("流程文件");
+            let profiles_cache = self.profiles_cache.clone();
+            let selected_label = self
+                .selected_profile
+                .as_ref()
+                .map(|path| storage::profile_display_name(path))
+                .unwrap_or_else(|| "未选择".to_owned());
+            egui::ComboBox::from_id_salt("profile-file")
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    for path in &profiles_cache {
+                        ui.selectable_value(
+                            &mut self.selected_profile,
+                            Some(path.clone()),
+                            storage::profile_display_name(path),
+                        );
+                    }
+                });
+            let has_selection = self.selected_profile.is_some();
+            if ui
+                .add_enabled(has_selection, egui::Button::new("打开"))
+                .clicked()
+            {
+                self.pending_open_profile = self.selected_profile.clone();
+            }
+            if ui.button("另存为").clicked() {
+                self.save_as_name = self.profile.name.clone();
+                self.save_as_open = true;
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("删除"))
+                .clicked()
+            {
+                self.pending_delete_profile = self.selected_profile.clone();
+            }
+            if ui.button("刷新").clicked() {
+                self.refresh_profiles();
+            }
         });
         ui.add_space(10.0);
 
@@ -1433,8 +1654,12 @@ impl Make5771App {
             ui.set_min_height(360.0);
             if self.profile.templates.is_empty() {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    template_icon(ui, 48.0, theme::TERTIARY_LABEL);
+                    ui.add_space(70.0);
+                    ui.add(
+                        egui::Image::new(&self.mascots.agrippa_watch)
+                            .fit_to_exact_size(Vec2::splat(110.0)),
+                    );
+                    ui.add_space(6.0);
                     ui.label(RichText::new("还没有图片模板").size(18.0).strong());
                     ui.label(
                         RichText::new("连接游戏窗口后，框选“开始”“Auto”和“结算”等目标")
@@ -1530,11 +1755,31 @@ impl Make5771App {
                 if ui.button("清空").clicked() {
                     self.logs.clear();
                 }
+                ui.add(
+                    egui::Image::new(&self.mascots.hilo_vanish)
+                        .fit_to_exact_size(Vec2::splat(34.0)),
+                );
             });
         });
         ui.add_space(12.0);
         theme::card().show(ui, |ui| {
             ui.set_min_height(410.0);
+            if self.logs.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(110.0);
+                    ui.add(
+                        egui::Image::new(&self.mascots.keeper_me)
+                            .fit_to_exact_size(Vec2::splat(96.0)),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("还没有日志").size(18.0).strong());
+                    ui.label(
+                        RichText::new("开始运行或连接游戏窗口后，这里会显示识别与点击记录")
+                            .color(theme::SECONDARY_LABEL),
+                    );
+                });
+                return;
+            }
             egui::ScrollArea::vertical()
                 .id_salt("log-list")
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -1596,7 +1841,15 @@ impl Make5771App {
 
         ui.add_space(10.0);
         theme::card().show(ui, |ui| {
-            ui.label(RichText::new("分享信息").size(18.0).strong());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("分享信息").size(18.0).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add(
+                        egui::Image::new(&self.mascots.erika_ok)
+                            .fit_to_exact_size(Vec2::splat(44.0)),
+                    );
+                });
+            });
             ui.label(
                 RichText::new("这些信息会随 .m5771pack 一起发布，方便别人判断是否适用。")
                     .size(11.0)
@@ -1773,7 +2026,8 @@ impl Make5771App {
                 ui.label(RichText::new("执行保护").size(18.0).strong());
                 ui.separator();
                 safety_status_row(ui, "只在目标窗口处于前台时点击");
-                safety_status_row(ui, "客户区尺寸变化时立即停止");
+                safety_status_row(ui, "分辨率不符时按比例缩放模板");
+                safety_status_row(ui, "运行中客户区尺寸变化时停止");
                 safety_status_row(ui, "仅使用截图与 Windows 标准输入");
             });
         });
@@ -1782,7 +2036,11 @@ impl Make5771App {
         theme::card().show(ui, |ui| {
             ui.label(RichText::new("本地数据").size(18.0).strong());
             ui.separator();
-            settings_value_row(ui, "流程配置", "profiles/default.m5771.json");
+            settings_value_row(
+                ui,
+                "流程配置",
+                &self.current_profile_path.display().to_string(),
+            );
             settings_value_row(ui, "图片模板", "templates/");
             settings_value_row(ui, "运行日志", "logs/");
             settings_value_row(ui, "应用版本", env!("CARGO_PKG_VERSION"));
@@ -1821,9 +2079,18 @@ impl Make5771App {
             .default_height(460.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("选择软件需要识别和操作的游戏窗口").color(theme::SECONDARY_LABEL),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("选择软件需要识别和操作的游戏窗口")
+                            .color(theme::SECONDARY_LABEL),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add(
+                            egui::Image::new(&self.mascots.celeste_pray)
+                                .fit_to_exact_size(Vec2::splat(44.0)),
+                        );
+                    });
+                });
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.window_filter)
@@ -1885,7 +2152,12 @@ impl Make5771App {
                         }
                         if shown == 0 {
                             ui.vertical_centered(|ui| {
-                                ui.add_space(60.0);
+                                ui.add_space(40.0);
+                                ui.add(
+                                    egui::Image::new(&self.mascots.brown_dunno)
+                                        .fit_to_exact_size(Vec2::splat(80.0)),
+                                );
+                                ui.add_space(4.0);
                                 ui.label("没有符合条件的可见窗口");
                             });
                         }
@@ -2041,12 +2313,20 @@ impl Make5771App {
                     .default_width(480.0)
                     .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                     .show(ctx, |ui| {
-                        ui.label(RichText::new(&template.name).size(18.0).strong());
-                        ui.label(
-                            RichText::new(format!("文件：{}", template.path))
-                                .size(11.0)
-                                .color(theme::SECONDARY_LABEL),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Image::new(&self.mascots.kekesi_grudge)
+                                    .fit_to_exact_size(Vec2::splat(64.0)),
+                            );
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&template.name).size(18.0).strong());
+                                ui.label(
+                                    RichText::new(format!("文件：{}", template.path))
+                                        .size(11.0)
+                                        .color(theme::SECONDARY_LABEL),
+                                );
+                            });
+                        });
                         if references > 0 {
                             ui.label(
                                 RichText::new(format!(
@@ -2080,6 +2360,122 @@ impl Make5771App {
                 }
             } else {
                 self.pending_delete_template = None;
+            }
+        }
+
+        if let Some(path) = self.pending_open_profile.clone() {
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new("打开流程文件")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(460.0)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "打开“{}”将替换当前工作区，未保存的修改会丢失。",
+                        storage::profile_display_name(&path)
+                    ));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.add(theme::primary_button("打开")).clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if cancel || !open {
+                self.pending_open_profile = None;
+            }
+            if confirm {
+                self.open_profile(&path);
+                self.pending_open_profile = None;
+            }
+        }
+
+        if self.save_as_open {
+            let mut open = self.save_as_open;
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new("流程另存为")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(460.0)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("文件名")
+                            .size(12.0)
+                            .color(theme::SECONDARY_LABEL),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.save_as_name)
+                            .desired_width(ui.available_width()),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "保存到 profiles/<文件名>{}",
+                            storage::PROFILE_SUFFIX
+                        ))
+                        .size(11.0)
+                        .color(theme::TERTIARY_LABEL),
+                    );
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.add(theme::primary_button("保存")).clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if cancel {
+                open = false;
+            }
+            self.save_as_open = open;
+            if confirm {
+                self.save_profile_as();
+                self.save_as_open = false;
+            }
+        }
+
+        if let Some(path) = self.pending_delete_profile.clone() {
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new("删除流程文件")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(460.0)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "将从磁盘删除“{}”，当前工作区内容不受影响。",
+                        storage::profile_display_name(&path)
+                    ));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.add(theme::primary_button("确认删除")).clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if cancel || !open {
+                self.pending_delete_profile = None;
+            }
+            if confirm {
+                self.delete_profile_file(&path);
+                self.pending_delete_profile = None;
             }
         }
     }

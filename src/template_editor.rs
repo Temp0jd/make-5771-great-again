@@ -34,6 +34,7 @@ pub struct TemplateDraft {
 
 pub struct TemplateTestView {
     texture: egui::TextureHandle,
+    mascot: egui::TextureHandle,
     image_width: u32,
     image_height: u32,
     template_name: String,
@@ -50,6 +51,7 @@ impl TemplateTestView {
         search_region: SearchRegion,
         result: Option<TemplateMatch>,
         threshold: f32,
+        mascot: egui::TextureHandle,
     ) -> Self {
         let size = [image.width() as usize, image.height() as usize];
         let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
@@ -59,6 +61,7 @@ impl TemplateTestView {
                 color_image,
                 egui::TextureOptions::LINEAR,
             ),
+            mascot,
             image_width: image.width(),
             image_height: image.height(),
             template_name: template_name.into(),
@@ -79,6 +82,7 @@ impl TemplateTestView {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    ui.add(egui::Image::new(&self.mascot).fit_to_exact_size(Vec2::splat(36.0)));
                     ui.label(RichText::new(&self.template_name).strong());
                     ui.label(
                         RichText::new(format!("阈值 {:.2}", self.threshold))

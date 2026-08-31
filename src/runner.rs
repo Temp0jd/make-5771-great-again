@@ -32,6 +32,7 @@ pub enum RunnerEvent {
         step: String,
     },
     TargetReconnected(String),
+    Notice(String),
     Paused(String),
     Resumed,
     RoundCompleted(u32),
@@ -169,13 +170,33 @@ fn run_workflow(
     stop: Arc<AtomicBool>,
     events: mpsc::Sender<RunnerEvent>,
 ) {
-    let templates = match load_templates(&profile.templates) {
+    let startup_frame = match platform::capture_client(&target) {
+        Ok(frame) => frame,
+        Err(error) => {
+            let _ = events.send(RunnerEvent::Failed(error.to_string()));
+            return;
+        }
+    };
+    let frame_width = startup_frame.width();
+    let frame_height = startup_frame.height();
+    let templates = match load_templates(&profile, frame_width, frame_height) {
         Ok(templates) => templates,
         Err(error) => {
             let _ = events.send(RunnerEvent::Failed(error));
             return;
         }
     };
+    if frame_width != profile.expected_client_width
+        || frame_height != profile.expected_client_height
+    {
+        let _ = events.send(RunnerEvent::Notice(format!(
+            "客户区 {} × {} 与流程基准 {} × {} 不符，已按比例缩放模板",
+            frame_width,
+            frame_height,
+            profile.expected_client_width,
+            profile.expected_client_height
+        )));
+    }
     let deadline = if profile.loop_mode == LoopMode::Deadline {
         match resolve_deadline(&profile.deadline) {
             Ok(value) => Some(value),
@@ -193,6 +214,8 @@ fn run_workflow(
         profile: &profile,
         target,
         templates: &templates,
+        frame_width,
+        frame_height,
         stop: &stop,
         events: &events,
         jitter: Jitter::new(),
@@ -259,16 +282,56 @@ fn run_workflow(
     }
 }
 
-fn load_templates(assets: &[TemplateAsset]) -> Result<HashMap<String, LoadedTemplate>, String> {
+/// Loads template images, scaling them from their reference resolution to the
+/// actual client size when they differ (e.g. a shared package used at a
+/// different resolution).
+fn load_templates(
+    profile: &MacroProfile,
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<HashMap<String, LoadedTemplate>, String> {
     let mut templates = HashMap::new();
-    for asset in assets {
+    for asset in &profile.templates {
         let image = image::open(&asset.path)
             .map_err(|error| format!("无法读取模板“{}”：{error}", asset.name))?
             .into_luma8();
+        // Older profiles never recorded a reference size; treat them as
+        // captured at the profile's base resolution.
+        let reference_width = if asset.reference_width > 0 {
+            asset.reference_width
+        } else {
+            profile.expected_client_width
+        };
+        let reference_height = if asset.reference_height > 0 {
+            asset.reference_height
+        } else {
+            profile.expected_client_height
+        };
+
+        let mut scaled_asset = asset.clone();
+        scaled_asset.reference_width = frame_width;
+        scaled_asset.reference_height = frame_height;
+        let image = if reference_width == frame_width && reference_height == frame_height {
+            image
+        } else {
+            let scale = |value: u32, from: u32, to: u32| {
+                ((u64::from(value) * u64::from(to) + u64::from(from) / 2) / u64::from(from.max(1)))
+                    .max(1) as u32
+            };
+            scaled_asset.search_region = asset.search_region.map(|region| {
+                region.scaled(reference_width, reference_height, frame_width, frame_height)
+            });
+            image::imageops::resize(
+                &image,
+                scale(asset.width, reference_width, frame_width),
+                scale(asset.height, reference_height, frame_height),
+                image::imageops::FilterType::Triangle,
+            )
+        };
         templates.insert(
             asset.path.clone(),
             LoadedTemplate {
-                asset: asset.clone(),
+                asset: scaled_asset,
                 image,
                 last_match: Cell::new(None),
             },
@@ -340,6 +403,9 @@ struct StepContext<'a> {
     profile: &'a MacroProfile,
     target: TargetWindow,
     templates: &'a HashMap<String, LoadedTemplate>,
+    /// Client size captured at run start; every poll must match it.
+    frame_width: u32,
+    frame_height: u32,
     stop: &'a AtomicBool,
     events: &'a mpsc::Sender<RunnerEvent>,
     jitter: Jitter,
@@ -438,6 +504,7 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
         .ok_or_else(|| format!("步骤“{}”的图片模板未加载", step.name))?;
     let mut timeout_at = Instant::now() + Duration::from_secs(step.timeout_secs as u64);
     let mut state = WaitState::default();
+    let mut best_seen = 0.0_f32;
 
     loop {
         if !ctx.poll_gate(&mut state, &mut timeout_at)? {
@@ -448,16 +515,18 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
         }
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
-        ensure_expected_size(&frame, ctx.profile)?;
+        ensure_expected_size(&frame, ctx)?;
         let frame_gray = image::imageops::grayscale(&frame);
 
-        if let Some(found) = find_loaded_template(
+        let report = find_loaded_template(
             &frame_gray,
             frame.width(),
             frame.height(),
             template,
             step.threshold,
-        ) {
+        );
+        best_seen = best_seen.max(report.best_score);
+        if let Some(found) = report.matched {
             let (x, y) = found.center();
             ctx.click(x, y)?;
             let _ = ctx.events.send(RunnerEvent::MatchFound {
@@ -469,14 +538,15 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
         interruptible_wait(Duration::from_millis(300), ctx.stop)?;
     }
     Err(format!(
-        "步骤“{}”在 {} 秒内未找到目标",
-        step.name, step.timeout_secs
+        "步骤“{}”在 {} 秒内未找到目标（最佳相似度 {:.2}，阈值 {:.2}）",
+        step.name, step.timeout_secs, best_seen, step.threshold
     ))
 }
 
 fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepControl, String> {
     let mut timeout_at = Instant::now() + Duration::from_secs(step.timeout_secs as u64);
     let mut state = WaitState::default();
+    let mut best_seen = (0.0_f32, String::new());
 
     loop {
         if !ctx.poll_gate(&mut state, &mut timeout_at)? {
@@ -484,13 +554,13 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
         }
         if Instant::now() >= timeout_at {
             return Err(format!(
-                "步骤“{}”在 {} 秒内未匹配任何分支",
-                step.name, step.timeout_secs
+                "步骤“{}”在 {} 秒内未匹配任何分支（最接近“{}”相似度 {:.2}）",
+                step.name, step.timeout_secs, best_seen.1, best_seen.0
             ));
         }
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
-        ensure_expected_size(&frame, ctx.profile)?;
+        ensure_expected_size(&frame, ctx)?;
         let frame_gray = image::imageops::grayscale(&frame);
 
         let mut matched = None;
@@ -503,13 +573,17 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
                 .templates
                 .get(path)
                 .ok_or_else(|| format!("分支“{}”的触发模板未加载", branch.name))?;
-            if let Some(found) = find_loaded_template(
+            let report = find_loaded_template(
                 &frame_gray,
                 frame.width(),
                 frame.height(),
                 template,
                 branch.threshold,
-            ) {
+            );
+            if report.best_score > best_seen.0 {
+                best_seen = (report.best_score, branch.name.clone());
+            }
+            if let Some(found) = report.matched {
                 matched = Some((branch, found));
                 break;
             }
@@ -554,6 +628,7 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
     let mut timeout_at = Instant::now() + Duration::from_secs(step.timeout_secs as u64);
     let mut state = WaitState::default();
     let mut stable_hits = 0_u8;
+    let mut best_seen = (0.0_f32, String::new());
 
     loop {
         if !ctx.poll_gate(&mut state, &mut timeout_at)? {
@@ -566,13 +641,13 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
         }
         if Instant::now() >= timeout_at {
             return Err(format!(
-                "步骤“{}”的视觉条件在 {} 秒内未满足",
-                step.name, step.timeout_secs
+                "步骤“{}”的视觉条件在 {} 秒内未满足（最接近“{}”相似度 {:.2}）",
+                step.name, step.timeout_secs, best_seen.1, best_seen.0
             ));
         }
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
-        ensure_expected_size(&frame, ctx.profile)?;
+        ensure_expected_size(&frame, ctx)?;
         let frame_gray = image::imageops::grayscale(&frame);
 
         let mut satisfied = 0_usize;
@@ -586,22 +661,25 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
                 .templates
                 .get(path)
                 .ok_or_else(|| format!("视觉条件“{}”的图片模板未加载", term.name))?;
-            let found = find_loaded_template(
+            let report = find_loaded_template(
                 &frame_gray,
                 frame.width(),
                 frame.height(),
                 template,
                 term.threshold,
             );
+            if report.best_score > best_seen.0 {
+                best_seen = (report.best_score, term.name.clone());
+            }
             let term_met = match term.expectation {
-                ConditionExpectation::Present => found.is_some(),
-                ConditionExpectation::Absent => found.is_none(),
+                ConditionExpectation::Present => report.matched.is_some(),
+                ConditionExpectation::Absent => report.matched.is_none(),
             };
             if term_met {
                 satisfied += 1;
             }
             if matched.is_none()
-                && let Some(found) = found
+                && let Some(found) = report.matched
             {
                 matched = Some((term, found));
             }
@@ -688,18 +766,16 @@ fn wait_and_click_action(ctx: &mut StepContext<'_>, action: &BranchAction) -> Re
     wait_and_click(ctx, &step)
 }
 
-fn ensure_expected_size(frame: &image::RgbaImage, profile: &MacroProfile) -> Result<(), String> {
-    if frame.width() == profile.expected_client_width
-        && frame.height() == profile.expected_client_height
-    {
+fn ensure_expected_size(frame: &image::RgbaImage, ctx: &StepContext<'_>) -> Result<(), String> {
+    if frame.width() == ctx.frame_width && frame.height() == ctx.frame_height {
         Ok(())
     } else {
         Err(format!(
-            "客户区尺寸已变化：当前 {} × {}，流程要求 {} × {}",
+            "客户区尺寸已变化：当前 {} × {}，运行开始于 {} × {}",
             frame.width(),
             frame.height(),
-            profile.expected_client_width,
-            profile.expected_client_height
+            ctx.frame_width,
+            ctx.frame_height
         ))
     }
 }
@@ -710,7 +786,7 @@ fn find_loaded_template(
     frame_height: u32,
     template: &LoadedTemplate,
     threshold: f32,
-) -> Option<vision::TemplateMatch> {
+) -> vision::MatchReport {
     let base_region = template
         .asset
         .search_region
@@ -734,16 +810,19 @@ fn find_loaded_template(
             template.image.width(),
             template.image.height(),
         )
-        && let Some(found) = vision::find_template(frame, &template.image, tracked, threshold)
     {
-        template.last_match.set(Some((found.x, found.y)));
-        return Some(found);
+        let tracked_report =
+            vision::find_template_report(frame, &template.image, tracked, threshold);
+        if let Some(found) = tracked_report.matched {
+            template.last_match.set(Some((found.x, found.y)));
+            return tracked_report;
+        }
     }
-    let found = vision::find_template(frame, &template.image, base_region, threshold);
+    let report = vision::find_template_report(frame, &template.image, base_region, threshold);
     template
         .last_match
-        .set(found.map(|found| (found.x, found.y)));
-    found
+        .set(report.matched.map(|found| (found.x, found.y)));
+    report
 }
 
 /// Extra pixels scanned around the last known match position before falling
@@ -851,6 +930,45 @@ mod tests {
         };
         assert!(!loop_condition_reached(&profile, 2, None));
         assert!(loop_condition_reached(&profile, 3, None));
+    }
+
+    #[test]
+    fn templates_scale_to_actual_client_size() {
+        let root = std::env::temp_dir().join(format!("m5771-scale-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let image_path = root.join("template.png");
+        image::RgbaImage::from_pixel(8, 6, image::Rgba([10, 20, 30, 255]))
+            .save(&image_path)
+            .unwrap();
+
+        let mut profile = MacroProfile::default();
+        profile.templates.push(TemplateAsset {
+            id: 1,
+            name: "scaled".to_owned(),
+            path: image_path.to_string_lossy().into_owned(),
+            width: 8,
+            height: 6,
+            reference_width: 1280,
+            reference_height: 720,
+            search_region: Some(crate::model::SearchRegionSpec {
+                x: 640,
+                y: 360,
+                width: 320,
+                height: 180,
+            }),
+        });
+
+        let templates = load_templates(&profile, 640, 360).unwrap();
+        let loaded = templates.values().next().unwrap();
+        assert_eq!((loaded.image.width(), loaded.image.height()), (4, 3));
+        let region = loaded.asset.search_region.unwrap();
+        assert_eq!(
+            (region.x, region.y, region.width, region.height),
+            (320, 180, 160, 90)
+        );
+        assert_eq!(loaded.asset.reference_width, 640);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -17,6 +17,42 @@ pub fn default_profile_path() -> PathBuf {
     PathBuf::from("profiles/default.m5771.json")
 }
 
+pub const PROFILE_SUFFIX: &str = ".m5771.json";
+
+/// Lists all saved workflow profiles in `profiles/`, sorted by file name.
+pub fn list_profiles() -> Vec<PathBuf> {
+    list_profiles_in(Path::new("profiles"))
+}
+
+fn list_profiles_in(dir: &Path) -> Vec<PathBuf> {
+    let mut profiles = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(PROFILE_SUFFIX))
+            {
+                profiles.push(path);
+            }
+        }
+    }
+    profiles.sort();
+    profiles
+}
+
+/// Human-readable profile name: the file name without the `.m5771.json` suffix.
+pub fn profile_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| {
+            name.to_string_lossy()
+                .trim_end_matches(PROFILE_SUFFIX)
+                .to_owned()
+        })
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// Appends one log line to `logs/<date>.log`; failures are non-fatal.
 pub fn append_log(entry: &LogEntry) -> io::Result<()> {
     use std::io::Write;
@@ -475,6 +511,22 @@ mod tests {
         assert_eq!(actual.name, expected.name);
         assert_eq!(actual.steps.len(), expected.steps.len());
         assert_eq!(actual.loop_count, expected.loop_count);
+    }
+
+    #[test]
+    fn list_profiles_only_includes_profile_files() {
+        let root = std::env::temp_dir().join(format!("m5771-profiles-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("b.m5771.json"), "{}").unwrap();
+        fs::write(root.join("a.m5771.json"), "{}").unwrap();
+        fs::write(root.join("notes.txt"), "{}").unwrap();
+
+        let profiles = list_profiles_in(&root);
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profile_display_name(&profiles[0]), "a");
+        assert_eq!(profile_display_name(&profiles[1]), "b");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
