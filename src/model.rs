@@ -1,0 +1,679 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppTab {
+    Run,
+    Flow,
+    Templates,
+    Logs,
+    Settings,
+}
+
+impl AppTab {
+    pub const ALL: [Self; 5] = [
+        Self::Run,
+        Self::Flow,
+        Self::Templates,
+        Self::Logs,
+        Self::Settings,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Run => "运行",
+            Self::Flow => "流程",
+            Self::Templates => "模板",
+            Self::Logs => "日志",
+            Self::Settings => "设置",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoopMode {
+    Count,
+    Deadline,
+    Continuous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ClickMethod {
+    #[default]
+    Foreground,
+    Background,
+}
+
+impl ClickMethod {
+    pub const ALL: [Self; 2] = [Self::Foreground, Self::Background];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Foreground => "前台点击（移动鼠标，兼容性最好）",
+            Self::Background => "后台点击（不动鼠标，部分游戏不响应）",
+        }
+    }
+}
+
+fn default_click_jitter() -> bool {
+    true
+}
+
+impl LoopMode {
+    pub const ALL: [Self; 3] = [Self::Count, Self::Deadline, Self::Continuous];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Count => "固定次数",
+            Self::Deadline => "截止时间",
+            Self::Continuous => "持续运行",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerStatus {
+    Ready,
+    Running,
+    Paused,
+    Finishing,
+}
+
+impl RunnerStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "准备就绪",
+            Self::Running => "运行中",
+            Self::Paused => "已暂停",
+            Self::Finishing => "本局结束后停止",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StepKind {
+    WaitAndClick,
+    WaitAny,
+    VisualCondition,
+    Branch,
+    Delay,
+    RoundEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConditionMatchMode {
+    All,
+    Any,
+}
+
+impl ConditionMatchMode {
+    pub const ALL: [Self; 2] = [Self::All, Self::Any];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部满足（AND）",
+            Self::Any => "任一满足（OR）",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConditionExpectation {
+    Present,
+    Absent,
+}
+
+impl ConditionExpectation {
+    pub const ALL: [Self; 2] = [Self::Present, Self::Absent];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Present => "出现",
+            Self::Absent => "不出现",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConditionOutcome {
+    ContinueFlow,
+    ClickTemplate,
+    CompleteRound,
+    StopTask,
+}
+
+impl ConditionOutcome {
+    pub const ALL: [Self; 4] = [
+        Self::ContinueFlow,
+        Self::ClickTemplate,
+        Self::CompleteRound,
+        Self::StopTask,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ContinueFlow => "继续后续步骤",
+            Self::ClickTemplate => "点击指定模板",
+            Self::CompleteRound => "完成本局",
+            Self::StopTask => "停止任务",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualConditionTerm {
+    pub id: u64,
+    pub name: String,
+    pub template: Option<String>,
+    pub expectation: ConditionExpectation,
+    pub threshold: f32,
+}
+
+impl VisualConditionTerm {
+    pub fn new(id: u64, name: impl Into<String>, expectation: ConditionExpectation) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            template: None,
+            expectation,
+            threshold: 0.90,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualConditionSpec {
+    pub mode: ConditionMatchMode,
+    pub stable_checks: u8,
+    pub outcome: ConditionOutcome,
+    #[serde(default)]
+    pub terms: Vec<VisualConditionTerm>,
+}
+
+impl Default for VisualConditionSpec {
+    fn default() -> Self {
+        Self {
+            mode: ConditionMatchMode::All,
+            stable_checks: 2,
+            outcome: ConditionOutcome::ContinueFlow,
+            terms: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BranchOutcome {
+    ContinueFlow,
+    RepeatWait,
+    CompleteRound,
+    StopTask,
+}
+
+impl BranchOutcome {
+    pub const ALL: [Self; 4] = [
+        Self::RepeatWait,
+        Self::ContinueFlow,
+        Self::CompleteRound,
+        Self::StopTask,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ContinueFlow => "继续后续步骤",
+            Self::RepeatWait => "返回当前等待",
+            Self::CompleteRound => "完成本局",
+            Self::StopTask => "停止任务",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BranchActionKind {
+    WaitAndClick,
+    Delay,
+}
+
+impl BranchActionKind {
+    pub const ALL: [Self; 2] = [Self::WaitAndClick, Self::Delay];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WaitAndClick => "等待并点击",
+            Self::Delay => "固定等待",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchAction {
+    pub id: u64,
+    pub name: String,
+    pub kind: BranchActionKind,
+    pub template: Option<String>,
+    pub threshold: f32,
+    pub timeout_secs: u32,
+    pub delay_ms: u32,
+}
+
+impl BranchAction {
+    pub fn new(id: u64, name: impl Into<String>, kind: BranchActionKind) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            kind,
+            template: None,
+            threshold: 0.90,
+            timeout_secs: 60,
+            delay_ms: 500,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowBranch {
+    pub id: u64,
+    pub name: String,
+    pub trigger_template: Option<String>,
+    pub threshold: f32,
+    pub click_trigger: bool,
+    pub trigger_delay_ms: u32,
+    pub outcome: BranchOutcome,
+    #[serde(default)]
+    pub actions: Vec<BranchAction>,
+}
+
+impl WorkflowBranch {
+    pub fn new(id: u64, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            trigger_template: None,
+            threshold: 0.90,
+            click_trigger: false,
+            trigger_delay_ms: 400,
+            outcome: BranchOutcome::RepeatWait,
+            actions: Vec::new(),
+        }
+    }
+}
+
+impl StepKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WaitAndClick => "等待并点击",
+            Self::WaitAny => "等待任一目标",
+            Self::VisualCondition => "视觉条件",
+            Self::Branch => "条件分支",
+            Self::Delay => "固定等待",
+            Self::RoundEnd => "本局结束",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    pub id: u64,
+    pub name: String,
+    pub kind: StepKind,
+    pub indent: u8,
+    pub enabled: bool,
+    pub template: Option<String>,
+    pub threshold: f32,
+    pub timeout_secs: u32,
+    pub delay_ms: u32,
+    #[serde(default)]
+    pub branches: Vec<WorkflowBranch>,
+    #[serde(default)]
+    pub visual_condition: VisualConditionSpec,
+}
+
+impl WorkflowStep {
+    pub fn new(id: u64, name: impl Into<String>, kind: StepKind, indent: u8) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            kind,
+            indent,
+            enabled: true,
+            template: None,
+            threshold: 0.90,
+            timeout_secs: 60,
+            delay_ms: 500,
+            branches: Vec::new(),
+            visual_condition: VisualConditionSpec::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateAsset {
+    pub id: u64,
+    pub name: String,
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub reference_width: u32,
+    #[serde(default)]
+    pub reference_height: u32,
+    #[serde(default)]
+    pub search_region: Option<SearchRegionSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchRegionSpec {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MacroProfile {
+    pub name: String,
+    pub target_window: String,
+    pub expected_client_width: u32,
+    pub expected_client_height: u32,
+    pub loop_mode: LoopMode,
+    pub loop_count: u32,
+    pub deadline: String,
+    pub finish_current_round: bool,
+    pub steps: Vec<WorkflowStep>,
+    pub templates: Vec<TemplateAsset>,
+    #[serde(default)]
+    pub click_method: ClickMethod,
+    #[serde(default = "default_click_jitter")]
+    pub click_jitter: bool,
+    #[serde(default)]
+    pub sharing: SharingMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharingMetadata {
+    pub author: String,
+    pub description: String,
+    pub game_version: String,
+    pub game_language: String,
+    pub tags: String,
+}
+
+impl Default for SharingMetadata {
+    fn default() -> Self {
+        Self {
+            author: String::new(),
+            description: String::new(),
+            game_version: String::new(),
+            game_language: "简体中文".to_owned(),
+            tags: String::new(),
+        }
+    }
+}
+
+impl Default for MacroProfile {
+    fn default() -> Self {
+        Self {
+            name: "日常刷关".to_owned(),
+            target_window: "忘却前夜".to_owned(),
+            expected_client_width: 1280,
+            expected_client_height: 720,
+            loop_mode: LoopMode::Count,
+            loop_count: 20,
+            deadline: "23:30".to_owned(),
+            finish_current_round: true,
+            steps: vec![
+                WorkflowStep::new(1, "开始游戏", StepKind::WaitAndClick, 0),
+                WorkflowStep::new(2, "开启 Auto", StepKind::WaitAndClick, 0),
+                WorkflowStep::new(3, "结算游戏", StepKind::WaitAndClick, 0),
+                WorkflowStep::new(4, "本局结束", StepKind::RoundEnd, 0),
+            ],
+            templates: Vec::new(),
+            click_method: ClickMethod::default(),
+            click_jitter: default_click_jitter(),
+            sharing: SharingMetadata::default(),
+        }
+    }
+}
+
+impl MacroProfile {
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut issues = Vec::new();
+
+        if self.name.trim().is_empty() {
+            issues.push("流程名称不能为空".to_owned());
+        }
+        if self.target_window.trim().is_empty() {
+            issues.push("目标窗口名称不能为空".to_owned());
+        }
+        if self.expected_client_width == 0 || self.expected_client_height == 0 {
+            issues.push("目标窗口尺寸必须大于零".to_owned());
+        }
+        if self.loop_mode == LoopMode::Count && self.loop_count == 0 {
+            issues.push("固定次数必须至少为 1".to_owned());
+        }
+        if self.loop_mode == LoopMode::Deadline && !valid_deadline(&self.deadline) {
+            issues.push("截止时间必须使用 HH:MM 格式".to_owned());
+        }
+        if self.steps.is_empty() {
+            issues.push("流程至少需要一个步骤".to_owned());
+        }
+        if self.steps.len() > 1000 {
+            issues.push("流程步骤数不能超过 1000".to_owned());
+        }
+        for (label, value, limit) in [
+            ("作者", &self.sharing.author, 100),
+            ("游戏版本", &self.sharing.game_version, 100),
+            ("游戏语言", &self.sharing.game_language, 100),
+            ("标签", &self.sharing.tags, 500),
+            ("分享说明", &self.sharing.description, 4000),
+        ] {
+            if value.chars().count() > limit {
+                issues.push(format!("{label}不能超过 {limit} 个字符"));
+            }
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        for step in &self.steps {
+            if !ids.insert(step.id) {
+                issues.push(format!("步骤 ID {} 重复", step.id));
+            }
+            if step.name.trim().is_empty() {
+                issues.push(format!("步骤 {} 的名称不能为空", step.id));
+            }
+            if !(0.0..=1.0).contains(&step.threshold) {
+                issues.push(format!("步骤“{}”的相似度不合法", step.name));
+            }
+            if step.timeout_secs == 0 {
+                issues.push(format!("步骤“{}”的超时必须大于零", step.name));
+            }
+            if step.branches.len() > 100 {
+                issues.push(format!("步骤“{}”的分支数不能超过 100", step.name));
+            }
+            if !(1..=10).contains(&step.visual_condition.stable_checks) {
+                issues.push(format!("步骤“{}”的稳定检查次数必须为 1-10", step.name));
+            }
+            if step.visual_condition.terms.len() > 20 {
+                issues.push(format!("步骤“{}”的视觉条件不能超过 20 条", step.name));
+            }
+            let mut condition_term_ids = std::collections::HashSet::new();
+            for term in &step.visual_condition.terms {
+                if !condition_term_ids.insert(term.id) {
+                    issues.push(format!("步骤“{}”的条件 ID {} 重复", step.name, term.id));
+                }
+                if term.name.trim().is_empty() {
+                    issues.push(format!("步骤“{}”包含未命名视觉条件", step.name));
+                }
+                if !(0.0..=1.0).contains(&term.threshold) {
+                    issues.push(format!("视觉条件“{}”的相似度不合法", term.name));
+                }
+            }
+            let mut branch_ids = std::collections::HashSet::new();
+            for branch in &step.branches {
+                if !branch_ids.insert(branch.id) {
+                    issues.push(format!("步骤“{}”的分支 ID {} 重复", step.name, branch.id));
+                }
+                if branch.name.trim().is_empty() {
+                    issues.push(format!("步骤“{}”包含未命名分支", step.name));
+                }
+                if !(0.0..=1.0).contains(&branch.threshold) {
+                    issues.push(format!("分支“{}”的相似度不合法", branch.name));
+                }
+                if branch.actions.len() > 100 {
+                    issues.push(format!("分支“{}”的动作数不能超过 100", branch.name));
+                }
+
+                let mut action_ids = std::collections::HashSet::new();
+                for action in &branch.actions {
+                    if !action_ids.insert(action.id) {
+                        issues.push(format!("分支“{}”的动作 ID {} 重复", branch.name, action.id));
+                    }
+                    if action.name.trim().is_empty() {
+                        issues.push(format!("分支“{}”包含未命名动作", branch.name));
+                    }
+                    if !(0.0..=1.0).contains(&action.threshold) {
+                        issues.push(format!("动作“{}”的相似度不合法", action.name));
+                    }
+                    if action.timeout_secs == 0 {
+                        issues.push(format!("动作“{}”的超时必须大于零", action.name));
+                    }
+                }
+            }
+        }
+
+        if self.templates.len() > 500 {
+            issues.push("图片模板数不能超过 500".to_owned());
+        }
+        let mut template_ids = std::collections::HashSet::new();
+        let mut template_paths = std::collections::HashSet::new();
+        for template in &self.templates {
+            if !template_ids.insert(template.id) {
+                issues.push(format!("模板 ID {} 重复", template.id));
+            }
+            if !template_paths.insert(&template.path) {
+                issues.push(format!("模板路径重复：{}", template.path));
+            }
+            if template.name.trim().is_empty() {
+                issues.push(format!("模板 {} 的名称不能为空", template.id));
+            }
+            if template.width == 0 || template.height == 0 {
+                issues.push(format!("模板“{}”的尺寸无效", template.name));
+            }
+            if let Some(region) = template.search_region
+                && (region.width == 0
+                    || region.height == 0
+                    || region.x.saturating_add(region.width) > template.reference_width
+                    || region.y.saturating_add(region.height) > template.reference_height)
+            {
+                issues.push(format!("模板“{}”的搜索区域无效", template.name));
+            }
+        }
+
+        if issues.is_empty() {
+            Ok(())
+        } else {
+            Err(issues)
+        }
+    }
+}
+
+fn valid_deadline(value: &str) -> bool {
+    let Some((hours, minutes)) = value.split_once(':') else {
+        return false;
+    };
+    if hours.len() != 2 || minutes.len() != 2 {
+        return false;
+    }
+    matches!(
+        (hours.parse::<u8>(), minutes.parse::<u8>()),
+        (Ok(0..=23), Ok(0..=59))
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub time: String,
+    pub level: LogLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Success,
+    Warning,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_profile_is_valid() {
+        assert!(MacroProfile::default().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_deadline() {
+        let profile = MacroProfile {
+            loop_mode: LoopMode::Deadline,
+            deadline: "25:90".to_owned(),
+            ..MacroProfile::default()
+        };
+
+        let issues = profile.validate().expect_err("deadline should be rejected");
+        assert!(issues.iter().any(|issue| issue.contains("HH:MM")));
+    }
+
+    #[test]
+    fn rejects_duplicate_step_ids() {
+        let mut profile = MacroProfile::default();
+        profile.steps[1].id = profile.steps[0].id;
+
+        let issues = profile
+            .validate()
+            .expect_err("duplicate IDs should be rejected");
+        assert!(issues.iter().any(|issue| issue.contains("重复")));
+    }
+
+    #[test]
+    fn old_steps_load_with_empty_branch_list() {
+        let json = r#"{
+            "id": 9,
+            "name": "old step",
+            "kind": "Delay",
+            "indent": 0,
+            "enabled": true,
+            "template": null,
+            "threshold": 0.9,
+            "timeout_secs": 10,
+            "delay_ms": 500
+        }"#;
+        let step: WorkflowStep = serde_json::from_str(json).unwrap();
+        assert!(step.branches.is_empty());
+    }
+
+    #[test]
+    fn incomplete_wait_any_can_be_saved_as_a_draft() {
+        let mut profile = MacroProfile::default();
+        profile.steps[1].kind = StepKind::WaitAny;
+        assert!(profile.validate().is_ok());
+    }
+
+    #[test]
+    fn old_profiles_load_with_default_sharing_metadata() {
+        let mut value = serde_json::to_value(MacroProfile::default()).unwrap();
+        value.as_object_mut().unwrap().remove("sharing");
+        let profile: MacroProfile = serde_json::from_value(value).unwrap();
+        assert_eq!(profile.sharing.game_language, "简体中文");
+        assert!(profile.sharing.author.is_empty());
+    }
+
+    #[test]
+    fn old_profiles_load_with_default_click_options() {
+        let mut value = serde_json::to_value(MacroProfile::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("click_method");
+        object.remove("click_jitter");
+        let profile: MacroProfile = serde_json::from_value(value).unwrap();
+        assert_eq!(profile.click_method, ClickMethod::Foreground);
+        assert!(profile.click_jitter);
+    }
+}

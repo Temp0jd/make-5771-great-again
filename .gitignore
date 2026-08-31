@@ -1,0 +1,6 @@
+/target/
+/profiles/
+/templates/
+/imports/
+/logs/
+*.log
