@@ -1462,46 +1462,37 @@ impl Make5771App {
         ui.columns(2, |columns| {
             columns[0].set_width(list_width);
             theme::card().show(&mut columns[0], |ui| {
-                let selected_index = self
-                    .selected_step
-                    .and_then(|id| self.profile.steps.iter().position(|step| step.id == id));
                 let mut list_command = None;
                 ui.label(RichText::new(&self.profile.name).size(18.0).strong());
                 ui.horizontal(|ui| {
-                    if ui.button("添加步骤").clicked() {
-                        list_command = Some(StepListCommand::Add);
-                    }
-                    if ui
-                        .add_enabled(
-                            selected_index.is_some_and(|index| index > 0),
-                            egui::Button::new("上移"),
-                        )
-                        .clicked()
-                    {
-                        list_command = selected_index.map(StepListCommand::MoveUp);
-                    }
-                    if ui
-                        .add_enabled(
-                            selected_index
-                                .is_some_and(|index| index + 1 < self.profile.steps.len()),
-                            egui::Button::new("下移"),
-                        )
-                        .clicked()
-                    {
-                        list_command = selected_index.map(StepListCommand::MoveDown);
-                    }
-                    if ui
-                        .add_enabled(
-                            selected_index.is_some() && self.profile.steps.len() > 1,
-                            egui::Button::new("删除"),
-                        )
-                        .clicked()
-                    {
-                        list_command = selected_index.map(StepListCommand::Delete);
-                    }
+                    ui.menu_button("添加步骤 ▾", |ui| {
+                        for (kind, hint) in [
+                            (StepKind::WaitAndClick, "等到目标图片出现后点击它，最常用"),
+                            (
+                                StepKind::WaitAny,
+                                "同时监控多个画面，先出现先处理，适合应对随机弹窗",
+                            ),
+                            (
+                                StepKind::VisualCondition,
+                                "判断画面条件，决定继续、点击或结束本局",
+                            ),
+                            (StepKind::Delay, "原地等待固定时长"),
+                            (StepKind::RoundEnd, "把当前局计入完成数，并开始下一轮"),
+                        ] {
+                            if ui.button(kind.label()).on_hover_text(hint).clicked() {
+                                list_command = Some(StepListCommand::Add(kind));
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new("行内 ↑↓ 调顺序，⋯ 复制/停用/删除")
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                    );
                 });
                 match list_command {
-                    Some(StepListCommand::Add) => {
+                    Some(StepListCommand::Add(kind)) => {
                         let id = self
                             .profile
                             .steps
@@ -1510,10 +1501,16 @@ impl Make5771App {
                             .max()
                             .unwrap_or(0)
                             + 1;
+                        let count = self
+                            .profile
+                            .steps
+                            .iter()
+                            .filter(|step| step.kind == kind)
+                            .count();
                         self.profile.steps.push(WorkflowStep::new(
                             id,
-                            "新步骤",
-                            StepKind::WaitAndClick,
+                            format!("{} {}", kind.label(), count + 1),
+                            kind,
                             0,
                         ));
                         self.selected_step = Some(id);
@@ -1524,6 +1521,25 @@ impl Make5771App {
                     Some(StepListCommand::MoveDown(index)) => {
                         self.profile.steps.swap(index, index + 1);
                     }
+                    Some(StepListCommand::Duplicate(index)) => {
+                        let mut copy = self.profile.steps[index].clone();
+                        copy.id = self
+                            .profile
+                            .steps
+                            .iter()
+                            .map(|step| step.id)
+                            .max()
+                            .unwrap_or(0)
+                            + 1;
+                        copy.name = format!("{} 副本", copy.name);
+                        let new_id = copy.id;
+                        self.profile.steps.insert(index + 1, copy);
+                        self.selected_step = Some(new_id);
+                    }
+                    Some(StepListCommand::ToggleEnabled(index)) => {
+                        let step = &mut self.profile.steps[index];
+                        step.enabled = !step.enabled;
+                    }
                     Some(StepListCommand::Delete(index)) => {
                         self.profile.steps.remove(index);
                         let next_index = index.min(self.profile.steps.len() - 1);
@@ -1533,10 +1549,15 @@ impl Make5771App {
                 }
                 ui.separator();
 
+                let window_height = ui
+                    .ctx()
+                    .input(|input| input.viewport().inner_rect.map(|rect| rect.height()))
+                    .unwrap_or(800.0);
+                let list_height = (window_height - 350.0).clamp(320.0, 720.0);
                 egui::ScrollArea::vertical()
                     .id_salt("workflow-step-list")
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .max_height(460.0)
+                    .max_height(list_height)
                     .show(ui, |ui| {
                         for (index, step) in self.profile.steps.iter().enumerate() {
                             let selected = self.selected_step == Some(step.id);
@@ -1551,30 +1572,80 @@ impl Make5771App {
                                         theme::tertiary_label(),
                                     );
                                 }
-                                let label = format!("{}   {}", index + 1, step.name);
-                                let button_width =
-                                    (ui.available_width() - step.indent as f32 * 22.0 - 18.0)
-                                        .max(150.0);
-                                let button =
-                                    egui::Button::new(RichText::new(label).color(if selected {
-                                        theme::blue()
-                                    } else {
-                                        theme::label()
-                                    }))
-                                    .fill(if selected {
-                                        theme::blue().gamma_multiply(0.10)
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    })
-                                    .stroke(if selected {
-                                        Stroke::new(1.0, theme::blue().gamma_multiply(0.35))
-                                    } else {
-                                        Stroke::NONE
-                                    })
-                                    .min_size(Vec2::new(button_width, 38.0));
+                                let controls_width = 3.0 * 24.0 + 16.0;
+                                let button_width = (ui.available_width()
+                                    - step.indent as f32 * 22.0
+                                    - 18.0
+                                    - controls_width)
+                                    .max(120.0);
+                                let button = egui::Button::new(step_row_text(
+                                    step,
+                                    index,
+                                    selected,
+                                    &template_options,
+                                ))
+                                .fill(if selected {
+                                    theme::blue().gamma_multiply(0.10)
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .stroke(if selected {
+                                    Stroke::new(1.0, theme::blue().gamma_multiply(0.35))
+                                } else {
+                                    Stroke::NONE
+                                })
+                                .min_size(Vec2::new(button_width, 44.0));
                                 if ui.add(button).clicked() {
                                     self.selected_step = Some(step.id);
                                 }
+                                if ui
+                                    .add_enabled(
+                                        index > 0,
+                                        egui::Button::new(RichText::new("↑").size(12.0))
+                                            .min_size(Vec2::splat(24.0)),
+                                    )
+                                    .on_hover_text("上移")
+                                    .clicked()
+                                {
+                                    list_command = Some(StepListCommand::MoveUp(index));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        index + 1 < self.profile.steps.len(),
+                                        egui::Button::new(RichText::new("↓").size(12.0))
+                                            .min_size(Vec2::splat(24.0)),
+                                    )
+                                    .on_hover_text("下移")
+                                    .clicked()
+                                {
+                                    list_command = Some(StepListCommand::MoveDown(index));
+                                }
+                                ui.menu_button(RichText::new("⋯").size(13.0), |ui| {
+                                    let toggle_label = if step.enabled {
+                                        "停用此步骤"
+                                    } else {
+                                        "启用此步骤"
+                                    };
+                                    if ui.button(toggle_label).clicked() {
+                                        list_command = Some(StepListCommand::ToggleEnabled(index));
+                                        ui.close();
+                                    }
+                                    if ui.button("复制步骤").clicked() {
+                                        list_command = Some(StepListCommand::Duplicate(index));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui
+                                        .add_enabled(
+                                            self.profile.steps.len() > 1,
+                                            egui::Button::new("删除步骤"),
+                                        )
+                                        .clicked()
+                                    {
+                                        list_command = Some(StepListCommand::Delete(index));
+                                        ui.close();
+                                    }
+                                });
                             });
                         }
                     });
@@ -2754,9 +2825,11 @@ fn nav_icon(painter: &egui::Painter, tab: AppTab, center: egui::Pos2, color: Col
 
 #[derive(Debug, Clone, Copy)]
 enum StepListCommand {
-    Add,
+    Add(StepKind),
     MoveUp(usize),
     MoveDown(usize),
+    Duplicate(usize),
+    ToggleEnabled(usize),
     Delete(usize),
 }
 
@@ -3102,6 +3175,94 @@ fn edit_workflow_branch(
             BranchActionKind::WaitAndClick,
         ));
     }
+}
+
+/// Short colored tag shown before each step name in the flow list.
+fn step_kind_chip(kind: StepKind) -> (&'static str, Color32) {
+    match kind {
+        StepKind::WaitAndClick => ("点击", theme::blue()),
+        StepKind::WaitAny => ("任一", theme::orange()),
+        StepKind::VisualCondition => ("条件", theme::green()),
+        StepKind::Delay => ("等待", theme::tertiary_label()),
+        StepKind::RoundEnd => ("结束", theme::label()),
+        StepKind::Branch => ("分支", theme::tertiary_label()),
+    }
+}
+
+/// One-line summary of what a step actually does, shown under its name.
+fn step_summary(step: &WorkflowStep, templates: &[(u64, String, String)]) -> String {
+    let template_name = |path: &Option<String>| -> String {
+        path.as_ref()
+            .map(|path| {
+                templates
+                    .iter()
+                    .find(|(_, _, candidate)| candidate == path)
+                    .map(|(_, name, _)| name.clone())
+                    .unwrap_or_else(|| "模板已丢失".to_owned())
+            })
+            .unwrap_or_else(|| "未选择模板".to_owned())
+    };
+    let mut summary = match step.kind {
+        StepKind::WaitAndClick => format!(
+            "{} · 超时 {}s",
+            template_name(&step.template),
+            step.timeout_secs
+        ),
+        StepKind::WaitAny => format!(
+            "{} 个目标 · 超时 {}s",
+            step.branches.len(),
+            step.timeout_secs
+        ),
+        StepKind::VisualCondition => format!(
+            "{} 个条件 · 满足后{}",
+            step.visual_condition.terms.len(),
+            step.visual_condition.outcome.label()
+        ),
+        StepKind::Delay => format!("等待 {:.1}s", step.delay_ms as f32 / 1000.0),
+        StepKind::RoundEnd => "计一局并开始下一轮".to_owned(),
+        StepKind::Branch => "尚未开放".to_owned(),
+    };
+    if !step.enabled {
+        summary.push_str(" · 已停用");
+    }
+    summary
+}
+
+/// Two-line label for a step row: colored type chip + name, then a summary line.
+fn step_row_text(
+    step: &WorkflowStep,
+    index: usize,
+    selected: bool,
+    templates: &[(u64, String, String)],
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let format = |size: f32, color: Color32| egui::TextFormat {
+        font_id: egui::FontId::proportional(size),
+        color,
+        ..Default::default()
+    };
+    let (chip, chip_color) = step_kind_chip(step.kind);
+    let name_color = if selected {
+        theme::blue()
+    } else if step.enabled {
+        theme::label()
+    } else {
+        theme::tertiary_label()
+    };
+    job.append(
+        &format!("{}  ", index + 1),
+        0.0,
+        format(12.0, theme::tertiary_label()),
+    );
+    job.append(chip, 0.0, format(12.0, chip_color));
+    job.append(&format!("  {}", step.name), 0.0, format(13.5, name_color));
+    job.append("\n", 0.0, format(5.0, theme::tertiary_label()));
+    job.append(
+        &step_summary(step, templates),
+        0.0,
+        format(11.0, theme::tertiary_label()),
+    );
+    job
 }
 
 fn template_picker(
