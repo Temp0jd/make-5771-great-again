@@ -1586,62 +1586,6 @@ impl Make5771App {
                             .color(theme::tertiary_label()),
                     );
                 });
-                match list_command {
-                    Some(StepListCommand::Add(kind)) => {
-                        let id = self
-                            .profile
-                            .steps
-                            .iter()
-                            .map(|step| step.id)
-                            .max()
-                            .unwrap_or(0)
-                            + 1;
-                        let count = self
-                            .profile
-                            .steps
-                            .iter()
-                            .filter(|step| step.kind == kind)
-                            .count();
-                        self.profile.steps.push(WorkflowStep::new(
-                            id,
-                            format!("{} {}", kind.label(), count + 1),
-                            kind,
-                            0,
-                        ));
-                        self.selected_step = Some(id);
-                    }
-                    Some(StepListCommand::MoveUp(index)) => {
-                        self.profile.steps.swap(index, index - 1);
-                    }
-                    Some(StepListCommand::MoveDown(index)) => {
-                        self.profile.steps.swap(index, index + 1);
-                    }
-                    Some(StepListCommand::Duplicate(index)) => {
-                        let mut copy = self.profile.steps[index].clone();
-                        copy.id = self
-                            .profile
-                            .steps
-                            .iter()
-                            .map(|step| step.id)
-                            .max()
-                            .unwrap_or(0)
-                            + 1;
-                        copy.name = format!("{} 副本", copy.name);
-                        let new_id = copy.id;
-                        self.profile.steps.insert(index + 1, copy);
-                        self.selected_step = Some(new_id);
-                    }
-                    Some(StepListCommand::ToggleEnabled(index)) => {
-                        let step = &mut self.profile.steps[index];
-                        step.enabled = !step.enabled;
-                    }
-                    Some(StepListCommand::Delete(index)) => {
-                        self.profile.steps.remove(index);
-                        let next_index = index.min(self.profile.steps.len() - 1);
-                        self.selected_step = Some(self.profile.steps[next_index].id);
-                    }
-                    None => {}
-                }
                 ui.separator();
 
                 let window_height = ui
@@ -1744,6 +1688,65 @@ impl Make5771App {
                             });
                         }
                     });
+
+                // Commands are produced by the row widgets above, so they must
+                // be applied only after the list has rendered.
+                match list_command {
+                    Some(StepListCommand::Add(kind)) => {
+                        let id = self
+                            .profile
+                            .steps
+                            .iter()
+                            .map(|step| step.id)
+                            .max()
+                            .unwrap_or(0)
+                            + 1;
+                        let count = self
+                            .profile
+                            .steps
+                            .iter()
+                            .filter(|step| step.kind == kind)
+                            .count();
+                        self.profile.steps.push(WorkflowStep::new(
+                            id,
+                            format!("{} {}", kind.label(), count + 1),
+                            kind,
+                            0,
+                        ));
+                        self.selected_step = Some(id);
+                    }
+                    Some(StepListCommand::MoveUp(index)) => {
+                        self.profile.steps.swap(index, index - 1);
+                    }
+                    Some(StepListCommand::MoveDown(index)) => {
+                        self.profile.steps.swap(index, index + 1);
+                    }
+                    Some(StepListCommand::Duplicate(index)) => {
+                        let mut copy = self.profile.steps[index].clone();
+                        copy.id = self
+                            .profile
+                            .steps
+                            .iter()
+                            .map(|step| step.id)
+                            .max()
+                            .unwrap_or(0)
+                            + 1;
+                        copy.name = format!("{} 副本", copy.name);
+                        let new_id = copy.id;
+                        self.profile.steps.insert(index + 1, copy);
+                        self.selected_step = Some(new_id);
+                    }
+                    Some(StepListCommand::ToggleEnabled(index)) => {
+                        let step = &mut self.profile.steps[index];
+                        step.enabled = !step.enabled;
+                    }
+                    Some(StepListCommand::Delete(index)) => {
+                        self.profile.steps.remove(index);
+                        let next_index = index.min(self.profile.steps.len() - 1);
+                        self.selected_step = Some(self.profile.steps[next_index].id);
+                    }
+                    None => {}
+                }
             });
 
             theme::card().show(&mut columns[1], |ui| {
