@@ -1,7 +1,26 @@
-# Make 5771 Great Again
+<div align="center">
 
-### 校猫罪大恶极 搞得玩家怨声载道 
-《弥萨格猫公德政碑》
+<img src="assets/icon.png" width="140" alt="誓死效忠忘却前夜">
+
+# 校猫罪大恶极，搞得玩家怨声载道
+
+### Make 5771 Great Again
+
+面向 Windows 11 的《忘却前夜》轻量视觉流程编辑器
+截图识别 × 自动点击 × 流程分享——只读屏幕画面，不读不写游戏进程
+
+[![Release](https://img.shields.io/github/v/release/Temp0jd/make-5771-great-again)](https://github.com/Temp0jd/make-5771-great-again/releases)
+[![CI](https://github.com/Temp0jd/make-5771-great-again/actions/workflows/ci.yml/badge.svg)](https://github.com/Temp0jd/make-5771-great-again/actions)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.98-orange?logo=rust)](https://www.rust-lang.org/)
+[![egui](https://img.shields.io/badge/egui-0.35-blue)](https://github.com/emilk/egui)
+[![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D6?logo=windows)](https://www.microsoft.com/windows)
+
+</div>
+
+---
+
+### 《弥萨格猫公德政碑》
 
 <img src="assets/emoji/kekesi-cry.png" width="72" alt="凯刻斯·大哭">
 
@@ -109,41 +128,22 @@
 
 <img src="assets/emoji/ramona-point.png" width="72" alt="拉蒙娜·指：给我玩忘却前夜！">
 
+---
 
+## 功能一览
 
-## 当前范围
+- **界面**：iOS 风格中文界面、自绘无边框窗口、运行/流程/模板/日志/设置五页、忘却前夜表情装饰
+- **流程编排**：等待并点击、等待任一目标、视觉条件（AND/OR + 稳定确认）、固定等待、本局结束；分支子动作与优先级；固定次数、截止时间、持续运行三种循环策略
+- **执行安全**：失去前台自动暂停、F8 紧急停止、客户区尺寸保护、窗口掉线自动重连、截止时间跨午夜顺延、前台/后台两种点击方式与拟人化抖动
+- **模板工具**：F6 快速截图框选、PNG/JPG 拖放导入、局部搜索区域建议、识别测试与匹配位置可视化、模板缩略图预览、分辨率不符自动缩放
+- **分享协作**：`.m5771pack` 单文件导出（内嵌模板图）、拖放导入、多流程文件管理
+- **可观测性**：每局耗时与预计剩余时间、超时输出最佳相似度、日志落盘、崩溃 crash.log、系统托盘与完成通知
 
-- iOS 风格中文桌面界面
-- 自绘无边框标题栏与窗口控制
-- 运行、流程、模板、日志、设置五个页面
-- 主页面与长列表可见滚动条，支持小窗口浏览
-- 固定次数、截止时间、持续运行三种循环策略
-- 纵向步骤与可执行的画面分支
-- AND/OR 组合的视觉条件步骤与稳定确认
-- JSON 流程保存
-- 多流程文件管理与另存为
-- 新建流程与 `.m5771pack` 单文件导入/导出
-- 分享包自动嵌入 PNG 模板并在导入时重写本机路径
-- 分辨率不符时按比例缩放模板与搜索区域
-- 超时失败时输出最佳相似度辅助调试
-- 自动查找目标窗口，失败时可搜索、刷新并手动选择可见窗口
-- Windows 客户区截图底层
-- 纯 Rust 灰度模板匹配原型
-- PNG/JPG 导入与拖放
-- 截图框选、模板命名和裁剪保存
-- F6 快速截图与 F8 紧急停止快捷键
-- 自动建议局部搜索区域
-- 模板识别测试、阈值控制与匹配位置可视化
-- 流程步骤与模板绑定
-- 前台与客户区尺寸双重保护的标准鼠标点击
-- 前台/后台可切换点击方式与拟人化抖动
-- 游戏窗口关闭后自动重新连接
-- 系统托盘、完成通知与任务栏闪烁提醒
-- 每局耗时统计、预计剩余时间与日志落盘
-- 可中断执行线程、步骤超时与失去前台自动暂停
-- 固定局数、当天截止时间和持续运行策略
+## 执行模型
 
-当前执行器支持“等待并点击”“固定等待”“本局结束”三类线性步骤、外层循环、可执行的“等待任一目标”，以及“视觉条件”步骤：按 AND/OR 组合多条出现/不出现检查，连续稳定确认后可继续流程、点击命中模板、完成本局或停止任务。画面分支按列表优先级匹配，命中后可点击触发目标、执行线性子动作，再返回等待、继续后续步骤、完成本局或停止任务。通用 If/Else 条件节点仍在后续计划中。执行层只使用屏幕画面和 Windows 标准输入接口，不读取或修改目标进程；截止时间跨午夜自动顺延到次日，游戏窗口意外关闭后会按标题自动重连。
+执行器支持三类线性步骤（等待并点击 / 固定等待 / 本局结束）、外层循环、可执行的“等待任一目标”分支，以及“视觉条件”步骤：按 AND/OR 组合多条出现/不出现检查，连续稳定确认后可继续流程、点击命中模板、完成本局或停止任务。画面分支按列表优先级匹配，命中后可点击触发目标、执行线性子动作，再返回等待、继续后续步骤、完成本局或停止任务。通用 If/Else 条件节点仍在后续计划中。
+
+执行层只使用屏幕画面和 Windows 标准输入接口，不读取或修改目标进程。
 
 ## 分享流程
 
@@ -166,4 +166,4 @@ Windows 发布构建：
 cargo build --release
 ```
 
-输出文件位于 `target\release\Make5771GreatAgain.exe`。
+输出文件位于 `target\release\Make5771GreatAgain.exe`。推送 `v*` 标签会自动触发 CI 构建并发布 GitHub Release。
