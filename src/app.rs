@@ -87,6 +87,7 @@ struct TemplateTestOutcome {
 pub struct Make5771App {
     active_tab: AppTab,
     profile: MacroProfile,
+    shared_templates: Vec<TemplateAsset>,
     selected_step: Option<u64>,
     runner_status: RunnerStatus,
     completed_rounds: u32,
@@ -139,10 +140,16 @@ impl Make5771App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut profile =
             storage::load_profile(&storage::default_profile_path()).unwrap_or_default();
+        let shared_templates = storage::load_shared_templates();
         theme::install(&cc.egui_ctx, profile.dark_mode);
         cc.egui_ctx.set_zoom_factor(profile.ui_scale);
         let target_window = platform::find_target_window(&profile.target_window).ok();
-        if profile.templates.is_empty()
+        let has_templates = if profile.shared_templates {
+            !shared_templates.is_empty()
+        } else {
+            !profile.templates.is_empty()
+        };
+        if !has_templates
             && let Some(target) = &target_window
             && target.client_width > 0
             && target.client_height > 0
@@ -185,6 +192,7 @@ impl Make5771App {
         let mut app = Self {
             active_tab: AppTab::Run,
             profile,
+            shared_templates,
             selected_step: Some(1),
             runner_status: RunnerStatus::Ready,
             completed_rounds: 0,
@@ -251,10 +259,20 @@ impl Make5771App {
         app
     }
 
+    /// The template library active for the current mode: the shared library
+    /// when the profile opts in, otherwise the profile's own templates.
+    fn effective_templates(&self) -> &Vec<TemplateAsset> {
+        if self.profile.shared_templates {
+            &self.shared_templates
+        } else {
+            &self.profile.templates
+        }
+    }
+
     fn connect_target_window(&mut self) {
         match platform::find_target_window(&self.profile.target_window) {
             Ok(target) => {
-                if self.profile.templates.is_empty()
+                if self.effective_templates().is_empty()
                     && target.client_width > 0
                     && target.client_height > 0
                 {
@@ -312,7 +330,7 @@ impl Make5771App {
     }
 
     fn select_target_window(&mut self, target: TargetWindow) {
-        if self.profile.templates.is_empty() {
+        if self.effective_templates().is_empty() {
             self.profile.expected_client_width = target.client_width;
             self.profile.expected_client_height = target.client_height;
         }
@@ -582,7 +600,11 @@ impl Make5771App {
             self.toast = Some("请先连接游戏窗口".to_owned());
             return;
         };
-        match RunnerHandle::start(self.profile.clone(), target.clone()) {
+        let mut profile = self.profile.clone();
+        if profile.shared_templates {
+            profile.templates = self.shared_templates.clone();
+        }
+        match RunnerHandle::start(profile, target.clone()) {
             Ok(runner) => {
                 if let Err(error) = platform::focus_target(&target) {
                     runner.request_stop();
@@ -609,8 +631,7 @@ impl Make5771App {
         frame: image::RgbaImage,
     ) {
         let Some(template_asset) = self
-            .profile
-            .templates
+            .effective_templates()
             .iter()
             .find(|template| template.id == template_id)
             .cloned()
@@ -693,8 +714,7 @@ impl Make5771App {
         let reference_width = draft.image.width();
         let reference_height = draft.image.height();
         let id = self
-            .profile
-            .templates
+            .effective_templates()
             .iter()
             .map(|template| template.id)
             .max()
@@ -721,7 +741,7 @@ impl Make5771App {
 
         match result {
             Ok(()) => {
-                self.profile.templates.push(TemplateAsset {
+                let asset = TemplateAsset {
                     id,
                     name: name.clone(),
                     path: path.to_string_lossy().into_owned(),
@@ -734,13 +754,25 @@ impl Make5771App {
                         reference_width,
                         reference_height,
                     )),
-                });
-                if let Err(error) = storage::save_profile(&self.current_profile_path, &self.profile)
-                {
-                    self.push_log(
-                        LogLevel::Warning,
-                        format!("模板已保存，但流程更新失败：{error}"),
-                    );
+                };
+                if self.profile.shared_templates {
+                    self.shared_templates.push(asset);
+                    if let Err(error) = storage::save_shared_templates(&self.shared_templates) {
+                        self.push_log(
+                            LogLevel::Warning,
+                            format!("模板已保存，但公共模板库更新失败：{error}"),
+                        );
+                    }
+                } else {
+                    self.profile.templates.push(asset);
+                    if let Err(error) =
+                        storage::save_profile(&self.current_profile_path, &self.profile)
+                    {
+                        self.push_log(
+                            LogLevel::Warning,
+                            format!("模板已保存，但流程更新失败：{error}"),
+                        );
+                    }
                 }
                 self.toast = Some(format!("模板“{name}”已保存"));
                 self.push_log(LogLevel::Success, format!("已保存模板：{name}"));
@@ -963,13 +995,18 @@ impl Make5771App {
         profile.expected_client_height = self.profile.expected_client_height;
         profile.sharing.author = self.profile.sharing.author.clone();
         profile.sharing.game_language = self.profile.sharing.game_language.clone();
+        profile.shared_templates = true;
         if self.new_flow_preset == NewFlowPreset::Blank {
             profile.steps = vec![WorkflowStep::new(1, "新步骤", StepKind::WaitAndClick, 0)];
         }
-        match storage::save_profile(&self.current_profile_path, &profile) {
+        let path = storage::unique_profile_path(&profile.name);
+        match storage::save_profile(&path, &profile) {
             Ok(()) => {
                 let profile_name = profile.name.clone();
                 self.profile = profile;
+                self.current_profile_path = path.clone();
+                self.selected_profile = Some(path);
+                self.refresh_profiles();
                 self.selected_step = self.profile.steps.first().map(|step| step.id);
                 self.active_tab = AppTab::Flow;
                 self.new_flow_open = false;
@@ -1012,26 +1049,40 @@ impl Make5771App {
         };
         match storage::import_workflow_package(&path) {
             Ok((profile, summary)) => {
-                if let Err(error) = storage::save_profile(&self.current_profile_path, &profile) {
+                let save_path = storage::unique_profile_path(&profile.name);
+                if let Err(error) = storage::save_profile(&save_path, &profile) {
                     self.toast = Some(format!("导入后保存失败：{error}"));
                     self.push_log(LogLevel::Warning, format!("导入后保存失败：{error}"));
                     return;
                 }
+                let merged = if profile.shared_templates {
+                    self.merge_shared_templates(&profile.templates)
+                } else {
+                    0
+                };
                 self.profile = profile;
+                self.current_profile_path = save_path.clone();
+                self.selected_profile = Some(save_path);
+                self.refresh_profiles();
                 self.target_window = platform::find_target_window(&self.profile.target_window).ok();
                 self.selected_step = self.profile.steps.first().map(|step| step.id);
                 self.active_tab = AppTab::Flow;
                 self.template_draft = None;
                 self.template_test_view = None;
                 let message = format!(
-                    "已导入流程“{}”{}，包含 {} 个图片模板",
+                    "已导入流程“{}”{}，包含 {} 个图片模板{}",
                     summary.profile_name,
                     if summary.author.trim().is_empty() {
                         String::new()
                     } else {
                         format!("（作者：{}）", summary.author)
                     },
-                    summary.template_count
+                    summary.template_count,
+                    if merged > 0 {
+                        format!("，其中 {merged} 个已并入公共模板库")
+                    } else {
+                        String::new()
+                    }
                 );
                 self.toast = Some(message.clone());
                 self.push_log(LogLevel::Success, message);
@@ -1042,6 +1093,40 @@ impl Make5771App {
                 self.push_log(LogLevel::Warning, error.to_string());
             }
         }
+    }
+
+    /// Merges imported templates into the shared library (deduplicated by
+    /// path, ids reassigned) and persists it. Returns how many were added.
+    fn merge_shared_templates(&mut self, templates: &[TemplateAsset]) -> usize {
+        let mut next_id = self
+            .shared_templates
+            .iter()
+            .map(|template| template.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut added = 0_usize;
+        for template in templates {
+            if self
+                .shared_templates
+                .iter()
+                .any(|candidate| candidate.path == template.path)
+            {
+                continue;
+            }
+            let mut template = template.clone();
+            template.id = next_id;
+            next_id += 1;
+            self.shared_templates.push(template);
+            added += 1;
+        }
+        if added > 0
+            && let Err(error) = storage::save_shared_templates(&self.shared_templates)
+        {
+            self.toast = Some(format!("公共模板库保存失败：{error}"));
+            self.push_log(LogLevel::Warning, format!("公共模板库保存失败：{error}"));
+        }
+        added
     }
 
     fn export_flow_package(&mut self) {
@@ -1060,7 +1145,9 @@ impl Make5771App {
         let Some(path) = path else {
             return;
         };
-        match storage::export_workflow_package(&path, &self.profile) {
+        let mut packaged = self.profile.clone();
+        packaged.templates = self.effective_templates().clone();
+        match storage::export_workflow_package(&path, &packaged) {
             Ok(summary) => {
                 let message = format!(
                     "已导出流程“{}”，打包 {} 个图片模板",
@@ -1082,8 +1169,7 @@ impl Make5771App {
             return;
         }
         let Some(template) = self
-            .profile
-            .templates
+            .effective_templates()
             .iter()
             .find(|template| template.id == template_id)
             .cloned()
@@ -1092,12 +1178,21 @@ impl Make5771App {
             return;
         };
 
-        let mut updated = self.profile.clone();
-        updated
-            .templates
-            .retain(|candidate| candidate.id != template_id);
-        clear_template_references(&mut updated, &template.path);
-        if let Err(error) = storage::save_profile(&self.current_profile_path, &updated) {
+        clear_template_references(&mut self.profile, &template.path);
+        if self.profile.shared_templates {
+            self.shared_templates
+                .retain(|candidate| candidate.id != template_id);
+            if let Err(error) = storage::save_shared_templates(&self.shared_templates) {
+                self.toast = Some(format!("删除模板失败：{error}"));
+                self.push_log(LogLevel::Warning, format!("删除模板失败：{error}"));
+                return;
+            }
+        } else {
+            self.profile
+                .templates
+                .retain(|candidate| candidate.id != template_id);
+        }
+        if let Err(error) = storage::save_profile(&self.current_profile_path, &self.profile) {
             self.toast = Some(format!("删除模板失败：{error}"));
             self.push_log(LogLevel::Warning, format!("删除模板失败：{error}"));
             return;
@@ -1132,7 +1227,6 @@ impl Make5771App {
             None
         };
 
-        self.profile = updated;
         self.pending_delete_template = None;
         let references = count_template_references(&self.profile, &template.path);
         let message = if let Some(destination) = recovery {
@@ -1515,8 +1609,7 @@ impl Make5771App {
 
     fn flow_page(&mut self, ui: &mut egui::Ui) {
         let template_options: Vec<(u64, String, String)> = self
-            .profile
-            .templates
+            .effective_templates()
             .iter()
             .map(|template| (template.id, template.name.clone(), template.path.clone()))
             .collect();
@@ -2037,7 +2130,17 @@ impl Make5771App {
         let mut requested_delete = None;
         theme::card().show(ui, |ui| {
             ui.set_min_height(360.0);
-            if self.profile.templates.is_empty() {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.profile.shared_templates, true, "公共模板库");
+                ui.selectable_value(&mut self.profile.shared_templates, false, "随流程独立");
+            });
+            ui.label(
+                RichText::new("公共＝所有流程共用这份模板；独立＝模板随当前流程保存和分享")
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
+            ui.separator();
+            if self.effective_templates().is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(70.0);
                     ui.add(
@@ -2075,7 +2178,7 @@ impl Make5771App {
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .max_height(430.0)
                     .show(ui, |ui| {
-                        for template in self.profile.templates.clone() {
+                        for template in self.effective_templates().clone() {
                             ui.horizontal(|ui| {
                                 match self
                                     .thumbs
@@ -2402,7 +2505,7 @@ impl Make5771App {
                     self.profile.expected_client_height = target.client_height;
                 }
             });
-            if !self.profile.templates.is_empty() {
+            if !self.effective_templates().is_empty() {
                 ui.label(
                     RichText::new("改变基准尺寸后，旧模板的局部搜索区可能需要重新截取。")
                         .size(11.0)
@@ -2798,8 +2901,7 @@ impl Make5771App {
 
         if let Some(template_id) = self.pending_delete_template {
             let template = self
-                .profile
-                .templates
+                .effective_templates()
                 .iter()
                 .find(|template| template.id == template_id)
                 .cloned();
@@ -2983,8 +3085,7 @@ impl Make5771App {
 
         if let Some(template_id) = self.thumbs.preview {
             let template = self
-                .profile
-                .templates
+                .effective_templates()
                 .iter()
                 .find(|template| template.id == template_id)
                 .cloned();

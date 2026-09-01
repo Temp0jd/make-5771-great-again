@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{LogEntry, LogLevel, MacroProfile};
+use crate::model::{LogEntry, LogLevel, MacroProfile, TemplateAsset};
 
 const PACKAGE_FORMAT: &str = "make5771.workflow-package";
 const PACKAGE_VERSION: u32 = 1;
 const MAX_PACKAGE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ASSETS: usize = 500;
+const SHARED_TEMPLATES_FILE: &str = "shared_templates.json";
 
 pub fn default_profile_path() -> PathBuf {
     PathBuf::from("profiles/default.m5771.json")
@@ -51,6 +52,75 @@ pub fn profile_display_name(path: &Path) -> String {
                 .to_owned()
         })
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Picks a non-conflicting profile path under `profiles/` for a flow named
+/// `name`, appending `-2`, `-3`, … when the base name is already taken.
+pub fn unique_profile_path(name: &str) -> PathBuf {
+    unique_profile_path_in(Path::new("profiles"), name)
+}
+
+fn unique_profile_path_in(dir: &Path, name: &str) -> PathBuf {
+    let base = sanitize_profile_name(name);
+    for attempt in 0_u32.. {
+        let file_name = if attempt == 0 {
+            format!("{base}{PROFILE_SUFFIX}")
+        } else {
+            format!("{base}-{}{PROFILE_SUFFIX}", attempt + 1)
+        };
+        let path = dir.join(file_name);
+        if !path.exists() {
+            return path;
+        }
+    }
+    unreachable!()
+}
+
+fn sanitize_profile_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .filter(|character| {
+            !matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+        })
+        .collect();
+    let sanitized = sanitized.trim().trim_end_matches('.');
+    if sanitized.is_empty() {
+        "未命名".to_owned()
+    } else {
+        sanitized.to_owned()
+    }
+}
+
+/// Loads the shared template library. A missing or unreadable file yields an
+/// empty library; the file itself is always left untouched.
+pub fn load_shared_templates() -> Vec<TemplateAsset> {
+    load_shared_templates_from(Path::new(SHARED_TEMPLATES_FILE))
+}
+
+fn load_shared_templates_from(path: &Path) -> Vec<TemplateAsset> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+/// Persists the shared template library next to `profiles/`.
+pub fn save_shared_templates(templates: &[TemplateAsset]) -> Result<(), StorageError> {
+    save_shared_templates_to(Path::new(SHARED_TEMPLATES_FILE), templates)
+}
+
+fn save_shared_templates_to(path: &Path, templates: &[TemplateAsset]) -> Result<(), StorageError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(StorageError::Write)?;
+    }
+    let contents = serde_json::to_string_pretty(templates).map_err(StorageError::Encode)?;
+    fs::write(path, contents).map_err(StorageError::Write)
 }
 
 /// Appends one log line to `logs/<date>.log`; failures are non-fatal.
@@ -520,11 +590,104 @@ mod tests {
         fs::write(root.join("b.m5771.json"), "{}").unwrap();
         fs::write(root.join("a.m5771.json"), "{}").unwrap();
         fs::write(root.join("notes.txt"), "{}").unwrap();
+        fs::write(root.join("shared_templates.json"), "[]").unwrap();
 
         let profiles = list_profiles_in(&root);
         assert_eq!(profiles.len(), 2);
         assert_eq!(profile_display_name(&profiles[0]), "a");
         assert_eq!(profile_display_name(&profiles[1]), "b");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unique_profile_path_sanitizes_and_avoids_conflicts() {
+        let root = std::env::temp_dir().join(format!("m5771-unique-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+
+        let path = unique_profile_path_in(&root, "日常/刷关:v2");
+        assert_eq!(path, root.join("日常刷关v2.m5771.json"));
+
+        fs::write(&path, "{}").unwrap();
+        let second = unique_profile_path_in(&root, "日常/刷关:v2");
+        assert_eq!(second, root.join("日常刷关v2-2.m5771.json"));
+
+        fs::write(&second, "{}").unwrap();
+        let third = unique_profile_path_in(&root, "日常/刷关:v2");
+        assert_eq!(third, root.join("日常刷关v2-3.m5771.json"));
+
+        assert_eq!(
+            unique_profile_path_in(&root, "  "),
+            root.join("未命名.m5771.json")
+        );
+        assert_eq!(
+            unique_profile_path_in(&root, "..."),
+            root.join("未命名.m5771.json")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_templates_round_trip() {
+        let root = std::env::temp_dir().join(format!(
+            "m5771-shared-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = root.join("shared_templates.json");
+        let templates = vec![
+            TemplateAsset {
+                id: 1,
+                name: "开始".to_owned(),
+                path: "templates/start.png".to_owned(),
+                width: 12,
+                height: 8,
+                reference_width: 1280,
+                reference_height: 720,
+                search_region: None,
+            },
+            TemplateAsset {
+                id: 2,
+                name: "结算".to_owned(),
+                path: "templates/end.png".to_owned(),
+                width: 20,
+                height: 10,
+                reference_width: 1280,
+                reference_height: 720,
+                search_region: Some(crate::model::SearchRegionSpec {
+                    x: 1,
+                    y: 2,
+                    width: 30,
+                    height: 40,
+                }),
+            },
+        ];
+
+        save_shared_templates_to(&path, &templates).expect("shared templates should save");
+        let loaded = load_shared_templates_from(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "开始");
+        assert_eq!(loaded[1].search_region, templates[1].search_region);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_templates_load_tolerates_missing_or_broken_file() {
+        let root = std::env::temp_dir().join(format!(
+            "m5771-shared-missing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("shared_templates.json");
+
+        assert!(load_shared_templates_from(&path).is_empty());
+
+        fs::write(&path, "not json").unwrap();
+        assert!(load_shared_templates_from(&path).is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
 
         let _ = fs::remove_dir_all(root);
     }
