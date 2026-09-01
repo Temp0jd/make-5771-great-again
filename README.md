@@ -183,7 +183,7 @@
 3. 分享生成的 `.m5771pack` 单文件，不需要另外附带 `templates` 目录。
 4. 接收者点击「导入分享包」，或将文件直接拖入程序。
 
-格式详细说明见 [docs/M5771_PACKAGE_SPEC.md](docs/M5771_PACKAGE_SPEC.md)。项目还提供了不含图片的 [Auto 起步包](examples/auto-starter.m5771pack)（导入后可自行绑定截图）、[活动刷同调示例包](examples/morimens-event-tongdiao.m5771pack)（主循环监视调查弹窗，命中后分别执行「开始调查」「调查失败重新开始」两条动作序列，含 11 张模板），以及 [Token 选择范例包](examples/token-select-example.m5771pack)（演示「出现 A → 选择 A → 确认」的通用模式）。
+格式详细说明见 [docs/M5771_PACKAGE_SPEC.md](docs/M5771_PACKAGE_SPEC.md)。项目还提供了不含图片的 [Auto 起步包](examples/auto-starter.m5771pack)（导入后可自行绑定截图）、[活动关卡（刷同调）示例包](examples/morimens-event-tongdiao.m5771pack)（主循环常驻监视：通关自动开新局并计数、死亡自动重开、活动Token随选随确认、Auto 未开启才点，含 11 张模板），以及 [Token 选择范例包](examples/token-select-example.m5771pack)（演示「出现 A → 选择 A → 确认」的通用模式）。
 
 ## 本地开发
 

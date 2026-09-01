@@ -15,7 +15,7 @@
     "templates": [
       {
         "id": 1,
-        "name": "巧克力",
+        "name": "活动Token",
         "path": "assets/template-5.png",
         "width": 223,
         "height": 42,
@@ -36,7 +36,7 @@
     ],
     "sharing": {
       "author": "Make 5771 Team",
-      "description": "演示“Token 选择”通用模式：出现 A（巧克力 Token 选择界面）→ 点击选择一个 → 点击确认，不消耗体力。在其他流程里复用时，把这两步作为分支动作（等待并点击 A + 等待并点击 确认），A 不一定出现就给动作勾上“未找到时跳过（可选动作）”。基准分辨率 2560×1440，其他分辨率自动缩放模板。",
+      "description": "演示“Token 选择”通用模式：出现 A（活动Token 选择界面）→ 点击选择一个 → 点击确认，不消耗体力。在其他流程里复用时，把这两步作为分支动作（等待并点击 A + 等待并点击 确认），A 不一定出现就给动作勾上“未找到时跳过（可选动作）”。基准分辨率 2560×1440，其他分辨率自动缩放模板。",
       "game_version": "",
       "game_language": "简体中文",
       "tags": "范例,Token选择"
@@ -44,7 +44,7 @@
     "steps": [
       {
         "id": 1,
-        "name": "选择 Token（巧克力）",
+        "name": "选择活动Token",
         "kind": "WaitAndClick",
         "indent": 0,
         "enabled": true,
