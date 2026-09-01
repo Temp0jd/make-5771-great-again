@@ -1246,6 +1246,10 @@ impl Make5771App {
         ui.label(RichText::new("选择流程并设置本次运行方式").color(theme::secondary_label()));
         ui.add_space(10.0);
 
+        let profiles_cache = self.profiles_cache.clone();
+        let current_path = self.current_profile_path.clone();
+        let mut switch_to = None;
+        let mut refresh = false;
         theme::card().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -1285,7 +1289,44 @@ impl Make5771App {
                     }
                 });
             });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("切换流程")
+                        .size(12.0)
+                        .color(theme::secondary_label()),
+                );
+                egui::ComboBox::from_id_salt("run-flow-switcher")
+                    .selected_text(storage::profile_display_name(&current_path))
+                    .show_ui(ui, |ui| {
+                        for path in &profiles_cache {
+                            if ui
+                                .selectable_label(
+                                    path == &current_path,
+                                    storage::profile_display_name(path),
+                                )
+                                .clicked()
+                            {
+                                switch_to = Some(path.clone());
+                            }
+                        }
+                    });
+                if ui.small_button("刷新").clicked() {
+                    refresh = true;
+                }
+                ui.label(
+                    RichText::new("直接载入所选流程，未保存的修改会丢失")
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
+            });
         });
+        if refresh {
+            self.refresh_profiles();
+        }
+        if let Some(path) = switch_to {
+            self.open_profile(&path);
+        }
 
         ui.add_space(8.0);
         theme::card().show(ui, |ui| {
@@ -3032,6 +3073,9 @@ impl Make5771App {
                 );
                 if response.clicked() {
                     self.active_tab = tab;
+                    if tab == AppTab::Run {
+                        self.refresh_profiles();
+                    }
                 }
             }
         });
