@@ -434,7 +434,7 @@ mod windows_impl {
             Err(_) => return Err("无法创建托盘消息窗口".to_owned()),
         };
 
-        let mut data = NOTIFYICONDATAW {
+        let data = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: window,
             uID: TRAY_ICON_ID,
@@ -444,7 +444,7 @@ mod windows_impl {
             szTip: wide_array(APP_TITLE),
             ..Default::default()
         };
-        if !unsafe { Shell_NotifyIconW(NIM_ADD, &mut data) }.as_bool() {
+        if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
             unsafe {
                 let _ = DestroyWindow(window);
             }
@@ -454,20 +454,20 @@ mod windows_impl {
     }
 
     unsafe fn cleanup_tray(window: HWND) {
-        let mut data = NOTIFYICONDATAW {
+        let data = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: window,
             uID: TRAY_ICON_ID,
             ..Default::default()
         };
         unsafe {
-            let _ = Shell_NotifyIconW(NIM_DELETE, &mut data);
+            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
             let _ = DestroyWindow(window);
         }
     }
 
     pub fn show_tray_notification(window: isize, title: &str, message: &str) {
-        let mut data = NOTIFYICONDATAW {
+        let data = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: HWND(window as *mut c_void),
             uID: TRAY_ICON_ID,
@@ -478,7 +478,7 @@ mod windows_impl {
             ..Default::default()
         };
         unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &mut data);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
         }
     }
 
