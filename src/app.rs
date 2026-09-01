@@ -1580,22 +1580,9 @@ impl Make5771App {
                         for (index, step) in self.profile.steps.iter().enumerate() {
                             let selected = self.selected_step == Some(step.id);
                             ui.horizontal(|ui| {
-                                ui.add_space(step.indent as f32 * 22.0);
-                                if step.indent > 0 {
-                                    let (marker, _) =
-                                        ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-                                    ui.painter().circle_filled(
-                                        marker.center(),
-                                        3.0,
-                                        theme::tertiary_label(),
-                                    );
-                                }
                                 let controls_width = 3.0 * 24.0 + 16.0;
-                                let button_width = (ui.available_width()
-                                    - step.indent as f32 * 22.0
-                                    - 18.0
-                                    - controls_width)
-                                    .max(120.0);
+                                let button_width =
+                                    (ui.available_width() - 18.0 - controls_width).max(120.0);
                                 let button = egui::Button::new(step_row_text(
                                     step,
                                     index,
@@ -3132,46 +3119,39 @@ fn wait_any_editor(
 
     let mut command = None;
     let branch_count = step.branches.len();
-    egui::ScrollArea::vertical()
-        .id_salt(("wait-any-branches", step.id))
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-        .max_height(390.0)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for index in 0..branch_count {
-                let title = format!("{}. {}", index + 1, step.branches[index].name);
-                egui::CollapsingHeader::new(title)
-                    .id_salt(("workflow-branch", step.id, step.branches[index].id))
-                    .default_open(index == 0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(index > 0, egui::Button::new("上移"))
-                                .clicked()
-                            {
-                                command = Some(BranchListCommand::MoveUp(index));
-                            }
-                            if ui
-                                .add_enabled(index + 1 < branch_count, egui::Button::new("下移"))
-                                .clicked()
-                            {
-                                command = Some(BranchListCommand::MoveDown(index));
-                            }
-                            if ui.button("删除分支").clicked() {
-                                command = Some(BranchListCommand::Delete(index));
-                            }
-                        });
-                        edit_workflow_branch(
-                            ui,
-                            step.id,
-                            &mut step.branches[index],
-                            template_options,
-                            thumbs,
-                        );
-                    });
-                ui.separator();
-            }
-        });
+    for index in 0..branch_count {
+        let title = format!("{}. {}", index + 1, step.branches[index].name);
+        egui::CollapsingHeader::new(title)
+            .id_salt(("workflow-branch", step.id, step.branches[index].id))
+            .default_open(index == 0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(index > 0, egui::Button::new("上移"))
+                        .clicked()
+                    {
+                        command = Some(BranchListCommand::MoveUp(index));
+                    }
+                    if ui
+                        .add_enabled(index + 1 < branch_count, egui::Button::new("下移"))
+                        .clicked()
+                    {
+                        command = Some(BranchListCommand::MoveDown(index));
+                    }
+                    if ui.button("删除分支").clicked() {
+                        command = Some(BranchListCommand::Delete(index));
+                    }
+                });
+                edit_workflow_branch(
+                    ui,
+                    step.id,
+                    &mut step.branches[index],
+                    template_options,
+                    thumbs,
+                );
+            });
+        ui.separator();
+    }
 
     match command {
         Some(BranchListCommand::MoveUp(index)) => step.branches.swap(index, index - 1),
@@ -3254,57 +3234,46 @@ fn visual_condition_editor(
 
     let mut delete_index = None;
     let term_count = step.visual_condition.terms.len();
-    egui::ScrollArea::vertical()
-        .id_salt(("visual-condition-terms", step.id))
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-        .max_height(300.0)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for (index, term) in step.visual_condition.terms.iter_mut().enumerate() {
-                theme::subtle_card().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{}. {}", index + 1, term.name)).strong());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .add_enabled(term_count > 1, egui::Button::new("删除"))
-                                .clicked()
-                            {
-                                delete_index = Some(index);
-                            }
-                        });
-                    });
-                    ui.text_edit_singleline(&mut term.name);
-                    template_picker(
-                        ui,
-                        ("visual-condition-template", step.id, term.id),
-                        "检查画面",
-                        &mut term.template,
-                        template_options,
-                        thumbs,
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label("期望");
-                        egui::ComboBox::from_id_salt((
-                            "visual-condition-expectation",
-                            step.id,
-                            term.id,
-                        ))
-                        .selected_text(term.expectation.label())
-                        .show_ui(ui, |ui| {
-                            for expectation in ConditionExpectation::ALL {
-                                ui.selectable_value(
-                                    &mut term.expectation,
-                                    expectation,
-                                    expectation.label(),
-                                );
-                            }
-                        });
-                    });
-                    threshold_editor(ui, &mut term.threshold);
+    for (index, term) in step.visual_condition.terms.iter_mut().enumerate() {
+        theme::subtle_card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{}. {}", index + 1, term.name)).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(term_count > 1, egui::Button::new("删除"))
+                        .clicked()
+                    {
+                        delete_index = Some(index);
+                    }
                 });
-                ui.add_space(4.0);
-            }
+            });
+            ui.text_edit_singleline(&mut term.name);
+            template_picker(
+                ui,
+                ("visual-condition-template", step.id, term.id),
+                "检查画面",
+                &mut term.template,
+                template_options,
+                thumbs,
+            );
+            ui.horizontal(|ui| {
+                ui.label("期望");
+                egui::ComboBox::from_id_salt(("visual-condition-expectation", step.id, term.id))
+                    .selected_text(term.expectation.label())
+                    .show_ui(ui, |ui| {
+                        for expectation in ConditionExpectation::ALL {
+                            ui.selectable_value(
+                                &mut term.expectation,
+                                expectation,
+                                expectation.label(),
+                            );
+                        }
+                    });
+            });
+            threshold_editor(ui, &mut term.threshold);
         });
+        ui.add_space(4.0);
+    }
     if let Some(index) = delete_index {
         step.visual_condition.terms.remove(index);
     }
@@ -3748,7 +3717,8 @@ fn click_point_picker(
         && let Some(texture) = thumbs.texture(ui.ctx(), &template_path, &template_name)
     {
         let [tex_w, tex_h] = texture.size();
-        let scale = (260.0 / tex_w as f32).min(1.0);
+        let max_width = (ui.available_width() - 8.0).max(140.0);
+        let scale = (max_width / tex_w as f32).clamp(0.2, 2.0);
         let display_size = Vec2::new(tex_w as f32 * scale, tex_h as f32 * scale);
         let response = ui.add(
             egui::Image::new(texture)
@@ -4244,7 +4214,7 @@ impl eframe::App for Make5771App {
             .frame(
                 egui::Frame::new()
                     .fill(theme::background())
-                    .inner_margin(egui::Margin::symmetric(24, 12)),
+                    .inner_margin(egui::Margin::symmetric(14, 12)),
             )
             .show(ui, |ui| {
                 let active_tab = self.active_tab;
