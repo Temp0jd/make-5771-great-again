@@ -3583,7 +3583,7 @@ fn edit_workflow_branch(
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut action.optional, "未找到时跳过（可选动作）");
                         ui.label(
-                            RichText::new("体力补充等不一定出现的画面建议勾选")
+                            RichText::new("Token 选择等不一定出现的画面建议勾选")
                                 .size(11.0)
                                 .color(theme::tertiary_label()),
                         );
