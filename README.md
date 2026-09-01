@@ -152,7 +152,7 @@
 3. 分享生成的 `.m5771pack` 单文件，不需要另外附带 `templates` 目录。
 4. 接收者点击“导入分享包”，或将文件直接拖入程序。
 
-格式详细说明见 [docs/M5771_PACKAGE_SPEC.md](docs/M5771_PACKAGE_SPEC.md)。项目还提供了不含图片的 [Auto 起步包](examples/auto-starter.m5771pack)（导入后可自行绑定截图），以及从其他宏软件方案转换而来的[活动刷同调示例包](examples/morimens-event-tongdiao.m5771pack)（含“完成调查/取消”两张模板）。
+格式详细说明见 [docs/M5771_PACKAGE_SPEC.md](docs/M5771_PACKAGE_SPEC.md)。项目还提供了不含图片的 [Auto 起步包](examples/auto-starter.m5771pack)（导入后可自行绑定截图），以及[活动刷同调示例包](examples/morimens-event-tongdiao.m5771pack)（含“完成调查/取消”等 11 张模板）。
 
 ## 本地开发
 
