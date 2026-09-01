@@ -600,4 +600,30 @@ mod tests {
         assert!(package.profile.validate().is_ok());
         assert!(package.assets.is_empty());
     }
+
+    #[test]
+    fn bundled_event_package_matches_v1_schema() {
+        let package: WorkflowPackage = serde_json::from_str(include_str!(
+            "../examples/morimens-event-tongdiao.m5771pack"
+        ))
+        .unwrap();
+        assert_eq!(package.format, PACKAGE_FORMAT);
+        assert_eq!(package.format_version, PACKAGE_VERSION);
+        assert!(package.profile.validate().is_ok());
+        assert_eq!(package.assets.len(), package.profile.templates.len());
+        for template in &package.profile.templates {
+            let asset = package
+                .assets
+                .iter()
+                .find(|asset| asset.key == template.path)
+                .expect("template asset missing");
+            let bytes = decode_base64(&asset.data_base64).unwrap();
+            assert_eq!(bytes.len(), asset.byte_length);
+            let image = image::load_from_memory(&bytes).unwrap();
+            assert_eq!(
+                (image.width(), image.height()),
+                (template.width, template.height)
+            );
+        }
+    }
 }
