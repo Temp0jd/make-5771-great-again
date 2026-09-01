@@ -15,7 +15,61 @@
     "steps": [
       {
         "id": 1,
-        "name": "活动关卡主循环",
+        "name": "挑战（进入关卡）",
+        "kind": "WaitAndClick",
+        "indent": 0,
+        "enabled": true,
+        "template": "assets/template-3.png",
+        "threshold": 0.8,
+        "timeout_secs": 30,
+        "delay_ms": 1500,
+        "branches": [],
+        "visual_condition": {
+          "mode": "All",
+          "stable_checks": 2,
+          "outcome": "ContinueFlow",
+          "terms": []
+        }
+      },
+      {
+        "id": 2,
+        "name": "助战（打开助战列表）",
+        "kind": "WaitAndClick",
+        "indent": 0,
+        "enabled": true,
+        "template": "assets/template-9.png",
+        "threshold": 0.8,
+        "timeout_secs": 30,
+        "delay_ms": 1500,
+        "branches": [],
+        "visual_condition": {
+          "mode": "All",
+          "stable_checks": 2,
+          "outcome": "ContinueFlow",
+          "terms": []
+        }
+      },
+      {
+        "id": 3,
+        "name": "助战对象（选择助战）",
+        "kind": "WaitAndClick",
+        "indent": 0,
+        "enabled": true,
+        "template": "assets/template-11.png",
+        "threshold": 0.8,
+        "timeout_secs": 30,
+        "delay_ms": 1500,
+        "branches": [],
+        "visual_condition": {
+          "mode": "All",
+          "stable_checks": 2,
+          "outcome": "ContinueFlow",
+          "terms": []
+        }
+      },
+      {
+        "id": 4,
+        "name": "战斗中监视（非线性）",
         "kind": "WaitAny",
         "indent": 0,
         "enabled": true,
@@ -26,88 +80,6 @@
         "branches": [
           {
             "id": 1,
-            "name": "完成调查（通关，开新一局）",
-            "trigger_template": "assets/template-1.png",
-            "threshold": 0.7,
-            "click_trigger": true,
-            "trigger_delay_ms": 3000,
-            "outcome": "CompleteRound",
-            "actions": [
-              {
-                "id": 1,
-                "name": "挑战",
-                "kind": "WaitAndClick",
-                "template": "assets/template-3.png",
-                "threshold": 0.8,
-                "timeout_secs": 30,
-                "delay_ms": 1500,
-                "optional": false
-              },
-              {
-                "id": 2,
-                "name": "助战",
-                "kind": "WaitAndClick",
-                "template": "assets/template-9.png",
-                "threshold": 0.8,
-                "timeout_secs": 30,
-                "delay_ms": 1500,
-                "optional": false
-              },
-              {
-                "id": 3,
-                "name": "助战对象",
-                "kind": "WaitAndClick",
-                "template": "assets/template-11.png",
-                "threshold": 0.8,
-                "timeout_secs": 30,
-                "delay_ms": 1500,
-                "optional": false
-              },
-              {
-                "id": 4,
-                "name": "上场",
-                "kind": "WaitAndClick",
-                "template": "assets/template-10.png",
-                "threshold": 0.8,
-                "timeout_secs": 30,
-                "delay_ms": 1500,
-                "optional": true
-              },
-              {
-                "id": 5,
-                "name": "调查",
-                "kind": "WaitAndClick",
-                "template": "assets/template-4.png",
-                "threshold": 0.8,
-                "timeout_secs": 30,
-                "delay_ms": 1500,
-                "optional": false
-              }
-            ]
-          },
-          {
-            "id": 2,
-            "name": "取消（调查失败）",
-            "trigger_template": "assets/template-2.png",
-            "threshold": 0.8,
-            "click_trigger": true,
-            "trigger_delay_ms": 1000,
-            "outcome": "RepeatWait",
-            "actions": [
-              {
-                "id": 1,
-                "name": "重新战斗",
-                "kind": "WaitAndClick",
-                "template": "assets/template-8.png",
-                "threshold": 0.85,
-                "timeout_secs": 30,
-                "delay_ms": 1500,
-                "optional": false
-              }
-            ]
-          },
-          {
-            "id": 3,
             "name": "活动Token（选择一个并确认）",
             "trigger_template": "assets/template-5.png",
             "threshold": 0.8,
@@ -128,6 +100,37 @@
             ]
           },
           {
+            "id": 2,
+            "name": "完成调查（通关，计一局）",
+            "trigger_template": "assets/template-1.png",
+            "threshold": 0.7,
+            "click_trigger": true,
+            "trigger_delay_ms": 3000,
+            "outcome": "CompleteRound",
+            "actions": []
+          },
+          {
+            "id": 3,
+            "name": "取消（调查失败）",
+            "trigger_template": "assets/template-2.png",
+            "threshold": 0.8,
+            "click_trigger": true,
+            "trigger_delay_ms": 1000,
+            "outcome": "RepeatWait",
+            "actions": [
+              {
+                "id": 1,
+                "name": "重新战斗",
+                "kind": "WaitAndClick",
+                "template": "assets/template-8.png",
+                "threshold": 0.85,
+                "timeout_secs": 30,
+                "delay_ms": 1500,
+                "optional": false
+              }
+            ]
+          },
+          {
             "id": 4,
             "name": "重新战斗（角色死亡）",
             "trigger_template": "assets/template-8.png",
@@ -139,37 +142,7 @@
           },
           {
             "id": 5,
-            "name": "挑战",
-            "trigger_template": "assets/template-3.png",
-            "threshold": 0.8,
-            "click_trigger": true,
-            "trigger_delay_ms": 1500,
-            "outcome": "RepeatWait",
-            "actions": []
-          },
-          {
-            "id": 6,
-            "name": "助战",
-            "trigger_template": "assets/template-9.png",
-            "threshold": 0.8,
-            "click_trigger": true,
-            "trigger_delay_ms": 1500,
-            "outcome": "RepeatWait",
-            "actions": []
-          },
-          {
-            "id": 7,
-            "name": "助战对象",
-            "trigger_template": "assets/template-11.png",
-            "threshold": 0.8,
-            "click_trigger": true,
-            "trigger_delay_ms": 1500,
-            "outcome": "RepeatWait",
-            "actions": []
-          },
-          {
-            "id": 8,
-            "name": "上场",
+            "name": "上场（确认助战）",
             "trigger_template": "assets/template-10.png",
             "threshold": 0.8,
             "click_trigger": true,
@@ -178,8 +151,8 @@
             "actions": []
           },
           {
-            "id": 9,
-            "name": "调查",
+            "id": 6,
+            "name": "调查（开始战斗）",
             "trigger_template": "assets/template-4.png",
             "threshold": 0.8,
             "click_trigger": true,
@@ -188,7 +161,7 @@
             "actions": []
           },
           {
-            "id": 10,
+            "id": 7,
             "name": "自动（未开启才点）",
             "trigger_template": "assets/template-7.png",
             "threshold": 0.8,
@@ -206,7 +179,7 @@
         }
       },
       {
-        "id": 2,
+        "id": 5,
         "name": "本局结束",
         "kind": "RoundEnd",
         "indent": 0,
@@ -338,7 +311,7 @@
     ],
     "sharing": {
       "author": "",
-      "description": "活动关卡全自动循环：主循环常驻监视所有画面。通关弹“完成调查”→ 点击后依次 挑战→助战→助战对象→上场（可选确认）→调查 开新一局，计一次成功；角色死亡 → 点“重新战斗”自动重开（不计局数）；“活动Token”出现 → 点击选择一个再点确认（token 选择，任何时机都能接住）；“自动”使用未开启状态的模板，已开启不匹配、不会重复点。挑战/助战/助战对象/上场/调查另有常驻守护分支，首战和流程跑偏都能自动接力。基准分辨率 2560×1440，其他分辨率自动缩放模板。",
+      "description": "活动关卡全自动循环，部分线性 + 事件驱动：每轮开头按线性顺序执行 挑战→助战→助战对象；随后进入非线性监视——“活动Token”弹出随时选择一个并确认（不消耗体力）；“上场/调查”自动接力进战斗；“自动”使用未开启状态的模板，已开启不匹配不会误点；通关弹“完成调查”→ 点击计一局并开始下一轮线性段；角色死亡 → 点“重新战斗”自动重开（不计局数）。请从活动主界面（能看到“挑战”）启动流程。基准分辨率 2560×1440，其他分辨率自动缩放模板。",
       "game_version": "",
       "game_language": "简体中文",
       "tags": "活动,同调"
