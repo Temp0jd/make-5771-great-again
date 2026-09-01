@@ -52,7 +52,6 @@ struct TemplateThumbs {
     cache: std::collections::HashMap<String, egui::TextureHandle>,
     preview: Option<u64>,
 }
-
 impl TemplateThumbs {
     fn texture(
         &mut self,
@@ -73,6 +72,16 @@ impl TemplateThumbs {
         }
         self.cache.get(path)
     }
+}
+
+/// Result of a template recognition test produced on a worker thread; the
+/// frame rides along so the preview texture can be built on the main thread.
+struct TemplateTestOutcome {
+    template_name: String,
+    frame: image::RgbaImage,
+    search_region: SearchRegion,
+    threshold: f32,
+    result: Result<vision::MatchReport, String>,
 }
 
 pub struct Make5771App {
@@ -103,6 +112,7 @@ pub struct Make5771App {
     pending_capture: Option<image::RgbaImage>,
     capture_purpose: CapturePurpose,
     pending_test_capture: Option<(u64, image::RgbaImage)>,
+    template_test_pending: Option<std::sync::mpsc::Receiver<TemplateTestOutcome>>,
     template_test_view: Option<TemplateTestView>,
     template_test_threshold: f32,
     workflow_runner: Option<RunnerHandle>,
@@ -197,6 +207,7 @@ impl Make5771App {
             pending_capture: None,
             capture_purpose: CapturePurpose::NewTemplate,
             pending_test_capture: None,
+            template_test_pending: None,
             template_test_view: None,
             template_test_threshold: 0.90,
             workflow_runner: None,
@@ -588,72 +599,40 @@ impl Make5771App {
             self.toast = Some("待测试的模板不存在".to_owned());
             return;
         };
-        let mut template = match image::open(&template_asset.path) {
-            Ok(image) => image.into_luma8(),
-            Err(error) => {
-                let message = format!("无法读取模板图片：{error}");
+        // The scan can take a moment on full-resolution frames, so the heavy
+        // part runs on a worker thread and reports back through a channel.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let threshold = self.template_test_threshold;
+        self.template_test_pending = Some(receiver);
+        self.push_log(
+            LogLevel::Info,
+            format!("正在识别模板“{}”…", template_asset.name),
+        );
+        std::thread::spawn(move || {
+            let outcome = run_template_test_work(template_asset, frame, threshold);
+            let _ = sender.send(outcome);
+        });
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    fn finish_template_test(&mut self, ctx: &egui::Context, outcome: TemplateTestOutcome) {
+        let report = match outcome.result {
+            Ok(report) => report,
+            Err(message) => {
                 self.toast = Some(message.clone());
                 self.push_log(LogLevel::Warning, message);
                 return;
             }
         };
-        let frame_gray = image::imageops::grayscale(&frame);
-        // Templates captured at another resolution are scaled to the frame,
-        // matching what the runner does at run time.
-        let reference_width = if template_asset.reference_width > 0 {
-            template_asset.reference_width
-        } else {
-            frame.width()
-        };
-        let reference_height = if template_asset.reference_height > 0 {
-            template_asset.reference_height
-        } else {
-            frame.height()
-        };
-        let mut scaled_region = template_asset.search_region;
-        if reference_width != frame.width() || reference_height != frame.height() {
-            let scale = |value: u32, from: u32, to: u32| {
-                ((u64::from(value) * u64::from(to) + u64::from(from) / 2) / u64::from(from.max(1)))
-                    .max(1) as u32
-            };
-            template = image::imageops::resize(
-                &template,
-                scale(template_asset.width, reference_width, frame.width()),
-                scale(template_asset.height, reference_height, frame.height()),
-                image::imageops::FilterType::Triangle,
-            );
-            scaled_region = scaled_region.map(|region| {
-                region.scaled(
-                    reference_width,
-                    reference_height,
-                    frame.width(),
-                    frame.height(),
-                )
-            });
-        }
-        let search_region = scaled_region
-            .map(|region| SearchRegion {
-                x: region.x,
-                y: region.y,
-                width: region.width,
-                height: region.height,
-            })
-            .unwrap_or_else(|| SearchRegion::full(&frame_gray));
-        let report = vision::find_template_report(
-            &frame_gray,
-            &template,
-            search_region,
-            self.template_test_threshold,
-        );
         let result = report.matched;
         let log_message = match result {
             Some(found) => format!(
                 "模板“{}”匹配成功，相似度 {:.3}",
-                template_asset.name, found.score
+                outcome.template_name, found.score
             ),
             None => format!(
                 "模板“{}”未达到阈值 {:.2}（最佳相似度 {:.2}）",
-                template_asset.name, self.template_test_threshold, report.best_score
+                outcome.template_name, outcome.threshold, report.best_score
             ),
         };
         self.push_log(
@@ -666,11 +645,11 @@ impl Make5771App {
         );
         self.template_test_view = Some(TemplateTestView::new(
             ctx,
-            &frame,
-            template_asset.name,
-            search_region,
+            &outcome.frame,
+            outcome.template_name,
+            outcome.search_region,
             result,
-            self.template_test_threshold,
+            outcome.threshold,
             self.mascots.ramona_pro.clone(),
         ));
     }
@@ -1810,70 +1789,15 @@ impl Make5771App {
                                 .color(theme::tertiary_label()),
                         );
                         delay_editor(ui, "识别后等待", &mut step.delay_ms);
-                        let click_template = step
-                            .template
-                            .as_ref()
-                            .and_then(|path| {
-                                template_options
-                                    .iter()
-                                    .find(|(_, _, candidate)| candidate == path)
-                            })
-                            .map(|(_, name, path)| (name.clone(), path.clone()));
-                        if let Some((template_name, template_path)) = click_template
-                            && let Some(texture) =
-                                self.thumbs
-                                    .texture(ui.ctx(), &template_path, &template_name)
-                        {
-                            let [tex_w, tex_h] = texture.size();
-                            let scale = (260.0 / tex_w as f32).min(1.0);
-                            let display_size =
-                                Vec2::new(tex_w as f32 * scale, tex_h as f32 * scale);
-                            let response = ui.add(
-                                egui::Image::new(texture)
-                                    .fit_to_exact_size(display_size)
-                                    .sense(Sense::click()),
-                            );
-                            if response.clicked()
-                                && let Some(pointer) = response.interact_pointer_pos()
-                            {
-                                let local = pointer - response.rect.min;
-                                let px = (local.x / scale).round() as i32;
-                                let py = (local.y / scale).round() as i32;
-                                step.click_anchor = ClickAnchor::Center;
-                                step.click_offset_x = px - tex_w as i32 / 2;
-                                step.click_offset_y = py - tex_h as i32 / 2;
-                            }
-                            let click_x = tex_w as i32 / 2 + step.click_offset_x;
-                            let click_y = tex_h as i32 / 2 + step.click_offset_y;
-                            let marker = response.rect.min
-                                + Vec2::new(click_x as f32 * scale, click_y as f32 * scale);
-                            let marker = response.rect.clamp(marker);
-                            let painter = ui.painter();
-                            let stroke = Stroke::new(2.0, theme::blue());
-                            painter.line_segment(
-                                [marker - Vec2::new(7.0, 0.0), marker + Vec2::new(7.0, 0.0)],
-                                stroke,
-                            );
-                            painter.line_segment(
-                                [marker - Vec2::new(0.0, 7.0), marker + Vec2::new(0.0, 7.0)],
-                                stroke,
-                            );
-                            painter.circle_filled(marker, 3.0, theme::blue());
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "点击位置：({click_x}, {click_y}) · 点击图片任意位置修改"
-                                    ))
-                                    .size(11.0)
-                                    .color(theme::tertiary_label()),
-                                );
-                                if ui.small_button("重置为中心").clicked() {
-                                    step.click_anchor = ClickAnchor::Center;
-                                    step.click_offset_x = 0;
-                                    step.click_offset_y = 0;
-                                }
-                            });
-                        }
+                        click_point_picker(
+                            ui,
+                            step.template.as_ref(),
+                            &template_options,
+                            &mut self.thumbs,
+                            &mut step.click_anchor,
+                            &mut step.click_offset_x,
+                            &mut step.click_offset_y,
+                        );
                         let test_template_id = step.template.as_ref().and_then(|path| {
                             template_options
                                 .iter()
@@ -1897,41 +1821,16 @@ impl Make5771App {
                             );
                         });
                         egui::CollapsingHeader::new("高级设置")
+                            .id_salt(("step-advanced", step.id))
                             .default_open(false)
                             .show(ui, |ui| {
                                 threshold_editor(ui, &mut step.threshold);
-                                ui.label(
-                                    RichText::new("点击位置")
-                                        .size(11.0)
-                                        .color(theme::secondary_label()),
-                                );
-                                ui.horizontal(|ui| {
-                                    egui::ComboBox::from_id_salt(("click-anchor", step.id))
-                                        .selected_text(step.click_anchor.label())
-                                        .show_ui(ui, |ui| {
-                                            for anchor in ClickAnchor::ALL {
-                                                ui.selectable_value(
-                                                    &mut step.click_anchor,
-                                                    anchor,
-                                                    anchor.label(),
-                                                );
-                                            }
-                                        });
-                                    ui.label("偏移 X");
-                                    ui.add(
-                                        egui::DragValue::new(&mut step.click_offset_x)
-                                            .suffix(" px"),
-                                    );
-                                    ui.label("Y");
-                                    ui.add(
-                                        egui::DragValue::new(&mut step.click_offset_y)
-                                            .suffix(" px"),
-                                    );
-                                });
-                                ui.label(
-                                    RichText::new("以匹配到的图片框为基准，偏移单位是像素")
-                                        .size(11.0)
-                                        .color(theme::tertiary_label()),
+                                click_anchor_offset_editors(
+                                    ui,
+                                    ("step-click", step.id),
+                                    &mut step.click_anchor,
+                                    &mut step.click_offset_x,
+                                    &mut step.click_offset_y,
                                 );
                             });
                     }
@@ -3335,6 +3234,13 @@ fn visual_condition_editor(
             });
     });
     if step.visual_condition.outcome == ConditionOutcome::ClickTemplate {
+        click_anchor_offset_editors(
+            ui,
+            ("visual-click", step.id),
+            &mut step.visual_condition.click_anchor,
+            &mut step.visual_condition.click_offset_x,
+            &mut step.visual_condition.click_offset_y,
+        );
         delay_editor(ui, "点击后等待", &mut step.delay_ms);
     }
     ui.label(
@@ -3448,6 +3354,16 @@ fn edit_workflow_branch(
         });
     });
     if branch.click_trigger {
+        click_point_editor(
+            ui,
+            ("branch-click", step_id, branch.id),
+            branch.trigger_template.as_ref(),
+            template_options,
+            thumbs,
+            &mut branch.click_anchor,
+            &mut branch.click_offset_x,
+            &mut branch.click_offset_y,
+        );
         delay_editor(ui, "点击后等待", &mut branch.trigger_delay_ms);
     }
     ui.horizontal(|ui| {
@@ -3514,6 +3430,16 @@ fn edit_workflow_branch(
                     );
                     threshold_editor(ui, &mut action.threshold);
                     timeout_editor(ui, &mut action.timeout_secs);
+                    click_point_editor(
+                        ui,
+                        ("action-click", step_id, branch.id, action.id),
+                        action.template.as_ref(),
+                        template_options,
+                        thumbs,
+                        &mut action.click_anchor,
+                        &mut action.click_offset_x,
+                        &mut action.click_offset_y,
+                    );
                     delay_editor(ui, "点击后等待", &mut action.delay_ms);
                 }
                 BranchActionKind::Delay => {
@@ -3691,6 +3617,218 @@ fn template_picker(
             response.on_hover_text("点击预览模板图片");
         }
     });
+}
+
+/// Worker half of template testing: loads and scales the template, then scans
+/// the frame. Runs off the UI thread; the frame is returned for the preview.
+fn run_template_test_work(
+    template_asset: TemplateAsset,
+    frame: image::RgbaImage,
+    threshold: f32,
+) -> TemplateTestOutcome {
+    let frame_gray = image::imageops::grayscale(&frame);
+    let full_region = SearchRegion::full(&frame_gray);
+    let mut template = match image::open(&template_asset.path) {
+        Ok(image) => image.into_luma8(),
+        Err(error) => {
+            return TemplateTestOutcome {
+                template_name: template_asset.name,
+                frame,
+                search_region: full_region,
+                threshold,
+                result: Err(format!("无法读取模板图片：{error}")),
+            };
+        }
+    };
+    // Templates captured at another resolution are scaled to the frame,
+    // matching what the runner does at run time.
+    let reference_width = if template_asset.reference_width > 0 {
+        template_asset.reference_width
+    } else {
+        frame.width()
+    };
+    let reference_height = if template_asset.reference_height > 0 {
+        template_asset.reference_height
+    } else {
+        frame.height()
+    };
+    let mut scaled_region = template_asset.search_region;
+    if reference_width != frame.width() || reference_height != frame.height() {
+        let scale = |value: u32, from: u32, to: u32| {
+            ((u64::from(value) * u64::from(to) + u64::from(from) / 2) / u64::from(from.max(1)))
+                .max(1) as u32
+        };
+        template = image::imageops::resize(
+            &template,
+            scale(template_asset.width, reference_width, frame.width()),
+            scale(template_asset.height, reference_height, frame.height()),
+            image::imageops::FilterType::Triangle,
+        );
+        scaled_region = scaled_region.map(|region| {
+            region.scaled(
+                reference_width,
+                reference_height,
+                frame.width(),
+                frame.height(),
+            )
+        });
+    }
+    let search_region = scaled_region
+        .map(|region| SearchRegion {
+            x: region.x,
+            y: region.y,
+            width: region.width,
+            height: region.height,
+        })
+        .unwrap_or(full_region);
+    let report = vision::find_template_report(&frame_gray, &template, search_region, threshold);
+    TemplateTestOutcome {
+        template_name: template_asset.name,
+        frame,
+        search_region,
+        threshold,
+        result: Ok(report),
+    }
+}
+
+/// Click-position editor: visual point picker on the template image (when a
+/// template is selected and its texture loads) plus an "高级设置" collapsing
+/// section with the manual anchor/offset controls. Used by every editor that
+/// clicks a matched template.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "editor widgets thread the shared template state plus the three edited fields"
+)]
+fn click_point_editor(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    template_path: Option<&String>,
+    template_options: &[(u64, String, String)],
+    thumbs: &mut TemplateThumbs,
+    anchor: &mut ClickAnchor,
+    offset_x: &mut i32,
+    offset_y: &mut i32,
+) {
+    click_point_picker(
+        ui,
+        template_path,
+        template_options,
+        thumbs,
+        anchor,
+        offset_x,
+        offset_y,
+    );
+    egui::CollapsingHeader::new("高级设置")
+        .id_salt(("click-point-advanced", &id))
+        .default_open(false)
+        .show(ui, |ui| {
+            click_anchor_offset_editors(ui, id, anchor, offset_x, offset_y);
+        });
+}
+
+/// The template image with a click-to-aim marker; clicking sets the anchor to
+/// Center and the offsets so the runtime click lands on the picked pixel.
+fn click_point_picker(
+    ui: &mut egui::Ui,
+    template_path: Option<&String>,
+    template_options: &[(u64, String, String)],
+    thumbs: &mut TemplateThumbs,
+    anchor: &mut ClickAnchor,
+    offset_x: &mut i32,
+    offset_y: &mut i32,
+) {
+    let click_template = template_path
+        .and_then(|path| {
+            template_options
+                .iter()
+                .find(|(_, _, candidate)| candidate == path)
+        })
+        .map(|(_, name, path)| (name.clone(), path.clone()));
+    if let Some((template_name, template_path)) = click_template
+        && let Some(texture) = thumbs.texture(ui.ctx(), &template_path, &template_name)
+    {
+        let [tex_w, tex_h] = texture.size();
+        let scale = (260.0 / tex_w as f32).min(1.0);
+        let display_size = Vec2::new(tex_w as f32 * scale, tex_h as f32 * scale);
+        let response = ui.add(
+            egui::Image::new(texture)
+                .fit_to_exact_size(display_size)
+                .sense(Sense::click()),
+        );
+        if response.clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let local = pointer - response.rect.min;
+            let px = (local.x / scale).round() as i32;
+            let py = (local.y / scale).round() as i32;
+            *anchor = ClickAnchor::Center;
+            *offset_x = px - tex_w as i32 / 2;
+            *offset_y = py - tex_h as i32 / 2;
+        }
+        let click_x = tex_w as i32 / 2 + *offset_x;
+        let click_y = tex_h as i32 / 2 + *offset_y;
+        let marker = response.rect.min + Vec2::new(click_x as f32 * scale, click_y as f32 * scale);
+        let marker = response.rect.clamp(marker);
+        let painter = ui.painter();
+        let stroke = Stroke::new(2.0, theme::blue());
+        painter.line_segment(
+            [marker - Vec2::new(7.0, 0.0), marker + Vec2::new(7.0, 0.0)],
+            stroke,
+        );
+        painter.line_segment(
+            [marker - Vec2::new(0.0, 7.0), marker + Vec2::new(0.0, 7.0)],
+            stroke,
+        );
+        painter.circle_filled(marker, 3.0, theme::blue());
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "点击位置：({click_x}, {click_y}) · 点击图片任意位置修改"
+                ))
+                .size(11.0)
+                .color(theme::tertiary_label()),
+            );
+            if ui.small_button("重置为中心").clicked() {
+                *anchor = ClickAnchor::Center;
+                *offset_x = 0;
+                *offset_y = 0;
+            }
+        });
+    }
+}
+
+/// Manual fine-tuning rows for the click position: anchor combo plus pixel
+/// offset drag values.
+fn click_anchor_offset_editors(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    anchor: &mut ClickAnchor,
+    offset_x: &mut i32,
+    offset_y: &mut i32,
+) {
+    ui.label(
+        RichText::new("点击位置")
+            .size(11.0)
+            .color(theme::secondary_label()),
+    );
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(("click-anchor", &id))
+            .selected_text(anchor.label())
+            .show_ui(ui, |ui| {
+                for candidate in ClickAnchor::ALL {
+                    ui.selectable_value(anchor, candidate, candidate.label());
+                }
+            });
+        ui.label("偏移 X");
+        ui.add(egui::DragValue::new(offset_x).suffix(" px"));
+        ui.label("Y");
+        ui.add(egui::DragValue::new(offset_y).suffix(" px"));
+    });
+    ui.label(
+        RichText::new("以匹配到的图片框为基准，偏移单位是像素")
+            .size(11.0)
+            .color(theme::tertiary_label()),
+    );
 }
 
 fn threshold_editor(ui: &mut egui::Ui, threshold: &mut f32) {
@@ -4046,6 +4184,20 @@ impl eframe::App for Make5771App {
         if let Some((template_id, frame)) = self.pending_test_capture.take() {
             self.active_tab = AppTab::Templates;
             self.run_template_test(&ctx, template_id, frame);
+        }
+        if let Some(receiver) = &self.template_test_pending {
+            match receiver.try_recv() {
+                Ok(outcome) => {
+                    self.template_test_pending = None;
+                    self.finish_template_test(&ctx, outcome);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.template_test_pending = None;
+                }
+            }
         }
 
         let dropped_paths: Vec<_> = ctx.input(|input| {

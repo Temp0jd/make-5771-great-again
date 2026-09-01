@@ -539,14 +539,13 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
         );
         best_seen = best_seen.max(report.best_score);
         if let Some(found) = report.matched {
-            let (base_x, base_y) = anchor_point(&found, step.click_anchor);
-            let x = (base_x as i32 + step.click_offset_x)
-                .clamp(0, ctx.target.client_width.saturating_sub(1) as i32)
-                as u32;
-            let y = (base_y as i32 + step.click_offset_y)
-                .clamp(0, ctx.target.client_height.saturating_sub(1) as i32)
-                as u32;
-            ctx.click(x, y)?;
+            click_match(
+                ctx,
+                &found,
+                step.click_anchor,
+                step.click_offset_x,
+                step.click_offset_y,
+            )?;
             let _ = ctx.events.send(RunnerEvent::MatchFound {
                 name: step.name.clone(),
                 score: found.score,
@@ -561,6 +560,23 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
     ))
 }
 
+/// Clicks a matched template box at the configured anchor plus pixel offset,
+/// clamped to the client area.
+fn click_match(
+    ctx: &mut StepContext<'_>,
+    found: &vision::TemplateMatch,
+    anchor: ClickAnchor,
+    offset_x: i32,
+    offset_y: i32,
+) -> Result<(), String> {
+    let (base_x, base_y) = anchor_point(found, anchor);
+    let x = (base_x as i32 + offset_x).clamp(0, ctx.target.client_width.saturating_sub(1) as i32)
+        as u32;
+    let y = (base_y as i32 + offset_y).clamp(0, ctx.target.client_height.saturating_sub(1) as i32)
+        as u32;
+    ctx.click(x, y)
+}
+
 /// Picks the reference point on the matched box for the configured anchor;
 /// edges use the inclusive far edge (x + w - 1, y + h - 1).
 fn anchor_point(found: &vision::TemplateMatch, anchor: ClickAnchor) -> (u32, u32) {
@@ -571,7 +587,7 @@ fn anchor_point(found: &vision::TemplateMatch, anchor: ClickAnchor) -> (u32, u32
     let center_x = found.x + found.width / 2;
     let center_y = found.y + found.height / 2;
     match anchor {
-        ClickAnchor::Center => (center_x, center_y),
+        ClickAnchor::Center => found.center(),
         ClickAnchor::TopLeft => (left, top),
         ClickAnchor::Top => (center_x, top),
         ClickAnchor::TopRight => (right, top),
@@ -669,8 +685,13 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
             score: found.score,
         });
         if branch.click_trigger {
-            let (x, y) = found.center();
-            ctx.click(x, y)?;
+            click_match(
+                ctx,
+                &found,
+                branch.click_anchor,
+                branch.click_offset_x,
+                branch.click_offset_y,
+            )?;
             ctx.wait(branch.trigger_delay_ms)?;
         }
         execute_branch_actions(ctx, branch)?;
@@ -776,8 +797,13 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
             ConditionOutcome::ContinueFlow => return Ok(StepControl::Continue),
             ConditionOutcome::ClickTemplate => {
                 if let Some((term, found)) = matched {
-                    let (x, y) = found.center();
-                    ctx.click(x, y)?;
+                    click_match(
+                        ctx,
+                        &found,
+                        spec.click_anchor,
+                        spec.click_offset_x,
+                        spec.click_offset_y,
+                    )?;
                     let _ = ctx.events.send(RunnerEvent::MatchFound {
                         name: term.name.clone(),
                         score: found.score,
@@ -824,6 +850,9 @@ fn wait_and_click_action(ctx: &mut StepContext<'_>, action: &BranchAction) -> Re
         threshold: action.threshold,
         timeout_secs: action.timeout_secs,
         delay_ms: action.delay_ms,
+        click_anchor: action.click_anchor,
+        click_offset_x: action.click_offset_x,
+        click_offset_y: action.click_offset_y,
         ..WorkflowStep::new(action.id, action.name.clone(), StepKind::WaitAndClick, 0)
     };
     wait_and_click(ctx, &step)

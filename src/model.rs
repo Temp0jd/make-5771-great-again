@@ -440,6 +440,12 @@ pub struct VisualConditionSpec {
     pub stable_checks: u8,
     pub outcome: ConditionOutcome,
     #[serde(default)]
+    pub click_anchor: ClickAnchor,
+    #[serde(default)]
+    pub click_offset_x: i32,
+    #[serde(default)]
+    pub click_offset_y: i32,
+    #[serde(default)]
     pub terms: Vec<VisualConditionTerm>,
 }
 
@@ -449,6 +455,9 @@ impl Default for VisualConditionSpec {
             mode: ConditionMatchMode::All,
             stable_checks: 2,
             outcome: ConditionOutcome::ContinueFlow,
+            click_anchor: ClickAnchor::default(),
+            click_offset_x: 0,
+            click_offset_y: 0,
             terms: Vec::new(),
         }
     }
@@ -506,6 +515,12 @@ pub struct BranchAction {
     pub threshold: f32,
     pub timeout_secs: u32,
     pub delay_ms: u32,
+    #[serde(default)]
+    pub click_anchor: ClickAnchor,
+    #[serde(default)]
+    pub click_offset_x: i32,
+    #[serde(default)]
+    pub click_offset_y: i32,
 }
 
 impl BranchAction {
@@ -518,6 +533,9 @@ impl BranchAction {
             threshold: 0.90,
             timeout_secs: 60,
             delay_ms: 500,
+            click_anchor: ClickAnchor::default(),
+            click_offset_x: 0,
+            click_offset_y: 0,
         }
     }
 }
@@ -532,6 +550,12 @@ pub struct WorkflowBranch {
     pub trigger_delay_ms: u32,
     pub outcome: BranchOutcome,
     #[serde(default)]
+    pub click_anchor: ClickAnchor,
+    #[serde(default)]
+    pub click_offset_x: i32,
+    #[serde(default)]
+    pub click_offset_y: i32,
+    #[serde(default)]
     pub actions: Vec<BranchAction>,
 }
 
@@ -545,6 +569,9 @@ impl WorkflowBranch {
             click_trigger: false,
             trigger_delay_ms: 400,
             outcome: BranchOutcome::RepeatWait,
+            click_anchor: ClickAnchor::default(),
+            click_offset_x: 0,
+            click_offset_y: 0,
             actions: Vec::new(),
         }
     }
@@ -1090,6 +1117,47 @@ mod tests {
         assert!(parse_key_combo("a+b").is_err());
         assert!(parse_key_combo("f13").is_err());
         assert!(parse_key_combo("ab").is_err());
+    }
+
+    #[test]
+    fn old_branches_and_actions_load_with_default_click_point() {
+        let branch: WorkflowBranch = serde_json::from_str(
+            r#"{
+                "id": 3,
+                "name": "old branch",
+                "trigger_template": null,
+                "threshold": 0.9,
+                "click_trigger": true,
+                "trigger_delay_ms": 400,
+                "outcome": "RepeatWait"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(branch.click_anchor, ClickAnchor::Center);
+        assert_eq!(branch.click_offset_x, 0);
+        assert_eq!(branch.click_offset_y, 0);
+
+        let action: BranchAction = serde_json::from_str(
+            r#"{
+                "id": 1,
+                "name": "old action",
+                "kind": "WaitAndClick",
+                "template": null,
+                "threshold": 0.9,
+                "timeout_secs": 60,
+                "delay_ms": 500
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(action.click_anchor, ClickAnchor::Center);
+        assert_eq!(action.click_offset_x, 0);
+
+        let spec: VisualConditionSpec = serde_json::from_str(
+            r#"{"mode": "All", "stable_checks": 2, "outcome": "ClickTemplate"}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.click_anchor, ClickAnchor::Center);
+        assert_eq!(spec.click_offset_y, 0);
     }
 
     #[test]
