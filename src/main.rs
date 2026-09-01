@@ -16,11 +16,14 @@ use eframe::egui;
 fn main() -> eframe::Result {
     install_panic_hook();
 
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("内嵌图标解码失败");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 700.0])
             .with_min_inner_size([860.0, 620.0])
             .with_decorations(false)
+            .with_icon(icon)
             .with_title("Make 5771 Great Again"),
         ..Default::default()
     };
