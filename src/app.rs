@@ -111,6 +111,8 @@ pub struct Make5771App {
     mascots: Mascots,
     thumbs: TemplateThumbs,
     countdown_capture_at: Option<std::time::Instant>,
+    /// Template currently being renamed in the library: (template id, edit buffer).
+    template_rename: Option<(u64, String)>,
     pending_capture: Option<image::RgbaImage>,
     capture_purpose: CapturePurpose,
     pending_test_capture: Option<(u64, image::RgbaImage)>,
@@ -214,6 +216,7 @@ impl Make5771App {
             mascots: Mascots::new(&cc.egui_ctx),
             thumbs: TemplateThumbs::default(),
             countdown_capture_at: None,
+            template_rename: None,
             pending_capture: None,
             capture_purpose: CapturePurpose::NewTemplate,
             pending_test_capture: None,
@@ -1093,6 +1096,51 @@ impl Make5771App {
             Err(error) => {
                 self.toast = Some(error.to_string());
                 self.push_log(LogLevel::Warning, error.to_string());
+            }
+        }
+    }
+
+    /// Renames a template in the currently effective library (shared or
+    /// per-profile) and persists it. Template references use paths, so a
+    /// rename never breaks steps.
+    fn rename_template(&mut self, template_id: u64, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.toast = Some("模板名称不能为空".to_owned());
+            return;
+        }
+        let shared = self.profile.shared_templates;
+        let templates = if shared {
+            &mut self.shared_templates
+        } else {
+            &mut self.profile.templates
+        };
+        let Some(template) = templates
+            .iter_mut()
+            .find(|template| template.id == template_id)
+        else {
+            return;
+        };
+        let old_name = std::mem::replace(&mut template.name, name.to_owned());
+        if old_name == name {
+            return;
+        }
+        let persisted = if shared {
+            storage::save_shared_templates(&self.shared_templates)
+                .map_err(|error| error.to_string())
+        } else {
+            storage::save_profile(&self.current_profile_path, &self.profile)
+                .map_err(|error| error.to_string())
+        };
+        match persisted {
+            Ok(()) => {
+                let message = format!("模板“{old_name}”已改名为“{name}”");
+                self.toast = Some(message.clone());
+                self.push_log(LogLevel::Success, message);
+            }
+            Err(error) => {
+                self.toast = Some(format!("改名保存失败：{error}"));
+                self.push_log(LogLevel::Warning, format!("改名保存失败：{error}"));
             }
         }
     }
@@ -2158,6 +2206,9 @@ impl Make5771App {
         ui.add_space(12.0);
         let mut requested_test = None;
         let mut requested_delete = None;
+        let mut requested_rename: Option<(u64, String)> = None;
+        let mut rename_apply = false;
+        let mut rename_cancel = false;
         theme::card().show(ui, |ui| {
             ui.set_min_height(360.0);
             ui.horizontal(|ui| {
@@ -2228,7 +2279,34 @@ impl Make5771App {
                                     None => template_icon(ui, 30.0, theme::blue()),
                                 }
                                 ui.vertical(|ui| {
-                                    ui.label(RichText::new(&template.name).strong());
+                                    let renaming_this = self
+                                        .template_rename
+                                        .as_ref()
+                                        .is_some_and(|(id, _)| *id == template.id);
+                                    if renaming_this {
+                                        ui.horizontal(|ui| {
+                                            if let Some((_, buffer)) = self.template_rename.as_mut()
+                                            {
+                                                ui.add(
+                                                    egui::TextEdit::singleline(buffer)
+                                                        .desired_width(140.0),
+                                                );
+                                            }
+                                            if ui
+                                                .small_button("✓")
+                                                .on_hover_text("确认改名")
+                                                .clicked()
+                                            {
+                                                rename_apply = true;
+                                            }
+                                            if ui.small_button("✕").on_hover_text("取消").clicked()
+                                            {
+                                                rename_cancel = true;
+                                            }
+                                        });
+                                    } else {
+                                        ui.label(RichText::new(&template.name).strong());
+                                    }
                                     ui.label(
                                         RichText::new(format!(
                                             "{} × {} · {}",
@@ -2244,6 +2322,10 @@ impl Make5771App {
                                     }
                                     if ui.button("删除").clicked() {
                                         requested_delete = Some(template.id);
+                                    }
+                                    if ui.button("改名").clicked() {
+                                        requested_rename =
+                                            Some((template.id, template.name.clone()));
                                     }
                                     let references =
                                         count_template_references(&self.profile, &template.path);
@@ -2276,6 +2358,15 @@ impl Make5771App {
         }
         if let Some(template_id) = requested_delete {
             self.pending_delete_template = Some(template_id);
+        }
+        if rename_cancel {
+            self.template_rename = None;
+        }
+        if rename_apply && let Some((template_id, name)) = self.template_rename.take() {
+            self.rename_template(template_id, &name);
+        }
+        if let Some((template_id, current_name)) = requested_rename {
+            self.template_rename = Some((template_id, current_name));
         }
     }
 
