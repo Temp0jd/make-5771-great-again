@@ -35,4 +35,6 @@ jobs:
         with:
           name: Make 5771 Great Again ${{ github.ref_name }}
           generate_release_notes: true
-          files: target/release/Make5771GreatAgain.exe
+          files: |
+            target/release/Make5771GreatAgain.exe
+            examples/*.m5771pack
