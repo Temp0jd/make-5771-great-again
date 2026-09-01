@@ -135,6 +135,8 @@
 
 从 [Releases](https://github.com/Temp0jd/make-5771-great-again/releases) 下载最新的 `Make5771GreatAgain.exe`，免安装、单文件运行。程序数据（流程、模板、日志）保存在 exe 所在目录下。
 
+每个 Release 还附带 **`template.zip`**：打包了全部官方示例分享包（见下文「分享流程」）。下载后解压，得到若干 `.m5771pack` 文件，在「流程」页点击「导入分享包」逐个导入，或直接拖入程序窗口。
+
 ## 功能一览
 
 - **流程编排**：等待并点击、等待任一目标、视觉条件（AND/OR + 稳定确认）、键盘输入、固定等待、本局结束；分支子动作与优先级；固定次数、截止时间、持续运行三种循环策略；多流程一键切换
@@ -184,7 +186,13 @@
 3. 分享生成的 `.m5771pack` 单文件，不需要另外附带 `templates` 目录。
 4. 接收者点击「导入分享包」，或将文件直接拖入程序。
 
-格式详细说明见 [docs/M5771_PACKAGE_SPEC.md](docs/M5771_PACKAGE_SPEC.md)。项目还提供了不含图片的 [Auto 起步包](examples/auto-starter.m5771pack)（导入后可自行绑定截图）、[活动关卡（刷同调）示例包](examples/morimens-event-tongdiao.m5771pack)（主循环常驻监视：通关自动开新局并计数、死亡自动重开、活动Token随选随确认、Auto 未开启才点，含 11 张模板），以及 [Token 选择范例包](examples/token-select-example.m5771pack)（演示「出现 A → 选择 A → 确认」的通用模式）。
+格式详细说明见 [docs/M5771_PACKAGE_SPEC.md](docs/M5771_PACKAGE_SPEC.md)。
+
+官方示例包（Release 的 `template.zip` 内含全部三个，也可在 [examples/](examples/) 单独获取）：
+
+- [Auto 起步包](examples/auto-starter.m5771pack)：不含图片的起步骨架，导入后自行绑定截图；
+- [活动关卡（刷同调）示例包](examples/morimens-event-tongdiao.m5771pack)：主循环常驻监视——通关自动开新局并计数、死亡自动重开、活动Token随选随确认、Auto 未开启才点，含 11 张模板；
+- [Token 选择范例包](examples/token-select-example.m5771pack)：演示「出现 A → 选择 A → 确认」的通用模式。
 
 ## 本地开发
 
