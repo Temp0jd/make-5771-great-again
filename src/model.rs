@@ -58,6 +58,10 @@ fn default_click_jitter() -> bool {
     true
 }
 
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
 impl LoopMode {
     pub const ALL: [Self; 3] = [Self::Count, Self::Deadline, Self::Continuous];
 
@@ -400,6 +404,8 @@ pub struct MacroProfile {
     pub click_jitter: bool,
     #[serde(default)]
     pub dark_mode: bool,
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
     #[serde(default)]
     pub sharing: SharingMetadata,
 }
@@ -446,6 +452,7 @@ impl Default for MacroProfile {
             click_method: ClickMethod::default(),
             click_jitter: default_click_jitter(),
             dark_mode: false,
+            ui_scale: default_ui_scale(),
             sharing: SharingMetadata::default(),
         }
     }
@@ -469,6 +476,9 @@ impl MacroProfile {
         }
         if self.loop_mode == LoopMode::Deadline && !valid_deadline(&self.deadline) {
             issues.push("截止时间必须使用 HH:MM 格式".to_owned());
+        }
+        if !(0.75..=2.0).contains(&self.ui_scale) {
+            issues.push("界面缩放必须在 75% - 200% 之间".to_owned());
         }
         if self.steps.is_empty() {
             issues.push("流程至少需要一个步骤".to_owned());

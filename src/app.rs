@@ -1,5 +1,5 @@
 use chrono::Local;
-use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Stroke, Vec2};
+use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Vec2};
 
 use crate::mascot::Mascots;
 use crate::model::{
@@ -125,6 +125,7 @@ impl Make5771App {
         let mut profile =
             storage::load_profile(&storage::default_profile_path()).unwrap_or_default();
         theme::install(&cc.egui_ctx, profile.dark_mode);
+        cc.egui_ctx.set_zoom_factor(profile.ui_scale);
         let target_window = platform::find_target_window(&profile.target_window).ok();
         if profile.templates.is_empty()
             && let Some(target) = &target_window
@@ -1348,12 +1349,27 @@ impl Make5771App {
                 );
                 ui.add_space(4.0);
             }
-            let text = if self.runner_status == RunnerStatus::Ready {
-                "开始运行"
-            } else {
+            let running = self.runner_status != RunnerStatus::Ready;
+            let text = if running {
                 "停止运行"
+            } else {
+                "开始运行"
             };
-            if ui.add(theme::primary_button(text)).clicked() {
+            let button = egui::Button::new(
+                RichText::new(text)
+                    .size(18.0)
+                    .color(Color32::WHITE)
+                    .strong(),
+            )
+            .fill(if running {
+                theme::orange()
+            } else {
+                theme::blue()
+            })
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(16))
+            .min_size(Vec2::new(260.0, 64.0));
+            if ui.add(button).clicked() {
                 self.toggle_runner();
             }
         });
@@ -1894,8 +1910,21 @@ impl Make5771App {
                     }
                 });
             });
+            ui.horizontal(|ui| {
+                ui.label("界面缩放");
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.profile.ui_scale, 0.85..=1.50)
+                            .fixed_decimals(2)
+                            .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+                    )
+                    .changed()
+                {
+                    ui.ctx().set_zoom_factor(self.profile.ui_scale);
+                }
+            });
             ui.label(
-                RichText::new("切换后立即生效，随流程配置一并保存。")
+                RichText::new("高分辨率或高缩放比的显示器可适当放大；切换后立即生效并随配置保存。")
                     .size(11.0)
                     .color(theme::tertiary_label()),
             );
