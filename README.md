@@ -209,6 +209,14 @@ cargo clippy --all-targets
 
 推送 `v*` 标签会自动触发 CI（fmt / clippy / test / 发布构建）并发布 GitHub Release。
 
+## 美术素材与版权声明
+
+本软件为**非官方同人工具**，与《忘却前夜》（Morimens）的开发商、发行商及运营商无任何关联，亦未获得其授权或认可。
+
+项目中使用的应用图标、表情包等装饰性美术素材，其原型来源于《忘却前夜》游戏及相关同人创作，**著作权归原权利人（B.I.A.V. Studio / Qookka Games 等）所有**。这些素材仅以非商业、个人学习交流为目的在本项目中使用，不用于任何商业用途；若涉及侵权或权利人有异议，请通过 [GitHub Issues](https://github.com/Temp0jd/make-5771-great-again/issues) 联系，本人将立即移除相关内容。
+
+上述美术素材**不适用**于本项目的 MIT 许可证，其再使用须遵循原权利人的相关规定。
+
 ## 许可证
 
-[MIT](LICENSE)
+本项目的**源代码**以 [MIT](LICENSE) 许可证发布（美术素材除外，见上节）。
