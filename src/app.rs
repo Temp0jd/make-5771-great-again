@@ -44,6 +44,36 @@ enum RunOutcome {
     Failed,
 }
 
+/// On-demand thumbnail textures for template assets, plus the floating
+/// preview window state. Loaded lazily from disk and cached by path.
+#[derive(Default)]
+struct TemplateThumbs {
+    cache: std::collections::HashMap<String, egui::TextureHandle>,
+    preview: Option<u64>,
+}
+
+impl TemplateThumbs {
+    fn texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &str,
+        name: &str,
+    ) -> Option<&egui::TextureHandle> {
+        if !self.cache.contains_key(path) {
+            let image = image::open(path).ok()?.into_rgba8();
+            let size = [image.width() as usize, image.height() as usize];
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+            let handle = ctx.load_texture(
+                format!("thumb-{name}"),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.cache.insert(path.to_owned(), handle);
+        }
+        self.cache.get(path)
+    }
+}
+
 pub struct Make5771App {
     active_tab: AppTab,
     profile: MacroProfile,
@@ -64,6 +94,7 @@ pub struct Make5771App {
     round_durations: std::collections::VecDeque<u64>,
     last_run_outcome: RunOutcome,
     mascots: Mascots,
+    thumbs: TemplateThumbs,
     countdown_capture_at: Option<std::time::Instant>,
     pending_capture: Option<image::RgbaImage>,
     capture_purpose: CapturePurpose,
@@ -133,6 +164,7 @@ impl Make5771App {
             round_durations: std::collections::VecDeque::new(),
             last_run_outcome: RunOutcome::None,
             mascots: Mascots::new(&cc.egui_ctx),
+            thumbs: TemplateThumbs::default(),
             countdown_capture_at: None,
             pending_capture: None,
             capture_purpose: CapturePurpose::NewTemplate,
@@ -1327,11 +1359,11 @@ impl Make5771App {
     }
 
     fn flow_page(&mut self, ui: &mut egui::Ui) {
-        let template_options: Vec<(String, String)> = self
+        let template_options: Vec<(u64, String, String)> = self
             .profile
             .templates
             .iter()
-            .map(|template| (template.name.clone(), template.path.clone()))
+            .map(|template| (template.id, template.name.clone(), template.path.clone()))
             .collect();
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
@@ -1582,14 +1614,17 @@ impl Make5771App {
                             "图片模板",
                             &mut step.template,
                             &template_options,
+                            &mut self.thumbs,
                         );
                         threshold_editor(ui, &mut step.threshold);
                         timeout_editor(ui, &mut step.timeout_secs);
                         delay_editor(ui, "识别后等待", &mut step.delay_ms);
                     }
-                    StepKind::WaitAny => wait_any_editor(ui, step, &template_options),
+                    StepKind::WaitAny => {
+                        wait_any_editor(ui, step, &template_options, &mut self.thumbs)
+                    }
                     StepKind::VisualCondition => {
-                        visual_condition_editor(ui, step, &template_options)
+                        visual_condition_editor(ui, step, &template_options, &mut self.thumbs)
                     }
                     StepKind::Delay => delay_editor(ui, "等待时间", &mut step.delay_ms),
                     StepKind::RoundEnd => {
@@ -1692,7 +1727,23 @@ impl Make5771App {
                     .show(ui, |ui| {
                         for template in self.profile.templates.clone() {
                             ui.horizontal(|ui| {
-                                template_icon(ui, 30.0, theme::BLUE);
+                                match self
+                                    .thumbs
+                                    .texture(ui.ctx(), &template.path, &template.name)
+                                {
+                                    Some(texture) => {
+                                        let response = ui.add(
+                                            egui::Image::new(texture)
+                                                .fit_to_exact_size(Vec2::new(64.0, 40.0))
+                                                .sense(Sense::click()),
+                                        );
+                                        if response.clicked() {
+                                            self.thumbs.preview = Some(template.id);
+                                        }
+                                        response.on_hover_text("点击预览模板图片");
+                                    }
+                                    None => template_icon(ui, 30.0, theme::BLUE),
+                                }
                                 ui.vertical(|ui| {
                                     ui.label(RichText::new(&template.name).strong());
                                     ui.label(
@@ -2478,6 +2529,55 @@ impl Make5771App {
                 self.pending_delete_profile = None;
             }
         }
+
+        if let Some(template_id) = self.thumbs.preview {
+            let template = self
+                .profile
+                .templates
+                .iter()
+                .find(|template| template.id == template_id)
+                .cloned();
+            match template {
+                Some(template) => {
+                    let mut open = true;
+                    egui::Window::new("模板预览")
+                        .open(&mut open)
+                        .collapsible(false)
+                        .resizable(true)
+                        .default_width(420.0)
+                        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                        .show(ctx, |ui| {
+                            ui.label(RichText::new(&template.name).strong());
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} × {} · {}",
+                                    template.width, template.height, template.path
+                                ))
+                                .size(11.0)
+                                .color(theme::TERTIARY_LABEL),
+                            );
+                            ui.add_space(6.0);
+                            if let Some(texture) =
+                                self.thumbs
+                                    .texture(ui.ctx(), &template.path, &template.name)
+                            {
+                                let size = texture.size_vec2();
+                                let scale = (400.0 / size.x).min(280.0 / size.y).min(2.0);
+                                ui.add(
+                                    egui::Image::new(texture)
+                                        .fit_to_exact_size(size * scale.max(0.1)),
+                                );
+                            } else {
+                                ui.label(RichText::new("模板图片读取失败").color(theme::ORANGE));
+                            }
+                        });
+                    if !open {
+                        self.thumbs.preview = None;
+                    }
+                }
+                None => self.thumbs.preview = None,
+            }
+        }
     }
 
     fn bottom_navigation(&mut self, ui: &mut egui::Ui) {
@@ -2529,7 +2629,8 @@ enum ActionListCommand {
 fn wait_any_editor(
     ui: &mut egui::Ui,
     step: &mut WorkflowStep,
-    template_options: &[(String, String)],
+    template_options: &[(u64, String, String)],
+    thumbs: &mut TemplateThumbs,
 ) {
     timeout_editor(ui, &mut step.timeout_secs);
     ui.label(
@@ -2575,6 +2676,7 @@ fn wait_any_editor(
                             step.id,
                             &mut step.branches[index],
                             template_options,
+                            thumbs,
                         );
                     });
                 ui.separator();
@@ -2605,7 +2707,8 @@ fn wait_any_editor(
 fn visual_condition_editor(
     ui: &mut egui::Ui,
     step: &mut WorkflowStep,
-    template_options: &[(String, String)],
+    template_options: &[(u64, String, String)],
+    thumbs: &mut TemplateThumbs,
 ) {
     timeout_editor(ui, &mut step.timeout_secs);
     ui.horizontal(|ui| {
@@ -2680,6 +2783,7 @@ fn visual_condition_editor(
                         "检查画面",
                         &mut term.template,
                         template_options,
+                        thumbs,
                     );
                     ui.horizontal(|ui| {
                         ui.label("期望");
@@ -2728,7 +2832,8 @@ fn edit_workflow_branch(
     ui: &mut egui::Ui,
     step_id: u64,
     branch: &mut WorkflowBranch,
-    template_options: &[(String, String)],
+    template_options: &[(u64, String, String)],
+    thumbs: &mut TemplateThumbs,
 ) {
     ui.label(
         RichText::new("分支名称")
@@ -2742,6 +2847,7 @@ fn edit_workflow_branch(
         "触发画面",
         &mut branch.trigger_template,
         template_options,
+        thumbs,
     );
     threshold_editor(ui, &mut branch.threshold);
     ui.horizontal(|ui| {
@@ -2813,6 +2919,7 @@ fn edit_workflow_branch(
                         "目标画面",
                         &mut action.template,
                         template_options,
+                        thumbs,
                     );
                     threshold_editor(ui, &mut action.threshold);
                     timeout_editor(ui, &mut action.timeout_secs);
@@ -2854,30 +2961,45 @@ fn template_picker(
     id: impl std::hash::Hash + std::fmt::Debug,
     label: &str,
     selected: &mut Option<String>,
-    template_options: &[(String, String)],
+    template_options: &[(u64, String, String)],
+    thumbs: &mut TemplateThumbs,
 ) {
     ui.label(
         RichText::new(label)
             .size(11.0)
             .color(theme::SECONDARY_LABEL),
     );
-    let selected_name = selected
-        .as_ref()
-        .and_then(|path| {
+    ui.horizontal(|ui| {
+        let selected_entry = selected.as_ref().and_then(|path| {
             template_options
                 .iter()
-                .find(|(_, candidate)| candidate == path)
-        })
-        .map(|(name, _)| name.as_str())
-        .unwrap_or("尚未选择");
-    egui::ComboBox::from_id_salt(id)
-        .selected_text(selected_name)
-        .show_ui(ui, |ui| {
-            ui.selectable_value(selected, None, "尚未选择");
-            for (name, path) in template_options {
-                ui.selectable_value(selected, Some(path.clone()), name);
-            }
+                .find(|(_, _, candidate)| candidate == path)
         });
+        let selected_name = selected_entry
+            .map(|(_, name, _)| name.as_str())
+            .unwrap_or("尚未选择");
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(selected_name)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(selected, None, "尚未选择");
+                for (_, name, path) in template_options {
+                    ui.selectable_value(selected, Some(path.clone()), name);
+                }
+            });
+        if let Some(&(template_id, ref name, ref path)) = selected_entry
+            && let Some(texture) = thumbs.texture(ui.ctx(), path, name)
+        {
+            let response = ui.add(
+                egui::Image::new(texture)
+                    .fit_to_exact_size(Vec2::new(64.0, 28.0))
+                    .sense(Sense::click()),
+            );
+            if response.clicked() {
+                thumbs.preview = Some(template_id);
+            }
+            response.on_hover_text("点击预览模板图片");
+        }
+    });
 }
 
 fn threshold_editor(ui: &mut egui::Ui, threshold: &mut f32) {
