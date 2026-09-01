@@ -521,6 +521,10 @@ pub struct BranchAction {
     pub click_offset_x: i32,
     #[serde(default)]
     pub click_offset_y: i32,
+    /// When true, a WaitAndClick action that times out is skipped instead of
+    /// failing the whole branch (for screens that only appear sometimes).
+    #[serde(default)]
+    pub optional: bool,
 }
 
 impl BranchAction {
@@ -536,6 +540,7 @@ impl BranchAction {
             click_anchor: ClickAnchor::default(),
             click_offset_x: 0,
             click_offset_y: 0,
+            optional: false,
         }
     }
 }
@@ -1154,6 +1159,7 @@ mod tests {
         .unwrap();
         assert_eq!(action.click_anchor, ClickAnchor::Center);
         assert_eq!(action.click_offset_x, 0);
+        assert!(!action.optional);
 
         let spec: VisualConditionSpec = serde_json::from_str(
             r#"{"mode": "All", "stable_checks": 2, "outcome": "ClickTemplate"}"#,

@@ -15,7 +15,7 @@
     "steps": [
       {
         "id": 1,
-        "name": "守护循环：进本、自动战斗到结算",
+        "name": "监视调查弹窗（主循环）",
         "kind": "WaitAny",
         "indent": 0,
         "enabled": true,
@@ -26,83 +26,205 @@
         "branches": [
           {
             "id": 1,
-            "name": "完成调查（继续调查）",
+            "name": "完成调查 → 开始调查",
             "trigger_template": "assets/template-1.png",
             "threshold": 0.7,
             "click_trigger": true,
             "trigger_delay_ms": 3000,
             "outcome": "RepeatWait",
-            "actions": []
+            "actions": [
+              {
+                "id": 1,
+                "name": "挑战",
+                "kind": "WaitAndClick",
+                "template": "assets/template-3.png",
+                "threshold": 0.7,
+                "timeout_secs": 20,
+                "delay_ms": 1000,
+                "optional": false
+              },
+              {
+                "id": 2,
+                "name": "助战",
+                "kind": "WaitAndClick",
+                "template": "assets/template-9.png",
+                "threshold": 0.7,
+                "timeout_secs": 20,
+                "delay_ms": 1000,
+                "optional": false
+              },
+              {
+                "id": 3,
+                "name": "图片变量11",
+                "kind": "WaitAndClick",
+                "template": "assets/template-11.png",
+                "threshold": 0.7,
+                "timeout_secs": 20,
+                "delay_ms": 1000,
+                "optional": false
+              },
+              {
+                "id": 4,
+                "name": "上场",
+                "kind": "WaitAndClick",
+                "template": "assets/template-10.png",
+                "threshold": 0.7,
+                "timeout_secs": 20,
+                "delay_ms": 1000,
+                "optional": false
+              },
+              {
+                "id": 5,
+                "name": "调查",
+                "kind": "WaitAndClick",
+                "template": "assets/template-4.png",
+                "threshold": 0.7,
+                "timeout_secs": 20,
+                "delay_ms": 1000,
+                "optional": false
+              },
+              {
+                "id": 6,
+                "name": "短暂停顿",
+                "kind": "Delay",
+                "template": null,
+                "threshold": 0.9,
+                "timeout_secs": 60,
+                "delay_ms": 300,
+                "optional": false
+              },
+              {
+                "id": 7,
+                "name": "巧克力（体力不足时）",
+                "kind": "WaitAndClick",
+                "template": "assets/template-5.png",
+                "threshold": 0.7,
+                "timeout_secs": 15,
+                "delay_ms": 1000,
+                "optional": true
+              },
+              {
+                "id": 8,
+                "name": "确认（体力不足时）",
+                "kind": "WaitAndClick",
+                "template": "assets/template-6.png",
+                "threshold": 0.7,
+                "timeout_secs": 15,
+                "delay_ms": 100,
+                "optional": true
+              },
+              {
+                "id": 9,
+                "name": "短暂停顿",
+                "kind": "Delay",
+                "template": null,
+                "threshold": 0.9,
+                "timeout_secs": 60,
+                "delay_ms": 300,
+                "optional": false
+              },
+              {
+                "id": 10,
+                "name": "自动",
+                "kind": "WaitAndClick",
+                "template": "assets/template-7.png",
+                "threshold": 0.7,
+                "timeout_secs": 20,
+                "delay_ms": 100,
+                "optional": false
+              },
+              {
+                "id": 11,
+                "name": "等待战斗加载",
+                "kind": "Delay",
+                "template": null,
+                "threshold": 0.9,
+                "timeout_secs": 60,
+                "delay_ms": 10000,
+                "optional": false
+              }
+            ]
           },
           {
             "id": 2,
-            "name": "巧克力（体力不足，停止任务）",
-            "trigger_template": "assets/template-5.png",
-            "threshold": 0.8,
-            "click_trigger": false,
-            "trigger_delay_ms": 0,
-            "outcome": "StopTask",
-            "actions": []
-          },
-          {
-            "id": 3,
-            "name": "取消（调查失败重开）",
+            "name": "取消 → 调查失败重新开始",
             "trigger_template": "assets/template-2.png",
             "threshold": 0.8,
             "click_trigger": true,
             "trigger_delay_ms": 1000,
             "outcome": "RepeatWait",
-            "actions": []
-          },
-          {
-            "id": 4,
-            "name": "重新战斗（结算，计一局）",
-            "trigger_template": "assets/template-8.png",
-            "threshold": 0.85,
-            "click_trigger": true,
-            "trigger_delay_ms": 2000,
-            "outcome": "ContinueFlow",
-            "actions": []
-          },
-          {
-            "id": 5,
-            "name": "挑战（进入关卡）",
-            "trigger_template": "assets/template-3.png",
-            "threshold": 0.85,
-            "click_trigger": true,
-            "trigger_delay_ms": 2000,
-            "outcome": "RepeatWait",
-            "actions": []
-          },
-          {
-            "id": 6,
-            "name": "助战（选择助战）",
-            "trigger_template": "assets/template-9.png",
-            "threshold": 0.85,
-            "click_trigger": true,
-            "trigger_delay_ms": 1500,
-            "outcome": "RepeatWait",
-            "actions": []
-          },
-          {
-            "id": 7,
-            "name": "上场（确认出击）",
-            "trigger_template": "assets/template-10.png",
-            "threshold": 0.85,
-            "click_trigger": true,
-            "trigger_delay_ms": 2000,
-            "outcome": "RepeatWait",
-            "actions": []
-          },
-          {
-            "id": 8,
-            "name": "自动（开启自动战斗）",
-            "trigger_template": "assets/template-7.png",
-            "threshold": 0.8,
-            "click_trigger": true,
-            "trigger_delay_ms": 1200,
-            "outcome": "RepeatWait",
-            "actions": []
+            "actions": [
+              {
+                "id": 1,
+                "name": "重新战斗",
+                "kind": "WaitAndClick",
+                "template": "assets/template-8.png",
+                "threshold": 0.7,
+                "timeout_secs": 20,
+                "delay_ms": 1000,
+                "optional": false
+              },
+              {
+                "id": 2,
+                "name": "短暂停顿",
+                "kind": "Delay",
+                "template": null,
+                "threshold": 0.9,
+                "timeout_secs": 60,
+                "delay_ms": 300,
+                "optional": false
+              },
+              {
+                "id": 3,
+                "name": "巧克力（体力不足时）",
+                "kind": "WaitAndClick",
+                "template": "assets/template-5.png",
+                "threshold": 0.7,
+                "timeout_secs": 15,
+                "delay_ms": 1000,
+                "optional": true
+              },
+              {
+                "id": 4,
+                "name": "确认（体力不足时）",
+                "kind": "WaitAndClick",
+                "template": "assets/template-6.png",
+                "threshold": 0.7,
+                "timeout_secs": 15,
+                "delay_ms": 100,
+                "optional": true
+              },
+              {
+                "id": 5,
+                "name": "短暂停顿",
+                "kind": "Delay",
+                "template": null,
+                "threshold": 0.9,
+                "timeout_secs": 60,
+                "delay_ms": 300,
+                "optional": false
+              },
+              {
+                "id": 6,
+                "name": "自动",
+                "kind": "WaitAndClick",
+                "template": "assets/template-7.png",
+                "threshold": 0.7,
+                "timeout_secs": 20,
+                "delay_ms": 100,
+                "optional": false
+              },
+              {
+                "id": 7,
+                "name": "等待战斗加载",
+                "kind": "Delay",
+                "template": null,
+                "threshold": 0.9,
+                "timeout_secs": 60,
+                "delay_ms": 10000,
+                "optional": false
+              }
+            ]
           }
         ],
         "visual_condition": {
@@ -245,7 +367,7 @@
     ],
     "sharing": {
       "author": "",
-      "description": "单步守护循环覆盖整个活动流程：进本（挑战→助战→上场）→ 开自动 → 结算点重新战斗计一局；“完成调查/取消”弹窗随时插入处理（阈值沿用原宏 70%/80%）。出现“巧克力”体力补充弹窗时不点击并停止任务，避免误消耗；“确认”模板保留在库中备用但默认不参与自动点击。基准分辨率 2560×1440，其他分辨率自动缩放模板。",
+      "description": "主循环监视“完成调查/取消”弹窗（阈值沿用原宏 70%/80%）：出现“完成调查”→ 点击后依次执行【开始调查】挑战→助战→图片变量11→上场→调查→（巧克力/确认：体力不足时，可选跳过）→自动→等待10秒；出现“取消”→ 点击后执行【调查失败重新开始】重新战斗→（巧克力/确认可选）→自动→等待10秒。两条序列执行完都回到主循环继续监视。注意：体力充足时巧克力/确认不出现属正常（可选动作会跳过）；“确认”涉及体力消耗，如不希望自动消耗请删除对应动作。基准分辨率 2560×1440，其他分辨率自动缩放模板。",
       "game_version": "",
       "game_language": "简体中文",
       "tags": "活动,同调"

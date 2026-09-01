@@ -834,7 +834,16 @@ fn execute_branch_actions(
         )));
         match action.kind {
             BranchActionKind::WaitAndClick => {
-                wait_and_click_action(ctx, action)?;
+                if let Err(error) = wait_and_click_action(ctx, action) {
+                    if action.optional && !ctx.stop.load(Ordering::Acquire) {
+                        let _ = ctx.events.send(RunnerEvent::Notice(format!(
+                            "可选动作“{}”未匹配，已跳过（{error}）",
+                            action.name
+                        )));
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
             BranchActionKind::Delay => {
                 ctx.wait(action.delay_ms)?;
