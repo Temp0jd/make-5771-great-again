@@ -2639,11 +2639,14 @@ impl Make5771App {
     }
 
     fn bottom_navigation(&mut self, ui: &mut egui::Ui) {
+        // Spread the tabs across the panel width so they adapt when the window
+        // is resized, but cap the width so very wide windows stay usable.
+        let tab_width = (ui.available_width() / AppTab::ALL.len() as f32).clamp(96.0, 220.0);
         ui.horizontal_centered(|ui| {
             for tab in AppTab::ALL {
                 let selected = self.active_tab == tab;
                 let (rect, response) =
-                    ui.allocate_exact_size(Vec2::new(96.0, 52.0), Sense::click());
+                    ui.allocate_exact_size(Vec2::new(tab_width, 52.0), Sense::click());
                 let color = if selected {
                     theme::blue()
                 } else {
