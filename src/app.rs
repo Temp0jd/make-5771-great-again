@@ -3,9 +3,10 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, 
 
 use crate::mascot::Mascots;
 use crate::model::{
-    AppTab, BranchAction, BranchActionKind, BranchOutcome, ClickMethod, ConditionExpectation,
-    ConditionMatchMode, ConditionOutcome, LogEntry, LogLevel, LoopMode, MacroProfile, RunnerStatus,
-    SearchRegionSpec, StepKind, TemplateAsset, VisualConditionTerm, WorkflowBranch, WorkflowStep,
+    AppTab, BranchAction, BranchActionKind, BranchOutcome, ClickAnchor, ClickMethod,
+    ConditionExpectation, ConditionMatchMode, ConditionOutcome, KeyInputMode, LogEntry, LogLevel,
+    LoopMode, MacroProfile, RunnerStatus, SearchRegionSpec, StepKind, TemplateAsset,
+    VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
 use crate::runner::{RunnerEvent, RunnerHandle};
@@ -1459,6 +1460,7 @@ impl Make5771App {
         ui.add_space(10.0);
 
         let list_width = (ui.available_width() * 0.43).clamp(320.0, 440.0);
+        let mut step_test_request: Option<u64> = None;
         ui.columns(2, |columns| {
             columns[0].set_width(list_width);
             theme::card().show(&mut columns[0], |ui| {
@@ -1477,6 +1479,7 @@ impl Make5771App {
                                 "判断画面条件，决定继续、点击或结束本局",
                             ),
                             (StepKind::Delay, "原地等待固定时长"),
+                            (StepKind::SendKeys, "向游戏窗口键入文字或按键，仅前台有效"),
                             (StepKind::RoundEnd, "把当前局计入完成数，并开始下一轮"),
                         ] {
                             if ui.button(kind.label()).on_hover_text(hint).clicked() {
@@ -1688,6 +1691,7 @@ impl Make5771App {
                             (StepKind::WaitAny, "等待任一目标"),
                             (StepKind::VisualCondition, "视觉条件"),
                             (StepKind::Delay, "固定等待"),
+                            (StepKind::SendKeys, "键盘输入"),
                             (StepKind::RoundEnd, "本局结束"),
                         ] {
                             ui.selectable_value(&mut step.kind, kind, label);
@@ -1704,9 +1708,67 @@ impl Make5771App {
                             &template_options,
                             &mut self.thumbs,
                         );
-                        threshold_editor(ui, &mut step.threshold);
                         timeout_editor(ui, &mut step.timeout_secs);
+                        ui.label(
+                            RichText::new("超过该时间未识别到目标，则本步骤失败")
+                                .size(11.0)
+                                .color(theme::tertiary_label()),
+                        );
                         delay_editor(ui, "识别后等待", &mut step.delay_ms);
+                        ui.label(
+                            RichText::new("点击位置")
+                                .size(11.0)
+                                .color(theme::secondary_label()),
+                        );
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt(("click-anchor", step.id))
+                                .selected_text(step.click_anchor.label())
+                                .show_ui(ui, |ui| {
+                                    for anchor in ClickAnchor::ALL {
+                                        ui.selectable_value(
+                                            &mut step.click_anchor,
+                                            anchor,
+                                            anchor.label(),
+                                        );
+                                    }
+                                });
+                            ui.label("偏移 X");
+                            ui.add(egui::DragValue::new(&mut step.click_offset_x).suffix(" px"));
+                            ui.label("Y");
+                            ui.add(egui::DragValue::new(&mut step.click_offset_y).suffix(" px"));
+                        });
+                        ui.label(
+                            RichText::new("以匹配到的图片框为基准，偏移单位是像素")
+                                .size(11.0)
+                                .color(theme::tertiary_label()),
+                        );
+                        let test_template_id = step.template.as_ref().and_then(|path| {
+                            template_options
+                                .iter()
+                                .find(|(_, _, candidate)| candidate == path)
+                                .map(|(id, _, _)| *id)
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    test_template_id.is_some(),
+                                    egui::Button::new("测试识别"),
+                                )
+                                .clicked()
+                            {
+                                step_test_request = test_template_id;
+                            }
+                            ui.label(
+                                RichText::new("倒计时 3 秒切回游戏画面，测试当前模板能否识别")
+                                    .size(11.0)
+                                    .color(theme::tertiary_label()),
+                            );
+                        });
+                        egui::CollapsingHeader::new("高级设置")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                threshold_editor(ui, &mut step.threshold);
+                            });
                     }
                     StepKind::WaitAny => {
                         wait_any_editor(ui, step, &template_options, &mut self.thumbs)
@@ -1715,6 +1777,84 @@ impl Make5771App {
                         visual_condition_editor(ui, step, &template_options, &mut self.thumbs)
                     }
                     StepKind::Delay => delay_editor(ui, "等待时间", &mut step.delay_ms),
+                    StepKind::SendKeys => {
+                        ui.label(
+                            RichText::new("输入模式")
+                                .size(11.0)
+                                .color(theme::secondary_label()),
+                        );
+                        egui::ComboBox::from_id_salt(("key-mode", step.id))
+                            .selected_text(step.key_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in KeyInputMode::ALL {
+                                    ui.selectable_value(&mut step.key_mode, mode, mode.label());
+                                }
+                            });
+                        match step.key_mode {
+                            KeyInputMode::Text => {
+                                ui.label(
+                                    RichText::new("输入文本")
+                                        .size(11.0)
+                                        .color(theme::secondary_label()),
+                                );
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut step.key_text)
+                                        .desired_rows(2)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("输入速率");
+                                    ui.add(
+                                        egui::Slider::new(&mut step.key_interval_ms, 10..=500)
+                                            .suffix(" ms"),
+                                    );
+                                });
+                                ui.label(
+                                    RichText::new("支持中文；间隔越小打得越快")
+                                        .size(11.0)
+                                        .color(theme::tertiary_label()),
+                                );
+                            }
+                            KeyInputMode::Combo => {
+                                ui.label(
+                                    RichText::new("按键组合")
+                                        .size(11.0)
+                                        .color(theme::secondary_label()),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut step.key_combo)
+                                        .hint_text("如 enter、ctrl+c、alt+f4"),
+                                );
+                                if !step.key_combo.trim().is_empty() {
+                                    match parse_key_combo(&step.key_combo) {
+                                        Ok(combo) => {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "将按下：{}",
+                                                    combo.describe()
+                                                ))
+                                                .size(11.0)
+                                                .color(theme::green()),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            ui.label(
+                                                RichText::new(error)
+                                                    .size(11.0)
+                                                    .color(Color32::from_rgb(255, 59, 48)),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        delay_editor(ui, "输入前等待", &mut step.delay_ms);
+                        ui.label(
+                            RichText::new("键盘输入前会自动激活游戏窗口（仅前台有效）")
+                                .size(11.0)
+                                .color(theme::tertiary_label()),
+                        );
+                    }
                     StepKind::RoundEnd => {
                         ui.label(
                             RichText::new("将当前局计入已完成局数，然后开始下一轮。")
@@ -1753,6 +1893,9 @@ impl Make5771App {
                 });
             });
         });
+        if let Some(template_id) = step_test_request {
+            self.begin_countdown_capture(ui.ctx(), CapturePurpose::TestTemplate(template_id));
+        }
     }
 
     fn templates_page(&mut self, ui: &mut egui::Ui) {
@@ -3184,6 +3327,7 @@ fn step_kind_chip(kind: StepKind) -> (&'static str, Color32) {
         StepKind::WaitAny => ("任一", theme::orange()),
         StepKind::VisualCondition => ("条件", theme::green()),
         StepKind::Delay => ("等待", theme::tertiary_label()),
+        StepKind::SendKeys => ("键盘", theme::purple()),
         StepKind::RoundEnd => ("结束", theme::label()),
         StepKind::Branch => ("分支", theme::tertiary_label()),
     }
@@ -3219,6 +3363,17 @@ fn step_summary(step: &WorkflowStep, templates: &[(u64, String, String)]) -> Str
             step.visual_condition.outcome.label()
         ),
         StepKind::Delay => format!("等待 {:.1}s", step.delay_ms as f32 / 1000.0),
+        StepKind::SendKeys => match step.key_mode {
+            KeyInputMode::Text => {
+                if step.key_text.trim().is_empty() {
+                    "未设置文本".to_owned()
+                } else {
+                    let text: String = step.key_text.chars().take(12).collect();
+                    format!("键入“{text}” · 间隔{}ms", step.key_interval_ms)
+                }
+            }
+            KeyInputMode::Combo => format!("按键 {}", step.key_combo),
+        },
         StepKind::RoundEnd => "计一局并开始下一轮".to_owned(),
         StepKind::Branch => "尚未开放".to_owned(),
     };

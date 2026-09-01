@@ -69,6 +69,8 @@ impl Drop for HotkeyGuard {
 pub enum PlatformError {
     #[cfg(not(windows))]
     Unsupported,
+    #[cfg(not(windows))]
+    KeyboardUnsupported,
     #[cfg(windows)]
     WindowNotFound(String),
     #[cfg(windows)]
@@ -80,6 +82,8 @@ impl std::fmt::Display for PlatformError {
         match self {
             #[cfg(not(windows))]
             Self::Unsupported => write!(formatter, "窗口连接仅支持 Windows"),
+            #[cfg(not(windows))]
+            Self::KeyboardUnsupported => write!(formatter, "键盘输入仅支持 Windows"),
             #[cfg(windows)]
             Self::WindowNotFound(title) => write!(formatter, "没有找到包含“{title}”的可见窗口"),
             #[cfg(windows)]
@@ -245,6 +249,34 @@ pub fn capture_client(_target: &TargetWindow) -> Result<image::RgbaImage, Platfo
 }
 
 #[cfg(windows)]
+pub fn send_unicode_char(target: &TargetWindow, ch: char) -> Result<(), PlatformError> {
+    windows_impl::send_unicode_char(target, ch)
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code, reason = "used by the Windows workflow executor")]
+pub fn send_unicode_char(_target: &TargetWindow, _ch: char) -> Result<(), PlatformError> {
+    Err(PlatformError::KeyboardUnsupported)
+}
+
+#[cfg(windows)]
+pub fn press_key_combo(
+    target: &TargetWindow,
+    combo: &crate::model::KeyCombo,
+) -> Result<(), PlatformError> {
+    windows_impl::press_key_combo(target, combo)
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code, reason = "used by the Windows workflow executor")]
+pub fn press_key_combo(
+    _target: &TargetWindow,
+    _combo: &crate::model::KeyCombo,
+) -> Result<(), PlatformError> {
+    Err(PlatformError::KeyboardUnsupported)
+}
+
+#[cfg(windows)]
 mod windows_impl {
     use std::ffi::c_void;
     use std::mem::size_of;
@@ -263,8 +295,11 @@ mod windows_impl {
         OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_MOUSE, MOD_NOREPEAT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        MOUSEINPUT, RegisterHotKey, SendInput, UnregisterHotKey, VK_F6, VK_F8,
+        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOD_NOREPEAT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        MOUSEINPUT, RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
+        VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F6, VK_F8, VK_HOME, VK_LEFT, VK_MENU,
+        VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
     };
     use windows::Win32::UI::Shell::{
         ExtractIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -285,6 +320,7 @@ mod windows_impl {
     use windows::core::{BOOL, PCWSTR, PWSTR};
 
     use super::{GlobalHotkey, HotkeyGuard, PlatformError, TargetWindow, TrayEvent, TrayGuard};
+    use crate::model::{KeyCode, KeyCombo};
 
     const CAPTURE_HOTKEY_ID: i32 = 577_106;
     const STOP_HOTKEY_ID: i32 = 577_108;
@@ -871,6 +907,99 @@ mod windows_impl {
             ));
         }
         Ok(())
+    }
+
+    /// Types one Unicode character (including CJK) via KEYEVENTF_UNICODE.
+    pub fn send_unicode_char(target: &TargetWindow, ch: char) -> Result<(), PlatformError> {
+        focus_for_keyboard(target)?;
+        let mut units = [0_u16; 2];
+        let encoded = ch.encode_utf16(&mut units);
+        let mut inputs = Vec::with_capacity(encoded.len() * 2);
+        for unit in encoded {
+            inputs.push(key_input(0, *unit, KEYEVENTF_UNICODE));
+            inputs.push(key_input(0, *unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+        }
+        send_key_inputs(&inputs)
+    }
+
+    /// Presses a modifier-plus-key combination: modifiers down, main key
+    /// down/up, then modifiers up in reverse order.
+    pub fn press_key_combo(target: &TargetWindow, combo: &KeyCombo) -> Result<(), PlatformError> {
+        focus_for_keyboard(target)?;
+        let mut modifiers = Vec::new();
+        if combo.ctrl {
+            modifiers.push(VK_CONTROL.0);
+        }
+        if combo.shift {
+            modifiers.push(VK_SHIFT.0);
+        }
+        if combo.alt {
+            modifiers.push(VK_MENU.0);
+        }
+        let main_key = virtual_key(combo.key);
+        let mut inputs = Vec::with_capacity(modifiers.len() * 2 + 2);
+        for &modifier in &modifiers {
+            inputs.push(key_input(modifier, 0, KEYBD_EVENT_FLAGS(0)));
+        }
+        inputs.push(key_input(main_key, 0, KEYBD_EVENT_FLAGS(0)));
+        inputs.push(key_input(main_key, 0, KEYEVENTF_KEYUP));
+        for &modifier in modifiers.iter().rev() {
+            inputs.push(key_input(modifier, 0, KEYEVENTF_KEYUP));
+        }
+        send_key_inputs(&inputs)
+    }
+
+    fn focus_for_keyboard(target: &TargetWindow) -> Result<(), PlatformError> {
+        focus_target(target).map_err(|_| {
+            PlatformError::WindowsApi("无法激活游戏窗口，键盘输入需要窗口处于前台".to_owned())
+        })
+    }
+
+    fn key_input(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk),
+                    wScan: scan,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    fn send_key_inputs(inputs: &[INPUT]) -> Result<(), PlatformError> {
+        let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+        if sent != inputs.len() as u32 {
+            return Err(PlatformError::WindowsApi(
+                "系统未接受完整的键盘输入事件".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn virtual_key(code: KeyCode) -> u16 {
+        match code {
+            KeyCode::Enter => VK_RETURN.0,
+            KeyCode::Esc => VK_ESCAPE.0,
+            KeyCode::Space => VK_SPACE.0,
+            KeyCode::Tab => VK_TAB.0,
+            KeyCode::Backspace => VK_BACK.0,
+            KeyCode::Delete => VK_DELETE.0,
+            KeyCode::Home => VK_HOME.0,
+            KeyCode::End => VK_END.0,
+            KeyCode::PageUp => VK_PRIOR.0,
+            KeyCode::PageDown => VK_NEXT.0,
+            KeyCode::Up => VK_UP.0,
+            KeyCode::Down => VK_DOWN.0,
+            KeyCode::Left => VK_LEFT.0,
+            KeyCode::Right => VK_RIGHT.0,
+            KeyCode::F(number) => VK_F1.0 + u16::from(number) - 1,
+            KeyCode::Letter(letter) => u16::from(letter.to_ascii_uppercase() as u8),
+            KeyCode::Digit(digit) => u16::from(digit as u8),
+        }
     }
 
     pub fn capture_client(target: &TargetWindow) -> Result<RgbaImage, PlatformError> {

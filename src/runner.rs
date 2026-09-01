@@ -8,9 +8,9 @@ use chrono::{DateTime, Local, NaiveTime};
 use image::GrayImage;
 
 use crate::model::{
-    BranchAction, BranchActionKind, BranchOutcome, ClickMethod, ConditionExpectation,
-    ConditionMatchMode, ConditionOutcome, LoopMode, MacroProfile, StepKind, TemplateAsset,
-    VisualConditionSpec, VisualConditionTerm, WorkflowBranch, WorkflowStep,
+    BranchAction, BranchActionKind, BranchOutcome, ClickAnchor, ClickMethod, ConditionExpectation,
+    ConditionMatchMode, ConditionOutcome, KeyInputMode, LoopMode, MacroProfile, StepKind,
+    TemplateAsset, VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
 use crate::vision::{self, SearchRegion};
@@ -95,6 +95,17 @@ fn validate_executable_profile(profile: &MacroProfile) -> Result<(), String> {
                 )?;
             }
             StepKind::Delay | StepKind::RoundEnd => {}
+            StepKind::SendKeys => match step.key_mode {
+                KeyInputMode::Text => {
+                    if step.key_text.trim().is_empty() {
+                        return Err(format!("步骤“{}”的输入文本不能为空", step.name));
+                    }
+                }
+                KeyInputMode::Combo => {
+                    parse_key_combo(&step.key_combo)
+                        .map_err(|error| format!("步骤“{}”的按键组合无效：{error}", step.name))?;
+                }
+            },
             StepKind::WaitAny => {
                 if step.branches.is_empty() {
                     return Err(format!("步骤“{}”至少需要一条分支", step.name));
@@ -257,6 +268,7 @@ fn run_workflow(
                 StepKind::WaitAny => wait_any(&mut ctx, step),
                 StepKind::Branch => Err(format!("步骤“{}”的条件分支执行尚未开放", step.name)),
                 StepKind::VisualCondition => visual_condition(&mut ctx, step),
+                StepKind::SendKeys => send_keys(&mut ctx, step).map(|()| StepControl::Continue),
             };
             match result {
                 Ok(StepControl::Continue) => {}
@@ -527,7 +539,13 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
         );
         best_seen = best_seen.max(report.best_score);
         if let Some(found) = report.matched {
-            let (x, y) = found.center();
+            let (base_x, base_y) = anchor_point(&found, step.click_anchor);
+            let x = (base_x as i32 + step.click_offset_x)
+                .clamp(0, ctx.target.client_width.saturating_sub(1) as i32)
+                as u32;
+            let y = (base_y as i32 + step.click_offset_y)
+                .clamp(0, ctx.target.client_height.saturating_sub(1) as i32)
+                as u32;
             ctx.click(x, y)?;
             let _ = ctx.events.send(RunnerEvent::MatchFound {
                 name: step.name.clone(),
@@ -541,6 +559,57 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
         "步骤“{}”在 {} 秒内未找到目标（最佳相似度 {:.2}，阈值 {:.2}）",
         step.name, step.timeout_secs, best_seen, step.threshold
     ))
+}
+
+/// Picks the reference point on the matched box for the configured anchor;
+/// edges use the inclusive far edge (x + w - 1, y + h - 1).
+fn anchor_point(found: &vision::TemplateMatch, anchor: ClickAnchor) -> (u32, u32) {
+    let left = found.x;
+    let top = found.y;
+    let right = found.x + found.width.saturating_sub(1);
+    let bottom = found.y + found.height.saturating_sub(1);
+    let center_x = found.x + found.width / 2;
+    let center_y = found.y + found.height / 2;
+    match anchor {
+        ClickAnchor::Center => (center_x, center_y),
+        ClickAnchor::TopLeft => (left, top),
+        ClickAnchor::Top => (center_x, top),
+        ClickAnchor::TopRight => (right, top),
+        ClickAnchor::Left => (left, center_y),
+        ClickAnchor::Right => (right, center_y),
+        ClickAnchor::BottomLeft => (left, bottom),
+        ClickAnchor::Bottom => (center_x, bottom),
+        ClickAnchor::BottomRight => (right, bottom),
+    }
+}
+
+/// Types text character by character, or presses a parsed key combination.
+/// `delay_ms` acts as a pre-input wait; per-character pacing reuses the
+/// click-jitter switch for humanization.
+fn send_keys(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), String> {
+    ctx.wait(step.delay_ms)?;
+    match step.key_mode {
+        KeyInputMode::Text => {
+            if step.key_text.is_empty() {
+                return Err(format!("步骤“{}”的输入文本不能为空", step.name));
+            }
+            let humanize = ctx.profile.click_jitter;
+            for ch in step.key_text.chars() {
+                if ctx.stop.load(Ordering::Acquire) {
+                    return Err("用户停止".to_owned());
+                }
+                platform::send_unicode_char(&ctx.target, ch).map_err(|error| error.to_string())?;
+                let interval = ctx.jitter.jitter_ms(step.key_interval_ms, humanize);
+                interruptible_wait(Duration::from_millis(interval), ctx.stop)?;
+            }
+        }
+        KeyInputMode::Combo => {
+            let combo = parse_key_combo(&step.key_combo)
+                .map_err(|error| format!("步骤“{}”的按键组合无效：{error}", step.name))?;
+            platform::press_key_combo(&ctx.target, &combo).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepControl, String> {
@@ -751,17 +820,11 @@ fn execute_branch_actions(
 
 fn wait_and_click_action(ctx: &mut StepContext<'_>, action: &BranchAction) -> Result<(), String> {
     let step = WorkflowStep {
-        id: action.id,
-        name: action.name.clone(),
-        kind: StepKind::WaitAndClick,
-        indent: 0,
-        enabled: true,
         template: action.template.clone(),
         threshold: action.threshold,
         timeout_secs: action.timeout_secs,
         delay_ms: action.delay_ms,
-        branches: Vec::new(),
-        visual_condition: VisualConditionSpec::default(),
+        ..WorkflowStep::new(action.id, action.name.clone(), StepKind::WaitAndClick, 0)
     };
     wait_and_click(ctx, &step)
 }
@@ -1075,5 +1138,81 @@ mod tests {
 
         let error = validate_executable_profile(&profile).unwrap_err();
         assert!(error.contains("至少需要一条视觉条件"));
+    }
+
+    #[test]
+    fn click_anchor_picks_point_on_match_box() {
+        let found = vision::TemplateMatch {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 10,
+            score: 1.0,
+        };
+        assert_eq!(anchor_point(&found, ClickAnchor::TopLeft), (10, 20));
+        assert_eq!(anchor_point(&found, ClickAnchor::Top), (25, 20));
+        assert_eq!(anchor_point(&found, ClickAnchor::TopRight), (39, 20));
+        assert_eq!(anchor_point(&found, ClickAnchor::Left), (10, 25));
+        assert_eq!(anchor_point(&found, ClickAnchor::Center), (25, 25));
+        assert_eq!(anchor_point(&found, ClickAnchor::Right), (39, 25));
+        assert_eq!(anchor_point(&found, ClickAnchor::BottomLeft), (10, 29));
+        assert_eq!(anchor_point(&found, ClickAnchor::Bottom), (25, 29));
+        assert_eq!(anchor_point(&found, ClickAnchor::BottomRight), (39, 29));
+    }
+
+    #[test]
+    fn executable_profile_rejects_empty_send_keys_text() {
+        let mut profile = MacroProfile::default();
+        let template_path = "templates/test.png".to_owned();
+        profile.templates.push(TemplateAsset {
+            id: 1,
+            name: "test".to_owned(),
+            path: template_path.clone(),
+            width: 20,
+            height: 20,
+            reference_width: 1280,
+            reference_height: 720,
+            search_region: None,
+        });
+        for step in &mut profile.steps[..3] {
+            step.template = Some(template_path.clone());
+        }
+        profile.steps[1].kind = StepKind::SendKeys;
+        profile.steps[1].template = None;
+
+        let error = validate_executable_profile(&profile).unwrap_err();
+        assert!(error.contains("输入文本不能为空"));
+
+        profile.steps[1].key_text = "刷关123".to_owned();
+        assert!(validate_executable_profile(&profile).is_ok());
+    }
+
+    #[test]
+    fn executable_profile_rejects_invalid_send_keys_combo() {
+        let mut profile = MacroProfile::default();
+        let template_path = "templates/test.png".to_owned();
+        profile.templates.push(TemplateAsset {
+            id: 1,
+            name: "test".to_owned(),
+            path: template_path.clone(),
+            width: 20,
+            height: 20,
+            reference_width: 1280,
+            reference_height: 720,
+            search_region: None,
+        });
+        for step in &mut profile.steps[..3] {
+            step.template = Some(template_path.clone());
+        }
+        profile.steps[1].kind = StepKind::SendKeys;
+        profile.steps[1].template = None;
+        profile.steps[1].key_mode = KeyInputMode::Combo;
+        profile.steps[1].key_combo = "ctrl+".to_owned();
+
+        let error = validate_executable_profile(&profile).unwrap_err();
+        assert!(error.contains("按键组合无效"));
+
+        profile.steps[1].key_combo = "ctrl+c".to_owned();
+        assert!(validate_executable_profile(&profile).is_ok());
     }
 }

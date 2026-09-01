@@ -58,6 +58,236 @@ fn default_click_jitter() -> bool {
     true
 }
 
+/// Where on the matched template box the click lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ClickAnchor {
+    #[default]
+    Center,
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+impl ClickAnchor {
+    pub const ALL: [Self; 9] = [
+        Self::Center,
+        Self::TopLeft,
+        Self::Top,
+        Self::TopRight,
+        Self::Left,
+        Self::Right,
+        Self::BottomLeft,
+        Self::Bottom,
+        Self::BottomRight,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Center => "中心",
+            Self::TopLeft => "左上",
+            Self::Top => "上",
+            Self::TopRight => "右上",
+            Self::Left => "左",
+            Self::Right => "右",
+            Self::BottomLeft => "左下",
+            Self::Bottom => "下",
+            Self::BottomRight => "右下",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum KeyInputMode {
+    #[default]
+    Text,
+    Combo,
+}
+
+impl KeyInputMode {
+    pub const ALL: [Self; 2] = [Self::Text, Self::Combo];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Text => "文本键入",
+            Self::Combo => "按键组合",
+        }
+    }
+}
+
+fn default_key_interval_ms() -> u32 {
+    60
+}
+
+/// Portable key identifiers for `SendKeys` steps; mapped to platform virtual
+/// keys in the platform layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCode {
+    Enter,
+    Esc,
+    Space,
+    Tab,
+    Backspace,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Up,
+    Down,
+    Left,
+    Right,
+    F(u8),
+    Letter(char),
+    Digit(char),
+}
+
+impl KeyCode {
+    fn name(self) -> String {
+        match self {
+            Self::Enter => "Enter".to_owned(),
+            Self::Esc => "Esc".to_owned(),
+            Self::Space => "Space".to_owned(),
+            Self::Tab => "Tab".to_owned(),
+            Self::Backspace => "Backspace".to_owned(),
+            Self::Delete => "Delete".to_owned(),
+            Self::Home => "Home".to_owned(),
+            Self::End => "End".to_owned(),
+            Self::PageUp => "PageUp".to_owned(),
+            Self::PageDown => "PageDown".to_owned(),
+            Self::Up => "↑".to_owned(),
+            Self::Down => "↓".to_owned(),
+            Self::Left => "←".to_owned(),
+            Self::Right => "→".to_owned(),
+            Self::F(number) => format!("F{number}"),
+            Self::Letter(letter) => letter.to_ascii_uppercase().to_string(),
+            Self::Digit(digit) => digit.to_string(),
+        }
+    }
+}
+
+/// A modifier-plus-key combination such as Ctrl+C or Alt+F4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyCombo {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub key: KeyCode,
+}
+
+impl KeyCombo {
+    /// Human-readable rendering like `Ctrl+Shift+Enter`, shown next to the
+    /// combo text box as live parse feedback.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.ctrl {
+            parts.push("Ctrl".to_owned());
+        }
+        if self.shift {
+            parts.push("Shift".to_owned());
+        }
+        if self.alt {
+            parts.push("Alt".to_owned());
+        }
+        parts.push(self.key.name());
+        parts.join("+")
+    }
+}
+
+/// Parses a combo string like `ctrl+c` or `Alt+F4` (case-insensitive, parts
+/// joined by `+`) into a `KeyCombo`.
+pub fn parse_key_combo(input: &str) -> Result<KeyCombo, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("按键组合不能为空".to_owned());
+    }
+    let mut ctrl = false;
+    let mut shift = false;
+    let mut alt = false;
+    let mut key: Option<KeyCode> = None;
+    for part in input.split('+') {
+        let token = part.trim().to_lowercase();
+        if token.is_empty() {
+            return Err("按键组合格式不正确，存在空的按键".to_owned());
+        }
+        match token.as_str() {
+            "ctrl" => {
+                if ctrl {
+                    return Err("修饰键 Ctrl 重复".to_owned());
+                }
+                ctrl = true;
+            }
+            "shift" => {
+                if shift {
+                    return Err("修饰键 Shift 重复".to_owned());
+                }
+                shift = true;
+            }
+            "alt" => {
+                if alt {
+                    return Err("修饰键 Alt 重复".to_owned());
+                }
+                alt = true;
+            }
+            _ => {
+                if key.is_some() {
+                    return Err("按键组合只能包含一个主键".to_owned());
+                }
+                key = Some(parse_main_key(&token)?);
+            }
+        }
+    }
+    let key = key.ok_or_else(|| "按键组合缺少主键，例如 enter、ctrl+c".to_owned())?;
+    Ok(KeyCombo {
+        ctrl,
+        shift,
+        alt,
+        key,
+    })
+}
+
+fn parse_main_key(token: &str) -> Result<KeyCode, String> {
+    let key = match token {
+        "enter" => KeyCode::Enter,
+        "esc" => KeyCode::Esc,
+        "space" => KeyCode::Space,
+        "tab" => KeyCode::Tab,
+        "backspace" => KeyCode::Backspace,
+        "delete" => KeyCode::Delete,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        _ => {
+            if let Some(digits) = token.strip_prefix('f')
+                && let Ok(number) = digits.parse::<u8>()
+                && (1..=12).contains(&number)
+            {
+                return Ok(KeyCode::F(number));
+            }
+            let mut chars = token.chars();
+            if let (Some(single), None) = (chars.next(), chars.next()) {
+                if single.is_ascii_lowercase() {
+                    return Ok(KeyCode::Letter(single));
+                }
+                if single.is_ascii_digit() {
+                    return Ok(KeyCode::Digit(single));
+                }
+            }
+            return Err(format!("无法识别的按键“{token}”"));
+        }
+    };
+    Ok(key)
+}
+
 fn default_ui_scale() -> f32 {
     1.0
 }
@@ -100,6 +330,7 @@ pub enum StepKind {
     VisualCondition,
     Branch,
     Delay,
+    SendKeys,
     RoundEnd,
 }
 
@@ -308,6 +539,7 @@ impl StepKind {
             Self::VisualCondition => "视觉条件",
             Self::Branch => "条件分支",
             Self::Delay => "固定等待",
+            Self::SendKeys => "键盘输入",
             Self::RoundEnd => "本局结束",
         }
     }
@@ -324,6 +556,20 @@ pub struct WorkflowStep {
     pub threshold: f32,
     pub timeout_secs: u32,
     pub delay_ms: u32,
+    #[serde(default)]
+    pub click_anchor: ClickAnchor,
+    #[serde(default)]
+    pub click_offset_x: i32,
+    #[serde(default)]
+    pub click_offset_y: i32,
+    #[serde(default)]
+    pub key_mode: KeyInputMode,
+    #[serde(default)]
+    pub key_text: String,
+    #[serde(default)]
+    pub key_combo: String,
+    #[serde(default = "default_key_interval_ms")]
+    pub key_interval_ms: u32,
     #[serde(default)]
     pub branches: Vec<WorkflowBranch>,
     #[serde(default)]
@@ -342,6 +588,13 @@ impl WorkflowStep {
             threshold: 0.90,
             timeout_secs: 60,
             delay_ms: 500,
+            click_anchor: ClickAnchor::default(),
+            click_offset_x: 0,
+            click_offset_y: 0,
+            key_mode: KeyInputMode::default(),
+            key_text: String::new(),
+            key_combo: String::new(),
+            key_interval_ms: default_key_interval_ms(),
             branches: Vec::new(),
             visual_condition: VisualConditionSpec::default(),
         }
@@ -723,5 +976,94 @@ mod tests {
         let profile: MacroProfile = serde_json::from_value(value).unwrap();
         assert_eq!(profile.click_method, ClickMethod::Foreground);
         assert!(profile.click_jitter);
+    }
+
+    #[test]
+    fn old_steps_load_with_default_click_anchor_and_key_fields() {
+        let json = r#"{
+            "id": 9,
+            "name": "old step",
+            "kind": "WaitAndClick",
+            "indent": 0,
+            "enabled": true,
+            "template": null,
+            "threshold": 0.9,
+            "timeout_secs": 10,
+            "delay_ms": 500
+        }"#;
+        let step: WorkflowStep = serde_json::from_str(json).unwrap();
+        assert_eq!(step.click_anchor, ClickAnchor::Center);
+        assert_eq!(step.click_offset_x, 0);
+        assert_eq!(step.click_offset_y, 0);
+        assert_eq!(step.key_mode, KeyInputMode::Text);
+        assert!(step.key_text.is_empty());
+        assert!(step.key_combo.is_empty());
+        assert_eq!(step.key_interval_ms, 60);
+    }
+
+    #[test]
+    fn parses_plain_main_key() {
+        assert_eq!(
+            parse_key_combo("enter").unwrap(),
+            KeyCombo {
+                ctrl: false,
+                shift: false,
+                alt: false,
+                key: KeyCode::Enter,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_modifiers_case_insensitively() {
+        assert_eq!(
+            parse_key_combo("CTRL+C").unwrap(),
+            KeyCombo {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                key: KeyCode::Letter('c'),
+            }
+        );
+        assert_eq!(
+            parse_key_combo("alt+f4").unwrap(),
+            KeyCombo {
+                ctrl: false,
+                shift: false,
+                alt: true,
+                key: KeyCode::F(4),
+            }
+        );
+        assert_eq!(
+            parse_key_combo("shift+delete").unwrap(),
+            KeyCombo {
+                ctrl: false,
+                shift: true,
+                alt: false,
+                key: KeyCode::Delete,
+            }
+        );
+        assert_eq!(
+            parse_key_combo("Ctrl+Shift+5").unwrap(),
+            KeyCombo {
+                ctrl: true,
+                shift: true,
+                alt: false,
+                key: KeyCode::Digit('5'),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_combos() {
+        assert!(parse_key_combo("").is_err());
+        assert!(parse_key_combo("   ").is_err());
+        assert!(parse_key_combo("ctrl+").is_err());
+        assert!(parse_key_combo("foo").is_err());
+        assert!(parse_key_combo("ctrl+ctrl+c").is_err());
+        assert!(parse_key_combo("ctrl").is_err());
+        assert!(parse_key_combo("a+b").is_err());
+        assert!(parse_key_combo("f13").is_err());
+        assert!(parse_key_combo("ab").is_err());
     }
 }
