@@ -536,6 +536,7 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
             frame.height(),
             template,
             step.threshold,
+            ctx.profile.match_algorithm,
         );
         best_seen = best_seen.max(report.best_score);
         if let Some(found) = report.matched {
@@ -664,6 +665,7 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
                 frame.height(),
                 template,
                 branch.threshold,
+                ctx.profile.match_algorithm,
             );
             if report.best_score > best_seen.0 {
                 best_seen = (report.best_score, branch.name.clone());
@@ -757,6 +759,7 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
                 frame.height(),
                 template,
                 term.threshold,
+                ctx.profile.match_algorithm,
             );
             if report.best_score > best_seen.0 {
                 best_seen = (report.best_score, term.name.clone());
@@ -887,6 +890,7 @@ fn find_loaded_template(
     frame_height: u32,
     template: &LoadedTemplate,
     threshold: f32,
+    algorithm: vision::MatchAlgorithm,
 ) -> vision::MatchReport {
     let base_region = template
         .asset
@@ -913,13 +917,14 @@ fn find_loaded_template(
         )
     {
         let tracked_report =
-            vision::find_template_report(frame, &template.image, tracked, threshold);
+            vision::find_template_report(frame, &template.image, tracked, threshold, algorithm);
         if let Some(found) = tracked_report.matched {
             template.last_match.set(Some((found.x, found.y)));
             return tracked_report;
         }
     }
-    let report = vision::find_template_report(frame, &template.image, base_region, threshold);
+    let report =
+        vision::find_template_report(frame, &template.image, base_region, threshold, algorithm);
     template
         .last_match
         .set(report.matched.map(|found| (found.x, found.y)));

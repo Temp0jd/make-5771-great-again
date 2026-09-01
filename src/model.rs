@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::vision::MatchAlgorithm;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppTab {
     Run,
@@ -717,6 +719,8 @@ pub struct MacroProfile {
     #[serde(default)]
     pub shared_templates: bool,
     #[serde(default)]
+    pub match_algorithm: MatchAlgorithm,
+    #[serde(default)]
     pub sharing: SharingMetadata,
 }
 
@@ -766,6 +770,7 @@ impl Default for MacroProfile {
             capture_hotkey: default_capture_hotkey(),
             stop_hotkey: default_stop_hotkey(),
             shared_templates: false,
+            match_algorithm: MatchAlgorithm::default(),
             sharing: SharingMetadata::default(),
         }
     }
@@ -1176,10 +1181,12 @@ mod tests {
         object.remove("capture_hotkey");
         object.remove("stop_hotkey");
         object.remove("shared_templates");
+        object.remove("match_algorithm");
         let profile: MacroProfile = serde_json::from_value(value).unwrap();
         assert_eq!(profile.capture_hotkey, "f6");
         assert_eq!(profile.stop_hotkey, "f8");
         assert!(!profile.shared_templates);
+        assert_eq!(profile.match_algorithm, MatchAlgorithm::Fast);
     }
 
     #[test]
