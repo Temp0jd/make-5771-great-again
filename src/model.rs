@@ -337,7 +337,7 @@ impl RunnerStatus {
             Self::Ready => "准备就绪",
             Self::Running => "运行中",
             Self::Paused => "已暂停",
-            Self::Finishing => "本局结束后停止",
+            Self::Finishing => "正在停止",
         }
     }
 }

@@ -93,6 +93,7 @@ pub struct Make5771App {
     current_step: String,
     logs: Vec<LogEntry>,
     toast: Option<String>,
+    force_stop_confirm: bool,
     target_window: Option<TargetWindow>,
     template_draft: Option<TemplateDraft>,
     hotkey_receiver: Option<std::sync::mpsc::Receiver<platform::GlobalHotkey>>,
@@ -190,6 +191,7 @@ impl Make5771App {
             current_step: "等待开始".to_owned(),
             logs: Vec::new(),
             toast: None,
+            force_stop_confirm: false,
             target_window,
             template_draft: None,
             hotkey_receiver,
@@ -546,6 +548,23 @@ impl Make5771App {
             self.capture_game_frame(ctx, "倒计时");
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
+    /// Immediately abandons the running workflow without waiting for the
+    /// current step: the stop flag is set so the worker thread exits at its
+    /// next checkpoint, but the UI returns to Ready at once.
+    fn force_stop(&mut self) {
+        if let Some(runner) = &self.workflow_runner {
+            runner.request_stop();
+        }
+        self.workflow_runner = None;
+        self.runner_status = RunnerStatus::Ready;
+        self.current_step = "已强制停止".to_owned();
+        self.run_started_at = None;
+        self.push_log(
+            LogLevel::Warning,
+            "已强制停止流程（未等待当前步骤完成，游戏可能停留在操作中间状态）",
+        );
     }
 
     fn toggle_runner(&mut self) {
@@ -1421,11 +1440,10 @@ impl Make5771App {
                 );
                 ui.add_space(4.0);
             }
-            let running = self.runner_status != RunnerStatus::Ready;
-            let text = if running {
-                "停止运行"
-            } else {
-                "开始运行"
+            let (text, fill) = match self.runner_status {
+                RunnerStatus::Ready => ("开始运行", theme::blue()),
+                RunnerStatus::Finishing => ("强制停止", theme::red()),
+                _ => ("停止运行", theme::orange()),
             };
             let button = egui::Button::new(
                 RichText::new(text)
@@ -1433,16 +1451,23 @@ impl Make5771App {
                     .color(Color32::WHITE)
                     .strong(),
             )
-            .fill(if running {
-                theme::orange()
-            } else {
-                theme::blue()
-            })
+            .fill(fill)
             .stroke(Stroke::NONE)
             .corner_radius(CornerRadius::same(16))
             .min_size(Vec2::new(260.0, 64.0));
             if ui.add(button).clicked() {
-                self.toggle_runner();
+                if self.runner_status == RunnerStatus::Finishing {
+                    self.force_stop_confirm = true;
+                } else {
+                    self.toggle_runner();
+                }
+            }
+            if self.runner_status == RunnerStatus::Finishing {
+                ui.label(
+                    RichText::new("正在等待当前步骤结束，再点一次可立即强制停止")
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
             }
         });
     }
@@ -4236,6 +4261,46 @@ impl eframe::App for Make5771App {
 
         self.show_window_picker(&ctx);
         self.show_workflow_dialogs(&ctx);
+
+        if self.force_stop_confirm {
+            let mut open = self.force_stop_confirm;
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new("强制停止")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label("确定要立即强制停止吗？");
+                    ui.label(
+                        RichText::new("不会等待当前步骤完成，游戏可能停留在操作中间状态。")
+                            .size(12.0)
+                            .color(theme::secondary_label()),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("强制停止").color(Color32::WHITE))
+                                    .fill(theme::red()),
+                            )
+                            .clicked()
+                        {
+                            confirm = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if confirm {
+                self.force_stop();
+            }
+            if confirm || cancel || !open {
+                self.force_stop_confirm = false;
+            }
+        }
 
         if let Some(message) = self.toast.clone() {
             let mut dismiss = false;

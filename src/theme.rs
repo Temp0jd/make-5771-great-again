@@ -15,6 +15,7 @@ pub struct Palette {
     pub green: Color32,
     pub orange: Color32,
     pub purple: Color32,
+    pub red: Color32,
 }
 
 const LIGHT: Palette = Palette {
@@ -29,6 +30,7 @@ const LIGHT: Palette = Palette {
     green: Color32::from_rgb(52, 199, 89),
     orange: Color32::from_rgb(255, 149, 0),
     purple: Color32::from_rgb(175, 82, 222),
+    red: Color32::from_rgb(255, 59, 48),
 };
 
 const DARK: Palette = Palette {
@@ -43,6 +45,7 @@ const DARK: Palette = Palette {
     green: Color32::from_rgb(48, 209, 88),
     orange: Color32::from_rgb(255, 159, 10),
     purple: Color32::from_rgb(191, 90, 242),
+    red: Color32::from_rgb(255, 69, 58),
 };
 
 thread_local! {
@@ -95,6 +98,10 @@ pub fn orange() -> Color32 {
 
 pub fn purple() -> Color32 {
     palette().purple
+}
+
+pub fn red() -> Color32 {
+    palette().red
 }
 
 pub fn install(ctx: &egui::Context, dark: bool) {
