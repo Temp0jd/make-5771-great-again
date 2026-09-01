@@ -394,7 +394,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
         return Err("长度不是 4 的倍数".to_owned());
     }
     let mut output = Vec::with_capacity(bytes.len() / 4 * 3);
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last = index + 1 == bytes.len() / 4;
         let first = decode_base64_value(chunk[0])?;
         let second = decode_base64_value(chunk[1])?;
