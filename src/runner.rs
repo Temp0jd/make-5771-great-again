@@ -5,7 +5,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, NaiveTime};
-use image::GrayImage;
+use image::{GrayImage, RgbaImage};
 
 use crate::model::{
     BranchAction, BranchActionKind, BranchOutcome, ClickAnchor, ClickMethod, ConditionExpectation,
@@ -13,7 +13,7 @@ use crate::model::{
     TemplateAsset, VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
-use crate::vision::{self, SearchRegion};
+use crate::vision::{self, MatchAlgorithm, SearchRegion};
 
 #[derive(Debug, Clone)]
 pub enum RunnerEvent {
@@ -304,9 +304,12 @@ fn load_templates(
 ) -> Result<HashMap<String, LoadedTemplate>, String> {
     let mut templates = HashMap::new();
     for asset in &profile.templates {
-        let image = image::open(&asset.path)
+        // Both a grayscale and an RGB copy are kept: the matching algorithm
+        // chosen in the profile decides which one is scanned.
+        let image_rgb = image::open(&asset.path)
             .map_err(|error| format!("无法读取模板“{}”：{error}", asset.name))?
-            .into_luma8();
+            .into_rgba8();
+        let image = image::imageops::grayscale(&image_rgb);
         // Older profiles never recorded a reference size; treat them as
         // captured at the profile's base resolution.
         let reference_width = if asset.reference_width > 0 {
@@ -323,8 +326,10 @@ fn load_templates(
         let mut scaled_asset = asset.clone();
         scaled_asset.reference_width = frame_width;
         scaled_asset.reference_height = frame_height;
-        let image = if reference_width == frame_width && reference_height == frame_height {
-            image
+        let (image, image_rgb) = if reference_width == frame_width
+            && reference_height == frame_height
+        {
+            (image, image_rgb)
         } else {
             let scale = |value: u32, from: u32, to: u32| {
                 ((u64::from(value) * u64::from(to) + u64::from(from) / 2) / u64::from(from.max(1)))
@@ -333,11 +338,21 @@ fn load_templates(
             scaled_asset.search_region = asset.search_region.map(|region| {
                 region.scaled(reference_width, reference_height, frame_width, frame_height)
             });
-            image::imageops::resize(
-                &image,
-                scale(asset.width, reference_width, frame_width),
-                scale(asset.height, reference_height, frame_height),
-                image::imageops::FilterType::Triangle,
+            let width = scale(asset.width, reference_width, frame_width);
+            let height = scale(asset.height, reference_height, frame_height);
+            (
+                image::imageops::resize(
+                    &image,
+                    width,
+                    height,
+                    image::imageops::FilterType::Triangle,
+                ),
+                image::imageops::resize(
+                    &image_rgb,
+                    width,
+                    height,
+                    image::imageops::FilterType::Triangle,
+                ),
             )
         };
         templates.insert(
@@ -345,6 +360,7 @@ fn load_templates(
             LoadedTemplate {
                 asset: scaled_asset,
                 image,
+                image_rgb,
                 last_match: Cell::new(None),
             },
         );
@@ -355,6 +371,7 @@ fn load_templates(
 struct LoadedTemplate {
     asset: TemplateAsset,
     image: GrayImage,
+    image_rgb: RgbaImage,
     /// Last match position in client coordinates; used to try a small
     /// neighborhood before paying for a full-region scan.
     last_match: Cell<Option<(u32, u32)>>,
@@ -517,10 +534,17 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
     let mut timeout_at = Instant::now() + Duration::from_secs(step.timeout_secs as u64);
     let mut state = WaitState::default();
     let mut best_seen = 0.0_f32;
+    // Position of the previous poll's match awaiting double confirmation.
+    let mut pending_confirm: Option<(u32, u32)> = None;
 
     loop {
         if !ctx.poll_gate(&mut state, &mut timeout_at)? {
             continue;
+        }
+        if state.resumed {
+            // Frames across a pause are not consecutive observations.
+            state.resumed = false;
+            pending_confirm = None;
         }
         if Instant::now() >= timeout_at {
             break;
@@ -528,10 +552,12 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
         ensure_expected_size(&frame, ctx)?;
-        let frame_gray = image::imageops::grayscale(&frame);
+        let frame_gray = (ctx.profile.match_algorithm != MatchAlgorithm::Precise)
+            .then(|| image::imageops::grayscale(&frame));
 
         let report = find_loaded_template(
-            &frame_gray,
+            &frame,
+            frame_gray.as_ref(),
             frame.width(),
             frame.height(),
             template,
@@ -540,6 +566,14 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
         );
         best_seen = best_seen.max(report.best_score);
         if let Some(found) = report.matched {
+            if ctx.profile.stable_confirm {
+                let position = (found.x, found.y);
+                if !pending_confirm.is_some_and(|pending| same_target(pending, position)) {
+                    pending_confirm = Some(position);
+                    interruptible_wait(Duration::from_millis(300), ctx.stop)?;
+                    continue;
+                }
+            }
             click_match(
                 ctx,
                 &found,
@@ -553,12 +587,19 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
             });
             return ctx.wait(step.delay_ms);
         }
+        pending_confirm = None;
         interruptible_wait(Duration::from_millis(300), ctx.stop)?;
     }
     Err(format!(
         "步骤“{}”在 {} 秒内未找到目标（最佳相似度 {:.2}，阈值 {:.2}）",
         step.name, step.timeout_secs, best_seen, step.threshold
     ))
+}
+
+/// Whether two match positions are close enough to count as the same target
+/// for double confirmation.
+fn same_target(a: (u32, u32), b: (u32, u32)) -> bool {
+    a.0.abs_diff(b.0) <= 4 && a.1.abs_diff(b.1) <= 4
 }
 
 /// Clicks a matched template box at the configured anchor plus pixel offset,
@@ -633,10 +674,17 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
     let mut timeout_at = Instant::now() + Duration::from_secs(step.timeout_secs as u64);
     let mut state = WaitState::default();
     let mut best_seen = (0.0_f32, String::new());
+    // (branch id, match position) awaiting double confirmation.
+    let mut pending_confirm: Option<(u64, u32, u32)> = None;
 
     loop {
         if !ctx.poll_gate(&mut state, &mut timeout_at)? {
             continue;
+        }
+        if state.resumed {
+            // Frames across a pause are not consecutive observations.
+            state.resumed = false;
+            pending_confirm = None;
         }
         if Instant::now() >= timeout_at {
             return Err(format!(
@@ -647,7 +695,8 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
         ensure_expected_size(&frame, ctx)?;
-        let frame_gray = image::imageops::grayscale(&frame);
+        let frame_gray = (ctx.profile.match_algorithm != MatchAlgorithm::Precise)
+            .then(|| image::imageops::grayscale(&frame));
 
         let mut matched = None;
         for branch in &step.branches {
@@ -660,7 +709,8 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
                 .get(path)
                 .ok_or_else(|| format!("分支“{}”的触发模板未加载", branch.name))?;
             let report = find_loaded_template(
-                &frame_gray,
+                &frame,
+                frame_gray.as_ref(),
                 frame.width(),
                 frame.height(),
                 template,
@@ -677,9 +727,22 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
         }
 
         let Some((branch, found)) = matched else {
+            pending_confirm = None;
             interruptible_wait(Duration::from_millis(300), ctx.stop)?;
             continue;
         };
+
+        if branch.click_trigger && ctx.profile.stable_confirm {
+            let position = (branch.id, found.x, found.y);
+            let confirmed = pending_confirm.is_some_and(|(id, px, py)| {
+                id == branch.id && same_target((px, py), (found.x, found.y))
+            });
+            if !confirmed {
+                pending_confirm = Some(position);
+                interruptible_wait(Duration::from_millis(300), ctx.stop)?;
+                continue;
+            }
+        }
 
         let _ = ctx.events.send(RunnerEvent::BranchMatched {
             step: step.name.clone(),
@@ -702,6 +765,7 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
             BranchOutcome::ContinueFlow => return Ok(StepControl::Continue),
             BranchOutcome::RepeatWait => {
                 timeout_at = Instant::now() + Duration::from_secs(step.timeout_secs as u64);
+                pending_confirm = None;
                 let _ = ctx.events.send(RunnerEvent::StepChanged(step.name.clone()));
             }
             BranchOutcome::CompleteRound => return Ok(StepControl::CompleteRound),
@@ -740,7 +804,8 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
         ensure_expected_size(&frame, ctx)?;
-        let frame_gray = image::imageops::grayscale(&frame);
+        let frame_gray = (ctx.profile.match_algorithm != MatchAlgorithm::Precise)
+            .then(|| image::imageops::grayscale(&frame));
 
         let mut satisfied = 0_usize;
         let mut matched: Option<(&VisualConditionTerm, vision::TemplateMatch)> = None;
@@ -754,7 +819,8 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
                 .get(path)
                 .ok_or_else(|| format!("视觉条件“{}”的图片模板未加载", term.name))?;
             let report = find_loaded_template(
-                &frame_gray,
+                &frame,
+                frame_gray.as_ref(),
                 frame.width(),
                 frame.height(),
                 template,
@@ -884,13 +950,18 @@ fn ensure_expected_size(frame: &image::RgbaImage, ctx: &StepContext<'_>) -> Resu
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the matcher needs both frame representations plus scan context"
+)]
 fn find_loaded_template(
-    frame: &GrayImage,
+    frame: &RgbaImage,
+    frame_gray: Option<&GrayImage>,
     frame_width: u32,
     frame_height: u32,
     template: &LoadedTemplate,
     threshold: f32,
-    algorithm: vision::MatchAlgorithm,
+    algorithm: MatchAlgorithm,
 ) -> vision::MatchReport {
     let base_region = template
         .asset
@@ -907,6 +978,21 @@ fn find_loaded_template(
         })
         .unwrap_or_else(|| SearchRegion::full(frame));
 
+    let run_match = |region: SearchRegion| -> vision::MatchReport {
+        match algorithm {
+            MatchAlgorithm::Precise => {
+                vision::find_template_report_rgb(frame, &template.image_rgb, region, threshold)
+            }
+            gray_algorithm => vision::find_template_report(
+                frame_gray.expect("灰度匹配路径必须提供灰度图"),
+                &template.image,
+                region,
+                threshold,
+                gray_algorithm,
+            ),
+        }
+    };
+
     if let Some((last_x, last_y)) = template.last_match.get()
         && let Some(tracked) = tracking_region(
             base_region,
@@ -916,15 +1002,13 @@ fn find_loaded_template(
             template.image.height(),
         )
     {
-        let tracked_report =
-            vision::find_template_report(frame, &template.image, tracked, threshold, algorithm);
+        let tracked_report = run_match(tracked);
         if let Some(found) = tracked_report.matched {
             template.last_match.set(Some((found.x, found.y)));
             return tracked_report;
         }
     }
-    let report =
-        vision::find_template_report(frame, &template.image, base_region, threshold, algorithm);
+    let report = run_match(base_region);
     template
         .last_match
         .set(report.matched.map(|found| (found.x, found.y)));
@@ -1181,6 +1265,15 @@ mod tests {
 
         let error = validate_executable_profile(&profile).unwrap_err();
         assert!(error.contains("至少需要一条视觉条件"));
+    }
+
+    #[test]
+    fn same_target_allows_small_position_jitter() {
+        assert!(same_target((100, 200), (104, 200)));
+        assert!(same_target((100, 200), (100, 196)));
+        assert!(same_target((100, 200), (104, 204)));
+        assert!(!same_target((100, 200), (105, 200)));
+        assert!(!same_target((100, 200), (100, 205)));
     }
 
     #[test]

@@ -1,23 +1,28 @@
-use image::GrayImage;
+use image::{GrayImage, RgbaImage};
 use serde::{Deserialize, Serialize};
 
-/// Which template-matching engine to use. The default is `Fast`; `Classic`
+/// Which template-matching engine to use. The default is `Precise`; `Classic`
 /// keeps the previous implementation unchanged for compatibility checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MatchAlgorithm {
-    /// Integral-image lower-bound prefilter plus banded multithreading.
+    /// RGB three-channel matching: integral-image lower-bound prefilter plus
+    /// banded multithreading; strongest against misclicks.
     #[default]
+    Precise,
+    /// Grayscale: integral-image lower-bound prefilter plus banded
+    /// multithreading.
     Fast,
-    /// The original strided pre-scan, single-threaded.
+    /// The original grayscale strided pre-scan, single-threaded.
     Classic,
 }
 
 impl MatchAlgorithm {
-    pub const ALL: [Self; 2] = [Self::Fast, Self::Classic];
+    pub const ALL: [Self; 3] = [Self::Precise, Self::Fast, Self::Classic];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Fast => "极速（推荐）",
+            Self::Precise => "精准（彩色，推荐）",
+            Self::Fast => "极速（灰度，最快）",
             Self::Classic => "经典（旧算法）",
         }
     }
@@ -32,7 +37,7 @@ pub struct SearchRegion {
 }
 
 impl SearchRegion {
-    pub fn full(image: &GrayImage) -> Self {
+    pub fn full(image: &impl image::GenericImageView) -> Self {
         Self {
             x: 0,
             y: 0,
@@ -68,7 +73,8 @@ pub struct MatchReport {
 }
 
 /// Finds the closest grayscale template using mean absolute pixel similarity,
-/// dispatching on the configured algorithm.
+/// dispatching on the configured algorithm. `Precise` needs RGB input; the
+/// grayscale entry falls back to `Fast` for it.
 pub fn find_template_report(
     frame: &GrayImage,
     template: &GrayImage,
@@ -78,8 +84,26 @@ pub fn find_template_report(
 ) -> MatchReport {
     match algorithm {
         MatchAlgorithm::Classic => find_classic(frame, template, region, threshold),
-        MatchAlgorithm::Fast => find_fast(frame, template, region, threshold),
+        MatchAlgorithm::Fast | MatchAlgorithm::Precise => {
+            find_fast(frame, template, region, threshold)
+        }
     }
+}
+
+/// Finds the closest RGB template using three-channel mean absolute
+/// similarity (the `Precise` engine: integral-image lower-bound prefilter
+/// plus banded multithreading, deterministic merge).
+pub fn find_template_report_rgb(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    region: SearchRegion,
+    threshold: f32,
+) -> MatchReport {
+    let bands = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(MAX_FAST_BANDS);
+    find_precise_impl(frame, template, region, threshold, bands)
 }
 
 /// The original implementation: pixel access goes through the raw image
@@ -311,25 +335,6 @@ fn find_fast_impl(
     threshold: f32,
     max_bands: usize,
 ) -> MatchReport {
-    let empty = MatchReport {
-        matched: None,
-        best_score: 0.0,
-    };
-    if template.width() == 0
-        || template.height() == 0
-        || region.width < template.width()
-        || region.height < template.height()
-        || region.x.saturating_add(region.width) > frame.width()
-        || region.y.saturating_add(region.height) > frame.height()
-    {
-        return empty;
-    }
-
-    let threshold = threshold.clamp(0.0, 1.0);
-    let pixel_count = template.width() as u64 * template.height() as u64;
-    let max_diff = ((1.0 - threshold) * pixel_count as f32 * 255.0) as u64;
-    let max_x = region.x + region.width - template.width();
-    let max_y = region.y + region.height - template.height();
     let scan = Scan {
         frame: frame.as_raw(),
         frame_width: frame.width() as usize,
@@ -337,6 +342,102 @@ fn find_fast_impl(
         template_width: template.width() as usize,
         template_height: template.height() as usize,
     };
+    find_banded(&scan, region, threshold, max_bands)
+}
+
+fn find_precise_impl(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    region: SearchRegion,
+    threshold: f32,
+    max_bands: usize,
+) -> MatchReport {
+    let scan = RgbScan {
+        frame: frame.as_raw(),
+        frame_width: frame.width() as usize,
+        template: template.as_raw(),
+        template_width: template.width() as usize,
+        template_height: template.height() as usize,
+    };
+    find_banded(&scan, region, threshold, max_bands)
+}
+
+/// What the banded engines need from a concrete scan (grayscale or RGB).
+trait ScanOps: Sync {
+    fn frame_size(&self) -> (u32, u32);
+    fn template_size(&self) -> (u32, u32);
+    /// Maximum absolute pixel difference per pixel: 255 gray, 765 RGB.
+    fn channel_scale(&self) -> f32;
+    /// Sum of the matched channels over the whole template.
+    fn template_sum(&self) -> u64;
+    fn coarse_score(&self, origin_x: u32, origin_y: u32) -> f32;
+    fn diff_at(&self, origin_x: u32, origin_y: u32, abort_at: u64) -> Option<u64>;
+    /// Window-sum table over frame pixels starting at (x0, y0), w × h pixels;
+    /// a pixel's value is the sum of its matched channels.
+    fn build_sum_table(&self, x0: u32, y0: u32, w: usize, h: usize) -> SumTable;
+}
+
+/// Window-sum table for the lower-bound prefilter.
+enum SumTable {
+    /// Grayscale windows fit u32; wrapping arithmetic keeps them exact.
+    U32 { data: Vec<u32>, stride: usize },
+    /// RGB channel-sum windows get u64 headroom.
+    U64 { data: Vec<u64>, stride: usize },
+}
+
+impl SumTable {
+    /// Sum of the w × h window at frame position (x, y); (x0, y0) is the
+    /// table origin in frame coordinates.
+    fn window_sum(&self, x: u32, y: u32, w: u32, h: u32, x0: u32, y0: u32) -> u64 {
+        let row = (y - y0) as usize;
+        let col = (x - x0) as usize;
+        let bottom = row + h as usize;
+        let right = col + w as usize;
+        match self {
+            Self::U32 { data, stride } => u64::from(
+                data[bottom * stride + right]
+                    .wrapping_add(data[row * stride + col])
+                    .wrapping_sub(data[row * stride + right])
+                    .wrapping_sub(data[bottom * stride + col]),
+            ),
+            Self::U64 { data, stride } => {
+                data[bottom * stride + right] + data[row * stride + col]
+                    - data[row * stride + right]
+                    - data[bottom * stride + col]
+            }
+        }
+    }
+}
+
+/// Shared banded engine behind `Fast` (grayscale) and `Precise` (RGB).
+fn find_banded<S: ScanOps>(
+    scan: &S,
+    region: SearchRegion,
+    threshold: f32,
+    max_bands: usize,
+) -> MatchReport {
+    let empty = MatchReport {
+        matched: None,
+        best_score: 0.0,
+    };
+    let (template_width, template_height) = scan.template_size();
+    let (frame_width, frame_height) = scan.frame_size();
+    if template_width == 0
+        || template_height == 0
+        || region.width < template_width
+        || region.height < template_height
+        || region.x.saturating_add(region.width) > frame_width
+        || region.y.saturating_add(region.height) > frame_height
+    {
+        return empty;
+    }
+
+    let threshold = threshold.clamp(0.0, 1.0);
+    let pixel_count = u64::from(template_width) * u64::from(template_height);
+    let channel_scale = scan.channel_scale();
+    let max_diff = ((1.0 - threshold) * pixel_count as f32 * channel_scale) as u64;
+    let max_x = region.x + region.width - template_width;
+    let max_y = region.y + region.height - template_height;
 
     let position_count = u64::from(max_x - region.x + 1) * u64::from(max_y - region.y + 1);
     if position_count <= DENSE_SCAN_LIMIT {
@@ -344,24 +445,20 @@ fn find_fast_impl(
         let mut state = FastState::default();
         for y in region.y..=max_y {
             for x in region.x..=max_x {
-                state.consider(&scan, x, y, threshold, max_diff, pixel_count);
+                state.consider(scan, x, y, threshold, max_diff, pixel_count);
             }
         }
-        return state.report(
-            scan.template_width as u32,
-            scan.template_height as u32,
-            pixel_count,
-        );
+        return state.report(template_width, template_height, pixel_count, channel_scale);
     }
 
     let grid_rows = (max_y - region.y) / PRESCAN_STRIDE + 1;
     let bands = max_bands.clamp(1, (grid_rows as usize).min(MAX_FAST_BANDS));
     let fast = FastScan {
-        scan: &scan,
+        scan,
         threshold,
         max_diff,
         pixel_count,
-        template_sum: scan.template.iter().map(|&value| u64::from(value)).sum(),
+        template_sum: scan.template_sum(),
         region,
         max_x,
         max_y,
@@ -405,17 +502,155 @@ fn find_fast_impl(
         matched: best.map(|(difference, y, x)| TemplateMatch {
             x,
             y,
-            width: scan.template_width as u32,
-            height: scan.template_height as u32,
-            score: 1.0 - difference as f32 / (pixel_count as f32 * 255.0),
+            width: template_width,
+            height: template_height,
+            score: 1.0 - difference as f32 / (pixel_count as f32 * channel_scale),
         }),
         best_score,
     }
 }
 
-/// Shared read-only inputs for one fast scan, passed to every band.
-struct FastScan<'a> {
-    scan: &'a Scan<'a>,
+/// Raw-buffer view of RGBA frame and template (row-major, stride = 4·width);
+/// only the R/G/B channels participate, alpha is ignored.
+struct RgbScan<'a> {
+    frame: &'a [u8],
+    frame_width: usize,
+    template: &'a [u8],
+    template_width: usize,
+    template_height: usize,
+}
+
+impl RgbScan<'_> {
+    fn coarse_score(&self, origin_x: u32, origin_y: u32) -> f32 {
+        // Same fixed sample budget as the grayscale coarse pass.
+        let pixel_count = self.template_width * self.template_height;
+        let sample_step = ((pixel_count as f32 / 144.0).sqrt().ceil() as usize).max(2);
+        let mut difference = 0_u64;
+        let mut samples = 0_u64;
+
+        for ty in (0..self.template_height).step_by(sample_step) {
+            for tx in (0..self.template_width).step_by(sample_step) {
+                let frame_base =
+                    ((origin_y as usize + ty) * self.frame_width + origin_x as usize + tx) * 4;
+                let template_base = (ty * self.template_width + tx) * 4;
+                for channel in 0..3 {
+                    difference += self.frame[frame_base + channel]
+                        .abs_diff(self.template[template_base + channel])
+                        as u64;
+                }
+                samples += 1;
+            }
+        }
+
+        1.0 - difference as f32 / (samples.max(1) as f32 * 765.0)
+    }
+
+    /// Three-channel summed absolute difference at `origin`, bailing out as
+    /// soon as the accumulated difference reaches `abort_at`.
+    fn diff_at(&self, origin_x: u32, origin_y: u32, abort_at: u64) -> Option<u64> {
+        let mut difference = 0_u64;
+        let mut frame_row = (origin_y as usize * self.frame_width + origin_x as usize) * 4;
+        let mut template_row = 0_usize;
+        for _ in 0..self.template_height {
+            let frame_pixels = &self.frame[frame_row..frame_row + self.template_width * 4];
+            let template_pixels =
+                &self.template[template_row..template_row + self.template_width * 4];
+            for px in 0..self.template_width {
+                let i = px * 4;
+                difference += u64::from(frame_pixels[i].abs_diff(template_pixels[i]))
+                    + u64::from(frame_pixels[i + 1].abs_diff(template_pixels[i + 1]))
+                    + u64::from(frame_pixels[i + 2].abs_diff(template_pixels[i + 2]));
+            }
+            if difference >= abort_at {
+                return None;
+            }
+            frame_row += self.frame_width * 4;
+            template_row += self.template_width * 4;
+        }
+        Some(difference)
+    }
+}
+
+impl ScanOps for RgbScan<'_> {
+    fn frame_size(&self) -> (u32, u32) {
+        (
+            self.frame_width as u32,
+            (self.frame.len() / (self.frame_width * 4)) as u32,
+        )
+    }
+
+    fn template_size(&self) -> (u32, u32) {
+        (self.template_width as u32, self.template_height as u32)
+    }
+
+    fn channel_scale(&self) -> f32 {
+        765.0
+    }
+
+    fn template_sum(&self) -> u64 {
+        self.template
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]))
+            .sum()
+    }
+
+    fn coarse_score(&self, origin_x: u32, origin_y: u32) -> f32 {
+        RgbScan::coarse_score(self, origin_x, origin_y)
+    }
+
+    fn diff_at(&self, origin_x: u32, origin_y: u32, abort_at: u64) -> Option<u64> {
+        RgbScan::diff_at(self, origin_x, origin_y, abort_at)
+    }
+
+    fn build_sum_table(&self, x0: u32, y0: u32, w: usize, h: usize) -> SumTable {
+        SumTable::U64 {
+            data: build_sat_rgb(self.frame, self.frame_width, x0, y0, w, h),
+            stride: w + 1,
+        }
+    }
+}
+
+impl ScanOps for Scan<'_> {
+    fn frame_size(&self) -> (u32, u32) {
+        (
+            self.frame_width as u32,
+            (self.frame.len() / self.frame_width) as u32,
+        )
+    }
+
+    fn template_size(&self) -> (u32, u32) {
+        (self.template_width as u32, self.template_height as u32)
+    }
+
+    fn channel_scale(&self) -> f32 {
+        255.0
+    }
+
+    fn template_sum(&self) -> u64 {
+        self.template.iter().map(|&value| u64::from(value)).sum()
+    }
+
+    fn coarse_score(&self, origin_x: u32, origin_y: u32) -> f32 {
+        Scan::coarse_score(self, origin_x, origin_y)
+    }
+
+    fn diff_at(&self, origin_x: u32, origin_y: u32, abort_at: u64) -> Option<u64> {
+        Scan::diff_at(self, origin_x, origin_y, abort_at)
+    }
+
+    fn build_sum_table(&self, x0: u32, y0: u32, w: usize, h: usize) -> SumTable {
+        SumTable::U32 {
+            data: build_sat(self.frame, self.frame_width, x0, y0, w, h),
+            stride: w + 1,
+        }
+    }
+}
+
+/// Shared read-only inputs for one banded scan, passed to every band.
+struct FastScan<'a, S: ScanOps> {
+    scan: &'a S,
     threshold: f32,
     max_diff: u64,
     pixel_count: u64,
@@ -428,10 +663,9 @@ struct FastScan<'a> {
 /// Processes pre-scan grid rows `[k0, k1)` plus their ±3 refinement
 /// neighborhoods. Neighborhoods may overlap neighboring bands; duplicates
 /// merge deterministically at the end.
-fn scan_band(fast: &FastScan<'_>, k0: u32, k1: u32) -> FastState {
+fn scan_band<S: ScanOps>(fast: &FastScan<'_, S>, k0: u32, k1: u32) -> FastState {
     let scan = fast.scan;
-    let template_width = scan.template_width as u32;
-    let template_height = scan.template_height as u32;
+    let (template_width, template_height) = scan.template_size();
     let grid_y0 = fast.region.y + k0 * PRESCAN_STRIDE;
     let grid_y1 = fast.region.y + (k1 - 1) * PRESCAN_STRIDE;
     // Frame rows the band's evaluated positions can touch: the refinement
@@ -440,30 +674,19 @@ fn scan_band(fast: &FastScan<'_>, k0: u32, k1: u32) -> FastState {
         .saturating_sub(PRESCAN_STRIDE - 1)
         .max(fast.region.y);
     let pos_y1 = (grid_y1 + PRESCAN_STRIDE - 1).min(fast.max_y);
-    let sat = build_sat(
-        scan.frame,
-        scan.frame_width,
+    let sat = scan.build_sum_table(
         fast.region.x,
         pos_y0,
         fast.region.width as usize,
-        (pos_y1 - pos_y0) as usize + scan.template_height,
+        (pos_y1 - pos_y0) as usize + template_height as usize,
     );
-    let sat_stride = fast.region.width as usize + 1;
     // Exact lower bound: sum|a-b| >= |window_sum - template_sum|, so positions
     // past the budget can never qualify. Returns true when the position may
     // still be a match.
     let sum_bound_passes = |x: u32, y: u32| -> bool {
-        let row = (y - pos_y0) as usize;
-        let col = (x - fast.region.x) as usize;
-        let bottom = row + template_height as usize;
-        let right = col + template_width as usize;
-        // Wrapping keeps the rectangle identity exact even if a table entry
-        // would exceed u32: the window sum itself always fits.
-        let window_sum = sat[bottom * sat_stride + right]
-            .wrapping_add(sat[row * sat_stride + col])
-            .wrapping_sub(sat[row * sat_stride + right])
-            .wrapping_sub(sat[bottom * sat_stride + col]);
-        u64::from(window_sum).abs_diff(fast.template_sum) <= fast.max_diff
+        sat.window_sum(x, y, template_width, template_height, fast.region.x, pos_y0)
+            .abs_diff(fast.template_sum)
+            <= fast.max_diff
     };
 
     let mut state = FastState::default();
@@ -523,6 +746,36 @@ fn build_sat(frame: &[u8], frame_width: usize, x0: u32, y0: u32, w: usize, h: us
     sat
 }
 
+/// Builds a u64 summed-area table over per-pixel RGB channel sums (RGBA
+/// input, alpha ignored).
+fn build_sat_rgb(
+    frame: &[u8],
+    frame_width: usize,
+    x0: u32,
+    y0: u32,
+    w: usize,
+    h: usize,
+) -> Vec<u64> {
+    let stride = w + 1;
+    let mut sat = vec![0_u64; stride * (h + 1)];
+    for j in 0..h {
+        let row_start = ((y0 as usize + j) * frame_width + x0 as usize) * 4;
+        let frame_row = &frame[row_start..row_start + w * 4];
+        let (above, current) = sat.split_at_mut((j + 1) * stride);
+        let above_row = &above[j * stride..(j + 1) * stride];
+        let current_row = &mut current[..stride];
+        let mut row_sum = 0_u64;
+        for i in 0..w {
+            let base = i * 4;
+            row_sum += u64::from(frame_row[base])
+                + u64::from(frame_row[base + 1])
+                + u64::from(frame_row[base + 2]);
+            current_row[i + 1] = above_row[i + 1] + row_sum;
+        }
+    }
+    sat
+}
+
 /// Band-local fast-scan result. `best` is ordered lexicographically by
 /// (difference, y, x), so band results merge deterministically regardless of
 /// evaluation order.
@@ -535,9 +788,9 @@ struct FastState {
 impl FastState {
     /// Full-resolution evaluation of one candidate position: coarse rejection,
     /// then the exact difference when the position looks promising.
-    fn consider(
+    fn consider<S: ScanOps>(
         &mut self,
-        scan: &Scan<'_>,
+        scan: &S,
         x: u32,
         y: u32,
         threshold: f32,
@@ -560,7 +813,7 @@ impl FastState {
         let Some(difference) = scan.diff_at(x, y, abort_at) else {
             return;
         };
-        let score = 1.0 - difference as f32 / (pixel_count as f32 * 255.0);
+        let score = 1.0 - difference as f32 / (pixel_count as f32 * scan.channel_scale());
         self.best_score = self.best_score.max(score);
         let candidate = (difference, y, x);
         if self.best.is_none_or(|current| candidate < current) {
@@ -568,14 +821,20 @@ impl FastState {
         }
     }
 
-    fn report(self, template_width: u32, template_height: u32, pixel_count: u64) -> MatchReport {
+    fn report(
+        self,
+        template_width: u32,
+        template_height: u32,
+        pixel_count: u64,
+        channel_scale: f32,
+    ) -> MatchReport {
         MatchReport {
             matched: self.best.map(|(difference, y, x)| TemplateMatch {
                 x,
                 y,
                 width: template_width,
                 height: template_height,
-                score: 1.0 - difference as f32 / (pixel_count as f32 * 255.0),
+                score: 1.0 - difference as f32 / (pixel_count as f32 * channel_scale),
             }),
             best_score: self.best_score,
         }
@@ -584,7 +843,7 @@ impl FastState {
 
 #[cfg(test)]
 mod tests {
-    use image::{GrayImage, Luma};
+    use image::{GrayImage, Luma, Rgba, RgbaImage};
 
     use super::*;
 
@@ -897,6 +1156,327 @@ mod tests {
         (frame, template)
     }
 
+    fn noise_rgb_image(rng: &mut XorShift, width: u32, height: u32) -> RgbaImage {
+        RgbaImage::from_fn(width, height, |_, _| {
+            Rgba([rng.next_u8(), rng.next_u8(), rng.next_u8(), 255])
+        })
+    }
+
+    fn smooth_rgb_image(rng: &mut XorShift, width: u32, height: u32) -> RgbaImage {
+        let coarse = noise_rgb_image(rng, width / 10, height / 10);
+        image::imageops::resize(
+            &coarse,
+            width,
+            height,
+            image::imageops::FilterType::CatmullRom,
+        )
+    }
+
+    fn embed_rgb(frame: &mut RgbaImage, template: &RgbaImage, at_x: u32, at_y: u32) {
+        for y in 0..template.height() {
+            for x in 0..template.width() {
+                frame.put_pixel(at_x + x, at_y + y, *template.get_pixel(x, y));
+            }
+        }
+    }
+
+    /// The naive exhaustive RGB reference: every position gets the
+    /// three-channel coarse pass and promising ones the exact difference.
+    fn naive_find_template_report_rgb(
+        frame: &RgbaImage,
+        template: &RgbaImage,
+        region: SearchRegion,
+        threshold: f32,
+    ) -> MatchReport {
+        let threshold = threshold.clamp(0.0, 1.0);
+        let pixel_count = u64::from(template.width()) * u64::from(template.height());
+        let max_diff = ((1.0 - threshold) * pixel_count as f32 * 765.0) as u64;
+        let max_x = region.x + region.width - template.width();
+        let max_y = region.y + region.height - template.height();
+        let mut best: Option<TemplateMatch> = None;
+        let mut best_diff = u64::MAX;
+        let mut best_score = 0.0_f32;
+
+        for y in region.y..=max_y {
+            for x in region.x..=max_x {
+                let coarse = naive_coarse_score_rgb(frame, template, x, y);
+                best_score = best_score.max(coarse);
+                if coarse + 0.06 < threshold {
+                    continue;
+                }
+                let abort_at = max_diff.saturating_add(1).min(best_diff);
+                let Some(difference) = naive_diff_at_rgb(frame, template, x, y, abort_at) else {
+                    continue;
+                };
+                let score = 1.0 - difference as f32 / (pixel_count as f32 * 765.0);
+                best_score = best_score.max(score);
+                best_diff = difference;
+                best = Some(TemplateMatch {
+                    x,
+                    y,
+                    width: template.width(),
+                    height: template.height(),
+                    score,
+                });
+            }
+        }
+
+        MatchReport {
+            matched: best,
+            best_score,
+        }
+    }
+
+    fn naive_coarse_score_rgb(
+        frame: &RgbaImage,
+        template: &RgbaImage,
+        origin_x: u32,
+        origin_y: u32,
+    ) -> f32 {
+        let pixel_count = template.width() as usize * template.height() as usize;
+        let sample_step = ((pixel_count as f32 / 144.0).sqrt().ceil() as usize).max(2);
+        let mut difference = 0_u64;
+        let mut samples = 0_u64;
+
+        for ty in (0..template.height()).step_by(sample_step) {
+            for tx in (0..template.width()).step_by(sample_step) {
+                let frame_pixel = frame.get_pixel(origin_x + tx, origin_y + ty);
+                let template_pixel = template.get_pixel(tx, ty);
+                for channel in 0..3 {
+                    difference += frame_pixel[channel].abs_diff(template_pixel[channel]) as u64;
+                }
+                samples += 1;
+            }
+        }
+
+        1.0 - difference as f32 / (samples.max(1) as f32 * 765.0)
+    }
+
+    fn naive_diff_at_rgb(
+        frame: &RgbaImage,
+        template: &RgbaImage,
+        origin_x: u32,
+        origin_y: u32,
+        abort_at: u64,
+    ) -> Option<u64> {
+        let mut difference = 0_u64;
+        for ty in 0..template.height() {
+            for tx in 0..template.width() {
+                let frame_pixel = frame.get_pixel(origin_x + tx, origin_y + ty);
+                let template_pixel = template.get_pixel(tx, ty);
+                for channel in 0..3 {
+                    difference += frame_pixel[channel].abs_diff(template_pixel[channel]) as u64;
+                }
+            }
+            if difference >= abort_at {
+                return None;
+            }
+        }
+        Some(difference)
+    }
+
+    fn assert_rgb_equivalent(
+        frame: &RgbaImage,
+        template: &RgbaImage,
+        threshold: f32,
+        context: &str,
+    ) {
+        let region = SearchRegion::full(frame);
+        let precise = find_template_report_rgb(frame, template, region, threshold);
+        let reference = naive_find_template_report_rgb(frame, template, region, threshold);
+        if let Some(expected) = reference.matched {
+            let found = precise
+                .matched
+                .unwrap_or_else(|| panic!("{context}: reference matched but precise did not"));
+            assert!(
+                (found.score - expected.score).abs() <= 0.02,
+                "{context}: score {:.3} vs reference {:.3}",
+                found.score,
+                expected.score
+            );
+        }
+        assert!(
+            (precise.best_score - reference.best_score).abs() <= 0.02,
+            "{context}: best score {:.3} vs reference {:.3}",
+            precise.best_score,
+            reference.best_score
+        );
+    }
+
+    fn embedded_noise_rgb_case() -> (RgbaImage, RgbaImage) {
+        let mut rng = XorShift(0x5771_1A01);
+        let mut frame = noise_rgb_image(&mut rng, 512, 384);
+        let template = noise_rgb_image(&mut rng, 96, 72);
+        // Stride-aligned position: the pre-scan grid sees the exact match.
+        embed_rgb(&mut frame, &template, 128, 96);
+        (frame, template)
+    }
+
+    fn unaligned_smooth_rgb_case() -> (RgbaImage, RgbaImage) {
+        let mut rng = XorShift(0x5771_1B02);
+        let frame = smooth_rgb_image(&mut rng, 512, 384);
+        let template = image::imageops::crop_imm(&frame, 157, 83, 96, 72).to_image();
+        (frame, template)
+    }
+
+    fn pure_noise_rgb_case() -> (RgbaImage, RgbaImage) {
+        let mut rng = XorShift(0x5771_1D04);
+        let frame = noise_rgb_image(&mut rng, 512, 384);
+        let template = noise_rgb_image(&mut rng, 96, 72);
+        (frame, template)
+    }
+
+    #[test]
+    fn precise_matches_reference_on_embedded_noise_template() {
+        let (frame, template) = embedded_noise_rgb_case();
+        assert_rgb_equivalent(&frame, &template, 0.90, "precise embedded noise");
+    }
+
+    #[test]
+    fn precise_matches_reference_on_unaligned_smooth_template() {
+        let (frame, template) = unaligned_smooth_rgb_case();
+        assert_rgb_equivalent(&frame, &template, 0.90, "precise unaligned smooth");
+    }
+
+    #[test]
+    fn precise_matches_reference_on_pure_noise_without_match() {
+        let (frame, template) = pure_noise_rgb_case();
+        assert_rgb_equivalent(&frame, &template, 0.90, "precise pure noise");
+    }
+
+    #[test]
+    fn precise_multithread_matches_single_thread() {
+        for (name, (frame, template)) in [
+            ("embedded noise", embedded_noise_rgb_case()),
+            ("unaligned smooth", unaligned_smooth_rgb_case()),
+            ("pure noise", pure_noise_rgb_case()),
+        ] {
+            let region = SearchRegion::full(&frame);
+            let single = find_precise_impl(&frame, &template, region, 0.90, 1);
+            let multi = find_precise_impl(&frame, &template, region, 0.90, MAX_FAST_BANDS);
+            assert_eq!(
+                single
+                    .matched
+                    .map(|found| (found.x, found.y, found.score.to_bits())),
+                multi
+                    .matched
+                    .map(|found| (found.x, found.y, found.score.to_bits())),
+                "{name}: multithreaded result differs from single-threaded"
+            );
+            assert_eq!(
+                single.best_score.to_bits(),
+                multi.best_score.to_bits(),
+                "{name}: multithreaded best score differs"
+            );
+        }
+    }
+
+    #[test]
+    fn rgb_sum_bound_never_rejects_qualifying_positions() {
+        let mut rng = XorShift(0x5771_1F06);
+        let frame = noise_rgb_image(&mut rng, 64, 48);
+        let template = noise_rgb_image(&mut rng, 16, 12);
+        let threshold = 0.9_f32;
+        let pixel_count = u64::from(template.width()) * u64::from(template.height());
+        let max_diff = ((1.0 - threshold) * pixel_count as f32 * 765.0) as u64;
+        let max_x = frame.width() - template.width();
+        let max_y = frame.height() - template.height();
+        let sat = build_sat_rgb(
+            frame.as_raw(),
+            frame.width() as usize,
+            0,
+            0,
+            frame.width() as usize,
+            frame.height() as usize,
+        );
+        let stride = frame.width() as usize + 1;
+        let template_sum: u64 = template
+            .as_raw()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]))
+            .sum();
+        for y in 0..=max_y {
+            for x in 0..=max_x {
+                let bottom = (y + template.height()) as usize;
+                let right = (x + template.width()) as usize;
+                let window_sum = sat[bottom * stride + right]
+                    + sat[y as usize * stride + x as usize]
+                    - sat[y as usize * stride + right]
+                    - sat[bottom * stride + x as usize];
+                if window_sum.abs_diff(template_sum) > max_diff {
+                    let difference = naive_diff_at_rgb(&frame, &template, x, y, u64::MAX)
+                        .expect("full diff should complete");
+                    assert!(
+                        difference > max_diff,
+                        "sum bound rejected ({x}, {y}) but true diff {difference} <= {max_diff}"
+                    );
+                } else {
+                    // Also verify the SAT window sum against a direct sum.
+                    let mut direct = 0_u64;
+                    for ty in 0..template.height() {
+                        for tx in 0..template.width() {
+                            let pixel = frame.get_pixel(x + tx, y + ty);
+                            direct +=
+                                u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]);
+                        }
+                    }
+                    assert_eq!(window_sum, direct, "SAT window sum wrong at ({x}, {y})");
+                }
+            }
+        }
+    }
+
+    /// The selling point of the precise engine: two regions with identical
+    /// grayscale but different colors. Grayscale matching cannot tell them
+    /// apart and clicks the first one; RGB matching rejects the impostor.
+    #[test]
+    fn precise_distinguishes_same_luma_colors() {
+        let luma = |pixel: Rgba<u8>| {
+            image::imageops::grayscale(&RgbaImage::from_pixel(1, 1, pixel)).get_pixel(0, 0)[0]
+        };
+        let color_a = Rgba([200, 40, 80, 255]);
+        let target_luma = luma(color_a);
+        let color_b = (0..=255)
+            .map(|r| Rgba([r, 30, 220, 255]))
+            .find(|&candidate| luma(candidate) == target_luma)
+            .expect("a same-luma but different color should exist");
+        assert_ne!(color_a, color_b);
+
+        let mut frame = RgbaImage::from_pixel(64, 48, Rgba([30, 30, 30, 255]));
+        let template = RgbaImage::from_pixel(16, 16, color_a);
+        // Impostor at (8, 8) — scanned first, same luma; true target at (40, 24).
+        for y in 0..16 {
+            for x in 0..16 {
+                frame.put_pixel(8 + x, 8 + y, color_b);
+                frame.put_pixel(40 + x, 24 + y, color_a);
+            }
+        }
+
+        let region = SearchRegion::full(&frame);
+        let gray_frame = image::imageops::grayscale(&frame);
+        let gray_template = image::imageops::grayscale(&template);
+        let gray = find_template_report(
+            &gray_frame,
+            &gray_template,
+            SearchRegion::full(&gray_frame),
+            0.99,
+            MatchAlgorithm::Fast,
+        );
+        let impostor = gray.matched.expect("grayscale should match the impostor");
+        assert_eq!(
+            (impostor.x, impostor.y),
+            (8, 8),
+            "grayscale cannot tell the two regions apart and clicks the impostor"
+        );
+
+        let precise = find_template_report_rgb(&frame, &template, region, 0.99);
+        let found = precise.matched.expect("precise should find the true color");
+        assert_eq!((found.x, found.y), (40, 24));
+        assert!(found.score > 0.99);
+    }
+
     #[test]
     fn matches_reference_on_embedded_noise_template() {
         let (frame, template) = embedded_noise_case();
@@ -1144,6 +1724,60 @@ mod tests {
             );
             assert_eq!(classic.matched.is_some(), fast_single.matched.is_some());
             assert_eq!(fast_single.matched, fast_multi.matched);
+        }
+
+        // Precise (RGB) on noise and realistic content, single vs multi thread.
+        for (width, height) in [(1920, 1080), (2560, 1440)] {
+            let mut rng = XorShift(0x5771_E008);
+            let noise_frame = noise_rgb_image(&mut rng, width, height);
+            let noise_template = noise_rgb_image(&mut rng, 120, 80);
+            let region = SearchRegion::full(&noise_frame);
+
+            let _ = find_precise_impl(&noise_frame, &noise_template, region, 0.90, MAX_FAST_BANDS);
+
+            let started = std::time::Instant::now();
+            let precise_single = find_precise_impl(&noise_frame, &noise_template, region, 0.90, 1);
+            let precise_single_elapsed = started.elapsed();
+
+            let started = std::time::Instant::now();
+            let precise_multi =
+                find_precise_impl(&noise_frame, &noise_template, region, 0.90, MAX_FAST_BANDS);
+            let precise_multi_elapsed = started.elapsed();
+
+            eprintln!(
+                "{width}×{height} noise scan: precise 1-thread {precise_single_elapsed:?}, \
+                 precise {MAX_FAST_BANDS}-thread {precise_multi_elapsed:?}"
+            );
+            assert_eq!(precise_single.matched, precise_multi.matched);
+
+            // Realistic: bright RGB template on a darker smooth frame.
+            let mut frame_rng = XorShift(0x5771_E009);
+            let mut real_frame = smooth_rgb_image(&mut frame_rng, width, height);
+            for pixel in real_frame.pixels_mut() {
+                for channel in 0..3 {
+                    pixel[channel] = ((u16::from(pixel[channel]) * 2) / 5) as u8;
+                }
+            }
+            let mut template_rng = XorShift(0x5771_E00A);
+            let template_source = smooth_rgb_image(&mut template_rng, 240, 160);
+            let real_template =
+                image::imageops::crop_imm(&template_source, 60, 40, 120, 80).to_image();
+            let region = SearchRegion::full(&real_frame);
+
+            let started = std::time::Instant::now();
+            let precise_single = find_precise_impl(&real_frame, &real_template, region, 0.90, 1);
+            let precise_single_elapsed = started.elapsed();
+
+            let started = std::time::Instant::now();
+            let precise_multi =
+                find_precise_impl(&real_frame, &real_template, region, 0.90, MAX_FAST_BANDS);
+            let precise_multi_elapsed = started.elapsed();
+
+            eprintln!(
+                "{width}×{height} realistic scan: precise 1-thread {precise_single_elapsed:?}, \
+                 precise {MAX_FAST_BANDS}-thread {precise_multi_elapsed:?}"
+            );
+            assert_eq!(precise_single.matched, precise_multi.matched);
         }
     }
 }

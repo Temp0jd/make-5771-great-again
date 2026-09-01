@@ -1,6 +1,6 @@
 [package]
 name = "make-5771-great-again"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2024"
 description = "A lightweight visual workflow editor for Windows"
 license = "MIT"

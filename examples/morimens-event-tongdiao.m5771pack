@@ -69,6 +69,42 @@
       },
       {
         "id": 4,
+        "name": "上场（确认助战）",
+        "kind": "WaitAndClick",
+        "indent": 0,
+        "enabled": true,
+        "template": "assets/template-10.png",
+        "threshold": 0.8,
+        "timeout_secs": 20,
+        "delay_ms": 1500,
+        "branches": [],
+        "visual_condition": {
+          "mode": "All",
+          "stable_checks": 2,
+          "outcome": "ContinueFlow",
+          "terms": []
+        }
+      },
+      {
+        "id": 5,
+        "name": "调查（开始战斗）",
+        "kind": "WaitAndClick",
+        "indent": 0,
+        "enabled": true,
+        "template": "assets/template-4.png",
+        "threshold": 0.8,
+        "timeout_secs": 30,
+        "delay_ms": 1500,
+        "branches": [],
+        "visual_condition": {
+          "mode": "All",
+          "stable_checks": 2,
+          "outcome": "ContinueFlow",
+          "terms": []
+        }
+      },
+      {
+        "id": 6,
         "name": "战斗中监视（非线性）",
         "kind": "WaitAny",
         "indent": 0,
@@ -142,29 +178,9 @@
           },
           {
             "id": 5,
-            "name": "上场（确认助战）",
-            "trigger_template": "assets/template-10.png",
-            "threshold": 0.8,
-            "click_trigger": true,
-            "trigger_delay_ms": 1500,
-            "outcome": "RepeatWait",
-            "actions": []
-          },
-          {
-            "id": 6,
-            "name": "调查（开始战斗）",
-            "trigger_template": "assets/template-4.png",
-            "threshold": 0.8,
-            "click_trigger": true,
-            "trigger_delay_ms": 1500,
-            "outcome": "RepeatWait",
-            "actions": []
-          },
-          {
-            "id": 7,
             "name": "自动（未开启才点）",
             "trigger_template": "assets/template-7.png",
-            "threshold": 0.8,
+            "threshold": 0.9,
             "click_trigger": true,
             "trigger_delay_ms": 1000,
             "outcome": "RepeatWait",
@@ -179,7 +195,7 @@
         }
       },
       {
-        "id": 5,
+        "id": 7,
         "name": "本局结束",
         "kind": "RoundEnd",
         "indent": 0,
@@ -311,7 +327,7 @@
     ],
     "sharing": {
       "author": "",
-      "description": "活动关卡全自动循环，部分线性 + 事件驱动：每轮开头按线性顺序执行 挑战→助战→助战对象；随后进入非线性监视——“活动Token”弹出随时选择一个并确认（不消耗体力）；“上场/调查”自动接力进战斗；“自动”使用未开启状态的模板，已开启不匹配不会误点；通关弹“完成调查”→ 点击计一局并开始下一轮线性段；角色死亡 → 点“重新战斗”自动重开（不计局数）。请从活动主界面（能看到“挑战”）启动流程。基准分辨率 2560×1440，其他分辨率自动缩放模板。",
+      "description": "活动关卡全自动循环，部分线性 + 事件驱动：每轮开头按线性顺序执行 挑战→助战→助战对象→上场→调查；随后进入非线性监视——“活动Token”弹出随时选择一个并确认（不消耗体力）；“自动”使用未开启状态的模板且阈值 0.90，已开启不匹配不会误点；通关弹“完成调查”→ 点击计一局并开始下一轮线性段；角色死亡 → 点“重新战斗”自动重开（不计局数）。请从活动主界面（能看到“挑战”）启动流程。建议识别算法用“精准（彩色）”并开启“点击前二次确认”，防战斗误触。基准分辨率 2560×1440，其他分辨率自动缩放模板。",
       "game_version": "",
       "game_language": "简体中文",
       "tags": "活动,同调"

@@ -2659,6 +2659,17 @@ impl Make5771App {
                     ui.toggle_value(&mut self.profile.click_jitter, "开启");
                 });
             });
+            ui.horizontal(|ui| {
+                ui.label("点击前二次确认");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.toggle_value(&mut self.profile.stable_confirm, "开启");
+                });
+            });
+            ui.label(
+                RichText::new("同一目标连续两帧识别到才点击，防误触；会增加约 0.3 秒响应延迟")
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
             if self.profile.click_method == ClickMethod::Background {
                 ui.label(
                     RichText::new(
@@ -2690,14 +2701,19 @@ impl Make5771App {
             });
             ui.label(
                 RichText::new(
-                    "极速（推荐）：积分图下界过滤 + 多线程，1080p 全图约 1-4 ms，低配置机器也流畅",
+                    "精准（彩色，推荐）：RGB 三通道匹配，抗误触最强，1080p 全图约 3-10 ms",
                 )
                 .size(11.0)
                 .color(theme::tertiary_label()),
             );
             ui.label(
+                RichText::new("极速（灰度，最快）：灰度下界过滤 + 多线程，1080p 全图约 1-4 ms")
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
+            ui.label(
                 RichText::new(
-                    "经典（旧算法）：步进粗扫单线程，1080p 全图约 13 ms，结果与极速一致，仅用于排查兼容问题",
+                    "经典（旧算法）：步进粗扫单线程，1080p 全图约 13 ms，仅用于排查兼容问题",
                 )
                 .size(11.0)
                 .color(theme::tertiary_label()),
@@ -3929,10 +3945,9 @@ fn run_template_test_work(
     threshold: f32,
     algorithm: vision::MatchAlgorithm,
 ) -> TemplateTestOutcome {
-    let frame_gray = image::imageops::grayscale(&frame);
-    let full_region = SearchRegion::full(&frame_gray);
-    let mut template = match image::open(&template_asset.path) {
-        Ok(image) => image.into_luma8(),
+    let full_region = SearchRegion::full(&frame);
+    let mut template_rgb = match image::open(&template_asset.path) {
+        Ok(image) => image.into_rgba8(),
         Err(error) => {
             return TemplateTestOutcome {
                 template_name: template_asset.name,
@@ -3961,8 +3976,8 @@ fn run_template_test_work(
             ((u64::from(value) * u64::from(to) + u64::from(from) / 2) / u64::from(from.max(1)))
                 .max(1) as u32
         };
-        template = image::imageops::resize(
-            &template,
+        template_rgb = image::imageops::resize(
+            &template_rgb,
             scale(template_asset.width, reference_width, frame.width()),
             scale(template_asset.height, reference_height, frame.height()),
             image::imageops::FilterType::Triangle,
@@ -3984,8 +3999,22 @@ fn run_template_test_work(
             height: region.height,
         })
         .unwrap_or(full_region);
-    let report =
-        vision::find_template_report(&frame_gray, &template, search_region, threshold, algorithm);
+    let report = match algorithm {
+        vision::MatchAlgorithm::Precise => {
+            vision::find_template_report_rgb(&frame, &template_rgb, search_region, threshold)
+        }
+        gray_algorithm => {
+            let frame_gray = image::imageops::grayscale(&frame);
+            let template = image::imageops::grayscale(&template_rgb);
+            vision::find_template_report(
+                &frame_gray,
+                &template,
+                search_region,
+                threshold,
+                gray_algorithm,
+            )
+        }
+    };
     TemplateTestOutcome {
         template_name: template_asset.name,
         frame,
