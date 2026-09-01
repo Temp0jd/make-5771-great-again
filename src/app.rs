@@ -4,9 +4,9 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, 
 use crate::mascot::Mascots;
 use crate::model::{
     AppTab, BranchAction, BranchActionKind, BranchOutcome, ClickAnchor, ClickMethod,
-    ConditionExpectation, ConditionMatchMode, ConditionOutcome, KeyInputMode, LogEntry, LogLevel,
-    LoopMode, MacroProfile, RunnerStatus, SearchRegionSpec, StepKind, TemplateAsset,
-    VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_key_combo,
+    ConditionExpectation, ConditionMatchMode, ConditionOutcome, KeyCombo, KeyInputMode, LogEntry,
+    LogLevel, LoopMode, MacroProfile, RunnerStatus, SearchRegionSpec, StepKind, TemplateAsset,
+    VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_hotkeys, parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
 use crate::runner::{RunnerEvent, RunnerHandle};
@@ -88,6 +88,9 @@ pub struct Make5771App {
     template_draft: Option<TemplateDraft>,
     hotkey_receiver: Option<std::sync::mpsc::Receiver<platform::GlobalHotkey>>,
     _hotkey_guard: Option<platform::HotkeyGuard>,
+    /// The combos currently registered with the OS; used to skip no-op
+    /// reinstalls and to restore working hotkeys when a new combo fails.
+    active_hotkeys: Option<(KeyCombo, KeyCombo)>,
     tray_receiver: Option<std::sync::mpsc::Receiver<platform::TrayEvent>>,
     tray_guard: Option<platform::TrayGuard>,
     run_started_at: Option<std::time::Instant>,
@@ -136,11 +139,34 @@ impl Make5771App {
             profile.expected_client_width = target.client_width;
             profile.expected_client_height = target.client_height;
         }
-        let (hotkey_receiver, hotkey_guard, hotkey_error) = match platform::install_global_hotkeys()
-        {
-            Ok((receiver, guard)) => (Some(receiver), Some(guard), None),
-            Err(error) => (None, None, Some(error.to_string())),
-        };
+        let (hotkey_receiver, hotkey_guard, active_hotkeys, hotkey_error) =
+            match parse_hotkeys(&profile.capture_hotkey, &profile.stop_hotkey) {
+                Ok((capture, stop)) => match platform::install_global_hotkeys(&capture, &stop) {
+                    Ok((receiver, guard)) => {
+                        (Some(receiver), Some(guard), Some((capture, stop)), None)
+                    }
+                    Err(error) => (None, None, None, Some(error.to_string())),
+                },
+                Err(error) => {
+                    let fallback_capture = parse_key_combo("f6").expect("内置默认截图热键必须合法");
+                    let fallback_stop = parse_key_combo("f8").expect("内置默认停止热键必须合法");
+                    let warning = format!("{error}，已回退为默认热键 F6 / F8");
+                    match platform::install_global_hotkeys(&fallback_capture, &fallback_stop) {
+                        Ok((receiver, guard)) => (
+                            Some(receiver),
+                            Some(guard),
+                            Some((fallback_capture, fallback_stop)),
+                            Some(warning),
+                        ),
+                        Err(install_error) => (
+                            None,
+                            None,
+                            None,
+                            Some(format!("{warning}；{install_error}")),
+                        ),
+                    }
+                }
+            };
         let (tray_receiver, tray_guard, tray_error) = match platform::install_tray_icon() {
             Ok((receiver, guard)) => (Some(receiver), Some(guard), None),
             Err(error) => (None, None, Some(error.to_string())),
@@ -158,6 +184,7 @@ impl Make5771App {
             template_draft: None,
             hotkey_receiver,
             _hotkey_guard: hotkey_guard,
+            active_hotkeys,
             tray_receiver,
             tray_guard,
             run_started_at: None,
@@ -381,14 +408,16 @@ impl Make5771App {
             match event {
                 platform::GlobalHotkey::CaptureTemplate => {
                     self.capture_purpose = CapturePurpose::NewTemplate;
-                    self.capture_game_frame(ctx, "F6");
+                    let label = hotkey_label(&self.profile.capture_hotkey);
+                    self.capture_game_frame(ctx, &label);
                 }
                 platform::GlobalHotkey::Stop => {
                     if let Some(runner) = &self.workflow_runner {
                         runner.request_stop();
                         self.runner_status = RunnerStatus::Finishing;
                         self.current_step = "正在停止".to_owned();
-                        self.push_log(LogLevel::Info, "已通过 F8 请求停止运行");
+                        let label = hotkey_label(&self.profile.stop_hotkey);
+                        self.push_log(LogLevel::Info, format!("已通过 {label} 请求停止运行"));
                     }
                 }
             }
@@ -766,10 +795,67 @@ impl Make5771App {
                     LogLevel::Success,
                     format!("已保存流程“{}”", self.profile.name),
                 );
+                self.reinstall_hotkeys();
             }
             Err(error) => {
                 self.toast = Some(format!("保存失败：{error}"));
                 self.push_log(LogLevel::Warning, format!("保存失败：{error}"));
+            }
+        }
+    }
+
+    /// Re-registers the global hotkeys from the current profile. Unchanged
+    /// combos are skipped; the old registration is released before installing
+    /// the new one, and restored when the new combo fails to register.
+    fn reinstall_hotkeys(&mut self) {
+        let (capture, stop) =
+            match parse_hotkeys(&self.profile.capture_hotkey, &self.profile.stop_hotkey) {
+                Ok(combos) => combos,
+                Err(error) => {
+                    self.push_log(LogLevel::Warning, format!("热键未更新：{error}"));
+                    return;
+                }
+            };
+        if self.active_hotkeys == Some((capture, stop)) {
+            return;
+        }
+        let previous = self.active_hotkeys;
+        // Release the old registration first: the new combo may overlap it
+        // (e.g. only the capture key changed), which would make RegisterHotKey
+        // fail while the old guard still holds the keys.
+        self._hotkey_guard = None;
+        self.hotkey_receiver = None;
+        let description = format!("截图={}，停止={}", capture.describe(), stop.describe());
+        match platform::install_global_hotkeys(&capture, &stop) {
+            Ok((receiver, guard)) => {
+                self.hotkey_receiver = Some(receiver);
+                self._hotkey_guard = Some(guard);
+                self.active_hotkeys = Some((capture, stop));
+                self.push_log(LogLevel::Success, format!("热键已更新：{description}"));
+            }
+            Err(error) => {
+                let restored = previous.and_then(|(old_capture, old_stop)| {
+                    match platform::install_global_hotkeys(&old_capture, &old_stop) {
+                        Ok((receiver, guard)) => {
+                            self.hotkey_receiver = Some(receiver);
+                            self._hotkey_guard = Some(guard);
+                            Some(())
+                        }
+                        Err(_) => None,
+                    }
+                });
+                if restored.is_none() {
+                    self.active_hotkeys = None;
+                }
+                let note = if restored.is_some() {
+                    "已恢复原热键"
+                } else {
+                    "原热键也未能恢复，热键暂不可用"
+                };
+                self.push_log(
+                    LogLevel::Warning,
+                    format!("热键更新失败（{note}）：{error}"),
+                );
             }
         }
     }
@@ -798,6 +884,7 @@ impl Make5771App {
                 let message = format!("已打开流程文件：{}", storage::profile_display_name(path));
                 self.toast = Some(message.clone());
                 self.push_log(LogLevel::Success, message);
+                self.reinstall_hotkeys();
             }
             Err(error) => {
                 let message = format!("打开流程失败：{error}");
@@ -892,6 +979,7 @@ impl Make5771App {
                 self.template_test_view = None;
                 self.toast = Some(format!("已新建流程“{profile_name}”"));
                 self.push_log(LogLevel::Success, format!("已新建流程“{profile_name}”"));
+                self.reinstall_hotkeys();
             }
             Err(error) => {
                 self.toast = Some(format!("新建流程失败：{error}"));
@@ -949,6 +1037,7 @@ impl Make5771App {
                 );
                 self.toast = Some(message.clone());
                 self.push_log(LogLevel::Success, message);
+                self.reinstall_hotkeys();
             }
             Err(error) => {
                 self.toast = Some(error.to_string());
@@ -1258,8 +1347,11 @@ impl Make5771App {
                 }
                 LoopMode::Continuous => {
                     ui.label(
-                        RichText::new("持续运行，直到按下 F8 或点击停止")
-                            .color(theme::secondary_label()),
+                        RichText::new(format!(
+                            "持续运行，直到按下 {} 或点击停止",
+                            hotkey_label(&self.profile.stop_hotkey)
+                        ))
+                        .color(theme::secondary_label()),
                     );
                 }
             }
@@ -1715,33 +1807,70 @@ impl Make5771App {
                                 .color(theme::tertiary_label()),
                         );
                         delay_editor(ui, "识别后等待", &mut step.delay_ms);
-                        ui.label(
-                            RichText::new("点击位置")
-                                .size(11.0)
-                                .color(theme::secondary_label()),
-                        );
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt(("click-anchor", step.id))
-                                .selected_text(step.click_anchor.label())
-                                .show_ui(ui, |ui| {
-                                    for anchor in ClickAnchor::ALL {
-                                        ui.selectable_value(
-                                            &mut step.click_anchor,
-                                            anchor,
-                                            anchor.label(),
-                                        );
-                                    }
-                                });
-                            ui.label("偏移 X");
-                            ui.add(egui::DragValue::new(&mut step.click_offset_x).suffix(" px"));
-                            ui.label("Y");
-                            ui.add(egui::DragValue::new(&mut step.click_offset_y).suffix(" px"));
-                        });
-                        ui.label(
-                            RichText::new("以匹配到的图片框为基准，偏移单位是像素")
-                                .size(11.0)
-                                .color(theme::tertiary_label()),
-                        );
+                        let click_template = step
+                            .template
+                            .as_ref()
+                            .and_then(|path| {
+                                template_options
+                                    .iter()
+                                    .find(|(_, _, candidate)| candidate == path)
+                            })
+                            .map(|(_, name, path)| (name.clone(), path.clone()));
+                        if let Some((template_name, template_path)) = click_template
+                            && let Some(texture) =
+                                self.thumbs
+                                    .texture(ui.ctx(), &template_path, &template_name)
+                        {
+                            let [tex_w, tex_h] = texture.size();
+                            let scale = (260.0 / tex_w as f32).min(1.0);
+                            let display_size =
+                                Vec2::new(tex_w as f32 * scale, tex_h as f32 * scale);
+                            let response = ui.add(
+                                egui::Image::new(texture)
+                                    .fit_to_exact_size(display_size)
+                                    .sense(Sense::click()),
+                            );
+                            if response.clicked()
+                                && let Some(pointer) = response.interact_pointer_pos()
+                            {
+                                let local = pointer - response.rect.min;
+                                let px = (local.x / scale).round() as i32;
+                                let py = (local.y / scale).round() as i32;
+                                step.click_anchor = ClickAnchor::Center;
+                                step.click_offset_x = px - tex_w as i32 / 2;
+                                step.click_offset_y = py - tex_h as i32 / 2;
+                            }
+                            let click_x = tex_w as i32 / 2 + step.click_offset_x;
+                            let click_y = tex_h as i32 / 2 + step.click_offset_y;
+                            let marker = response.rect.min
+                                + Vec2::new(click_x as f32 * scale, click_y as f32 * scale);
+                            let marker = response.rect.clamp(marker);
+                            let painter = ui.painter();
+                            let stroke = Stroke::new(2.0, theme::blue());
+                            painter.line_segment(
+                                [marker - Vec2::new(7.0, 0.0), marker + Vec2::new(7.0, 0.0)],
+                                stroke,
+                            );
+                            painter.line_segment(
+                                [marker - Vec2::new(0.0, 7.0), marker + Vec2::new(0.0, 7.0)],
+                                stroke,
+                            );
+                            painter.circle_filled(marker, 3.0, theme::blue());
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "点击位置：({click_x}, {click_y}) · 点击图片任意位置修改"
+                                    ))
+                                    .size(11.0)
+                                    .color(theme::tertiary_label()),
+                                );
+                                if ui.small_button("重置为中心").clicked() {
+                                    step.click_anchor = ClickAnchor::Center;
+                                    step.click_offset_x = 0;
+                                    step.click_offset_y = 0;
+                                }
+                            });
+                        }
                         let test_template_id = step.template.as_ref().and_then(|path| {
                             template_options
                                 .iter()
@@ -1768,6 +1897,39 @@ impl Make5771App {
                             .default_open(false)
                             .show(ui, |ui| {
                                 threshold_editor(ui, &mut step.threshold);
+                                ui.label(
+                                    RichText::new("点击位置")
+                                        .size(11.0)
+                                        .color(theme::secondary_label()),
+                                );
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt(("click-anchor", step.id))
+                                        .selected_text(step.click_anchor.label())
+                                        .show_ui(ui, |ui| {
+                                            for anchor in ClickAnchor::ALL {
+                                                ui.selectable_value(
+                                                    &mut step.click_anchor,
+                                                    anchor,
+                                                    anchor.label(),
+                                                );
+                                            }
+                                        });
+                                    ui.label("偏移 X");
+                                    ui.add(
+                                        egui::DragValue::new(&mut step.click_offset_x)
+                                            .suffix(" px"),
+                                    );
+                                    ui.label("Y");
+                                    ui.add(
+                                        egui::DragValue::new(&mut step.click_offset_y)
+                                            .suffix(" px"),
+                                    );
+                                });
+                                ui.label(
+                                    RichText::new("以匹配到的图片框为基准，偏移单位是像素")
+                                        .size(11.0)
+                                        .color(theme::tertiary_label()),
+                                );
                             });
                     }
                     StepKind::WaitAny => {
@@ -2334,8 +2496,70 @@ impl Make5771App {
             theme::card().show(&mut columns[0], |ui| {
                 ui.label(RichText::new("快捷键").size(18.0).strong());
                 ui.separator();
-                settings_value_row(ui, "F6", "截取当前游戏画面");
-                settings_value_row(ui, "F8", "立即请求停止流程");
+                ui.horizontal(|ui| {
+                    ui.label("截图热键");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.profile.capture_hotkey)
+                            .desired_width(140.0)
+                            .hint_text("f6 或 ctrl+f6"),
+                    );
+                });
+                match parse_key_combo(&self.profile.capture_hotkey) {
+                    Ok(combo) => {
+                        ui.label(
+                            RichText::new(format!("将注册：{}", combo.describe()))
+                                .size(11.0)
+                                .color(theme::green()),
+                        );
+                    }
+                    Err(error) => {
+                        ui.label(
+                            RichText::new(error)
+                                .size(11.0)
+                                .color(Color32::from_rgb(255, 59, 48)),
+                        );
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("停止热键");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.profile.stop_hotkey)
+                            .desired_width(140.0)
+                            .hint_text("f8 或 ctrl+f8"),
+                    );
+                });
+                match parse_key_combo(&self.profile.stop_hotkey) {
+                    Ok(combo) => {
+                        ui.label(
+                            RichText::new(format!("将注册：{}", combo.describe()))
+                                .size(11.0)
+                                .color(theme::green()),
+                        );
+                    }
+                    Err(error) => {
+                        ui.label(
+                            RichText::new(error)
+                                .size(11.0)
+                                .color(Color32::from_rgb(255, 59, 48)),
+                        );
+                    }
+                }
+                if let (Ok(capture), Ok(stop)) = (
+                    parse_key_combo(&self.profile.capture_hotkey),
+                    parse_key_combo(&self.profile.stop_hotkey),
+                ) && capture == stop
+                {
+                    ui.label(
+                        RichText::new("截图热键和停止热键不能相同")
+                            .size(11.0)
+                            .color(Color32::from_rgb(255, 59, 48)),
+                    );
+                }
+                ui.label(
+                    RichText::new("保存流程后生效")
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
                 ui.label(
                     RichText::new("快捷键为全局注册；如果被其他软件占用，日志页会显示错误。")
                         .size(11.0)
@@ -3495,6 +3719,14 @@ fn delay_editor(ui: &mut egui::Ui, label: &str, delay_ms: &mut u32) {
                 .suffix(" ms"),
         );
     });
+}
+
+/// Display label for a configured hotkey string, e.g. "Ctrl+F6"; falls back
+/// to the raw text when it cannot be parsed.
+fn hotkey_label(text: &str) -> String {
+    parse_key_combo(text)
+        .map(|combo| combo.describe())
+        .unwrap_or_else(|_| text.to_owned())
 }
 
 fn format_duration_secs(secs: u64) -> String {

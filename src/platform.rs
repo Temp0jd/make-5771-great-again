@@ -95,14 +95,18 @@ impl std::fmt::Display for PlatformError {
 impl std::error::Error for PlatformError {}
 
 #[cfg(windows)]
-pub fn install_global_hotkeys()
--> Result<(std::sync::mpsc::Receiver<GlobalHotkey>, HotkeyGuard), PlatformError> {
-    windows_impl::install_global_hotkeys()
+pub fn install_global_hotkeys(
+    capture: &crate::model::KeyCombo,
+    stop: &crate::model::KeyCombo,
+) -> Result<(std::sync::mpsc::Receiver<GlobalHotkey>, HotkeyGuard), PlatformError> {
+    windows_impl::install_global_hotkeys(capture, stop)
 }
 
 #[cfg(not(windows))]
-pub fn install_global_hotkeys()
--> Result<(std::sync::mpsc::Receiver<GlobalHotkey>, HotkeyGuard), PlatformError> {
+pub fn install_global_hotkeys(
+    _capture: &crate::model::KeyCombo,
+    _stop: &crate::model::KeyCombo,
+) -> Result<(std::sync::mpsc::Receiver<GlobalHotkey>, HotkeyGuard), PlatformError> {
     Err(PlatformError::Unsupported)
 }
 
@@ -295,11 +299,12 @@ mod windows_impl {
         OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOD_NOREPEAT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        MOUSEINPUT, RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
-        VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F6, VK_F8, VK_HOME, VK_LEFT, VK_MENU,
-        VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+        HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS,
+        KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
+        MOD_SHIFT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, RegisterHotKey, SendInput,
+        UnregisterHotKey, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+        VK_F1, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT,
+        VK_SPACE, VK_TAB, VK_UP,
     };
     use windows::Win32::UI::Shell::{
         ExtractIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -334,8 +339,17 @@ mod windows_impl {
         entries: Vec<(HWND, String)>,
     }
 
-    pub fn install_global_hotkeys()
-    -> Result<(std::sync::mpsc::Receiver<GlobalHotkey>, HotkeyGuard), PlatformError> {
+    pub fn install_global_hotkeys(
+        capture: &KeyCombo,
+        stop: &KeyCombo,
+    ) -> Result<(std::sync::mpsc::Receiver<GlobalHotkey>, HotkeyGuard), PlatformError> {
+        if capture == stop {
+            return Err(PlatformError::WindowsApi(
+                "截图热键和停止热键不能相同".to_owned(),
+            ));
+        }
+        let capture = *capture;
+        let stop = *stop;
         let (event_sender, event_receiver) = std::sync::mpsc::channel();
         let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
 
@@ -343,13 +357,21 @@ mod windows_impl {
             let thread_id = unsafe { GetCurrentThreadId() };
             let registration = (|| -> Result<(), String> {
                 unsafe {
-                    RegisterHotKey(None, CAPTURE_HOTKEY_ID, MOD_NOREPEAT, VK_F6.0 as u32)
-                        .map_err(|error| format!("无法注册 F6：{error}"))?;
-                    if let Err(error) =
-                        RegisterHotKey(None, STOP_HOTKEY_ID, MOD_NOREPEAT, VK_F8.0 as u32)
-                    {
+                    RegisterHotKey(
+                        None,
+                        CAPTURE_HOTKEY_ID,
+                        hotkey_modifiers(&capture),
+                        u32::from(virtual_key(capture.key)),
+                    )
+                    .map_err(|error| format!("无法注册截图热键 {}：{error}", capture.describe()))?;
+                    if let Err(error) = RegisterHotKey(
+                        None,
+                        STOP_HOTKEY_ID,
+                        hotkey_modifiers(&stop),
+                        u32::from(virtual_key(stop.key)),
+                    ) {
                         let _ = UnregisterHotKey(None, CAPTURE_HOTKEY_ID);
-                        return Err(format!("无法注册 F8：{error}"));
+                        return Err(format!("无法注册停止热键 {}：{error}", stop.describe()));
                     }
                 }
                 Ok(())
@@ -978,6 +1000,20 @@ mod windows_impl {
             ));
         }
         Ok(())
+    }
+
+    fn hotkey_modifiers(combo: &KeyCombo) -> HOT_KEY_MODIFIERS {
+        let mut modifiers = MOD_NOREPEAT;
+        if combo.ctrl {
+            modifiers |= MOD_CONTROL;
+        }
+        if combo.shift {
+            modifiers |= MOD_SHIFT;
+        }
+        if combo.alt {
+            modifiers |= MOD_ALT;
+        }
+        modifiers
     }
 
     fn virtual_key(code: KeyCode) -> u16 {

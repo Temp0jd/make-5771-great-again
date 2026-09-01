@@ -123,6 +123,25 @@ fn default_key_interval_ms() -> u32 {
     60
 }
 
+fn default_capture_hotkey() -> String {
+    "f6".to_owned()
+}
+
+fn default_stop_hotkey() -> String {
+    "f8".to_owned()
+}
+
+/// Parses both configured global hotkeys; fails when either is invalid or
+/// both resolve to the same combination.
+pub fn parse_hotkeys(capture: &str, stop: &str) -> Result<(KeyCombo, KeyCombo), String> {
+    let capture = parse_key_combo(capture).map_err(|error| format!("截图热键无效：{error}"))?;
+    let stop = parse_key_combo(stop).map_err(|error| format!("停止热键无效：{error}"))?;
+    if capture == stop {
+        return Err("截图热键和停止热键不能相同".to_owned());
+    }
+    Ok((capture, stop))
+}
+
 /// Portable key identifiers for `SendKeys` steps; mapped to platform virtual
 /// keys in the platform layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,6 +678,10 @@ pub struct MacroProfile {
     pub dark_mode: bool,
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    #[serde(default = "default_capture_hotkey")]
+    pub capture_hotkey: String,
+    #[serde(default = "default_stop_hotkey")]
+    pub stop_hotkey: String,
     #[serde(default)]
     pub sharing: SharingMetadata,
 }
@@ -706,6 +729,8 @@ impl Default for MacroProfile {
             click_jitter: default_click_jitter(),
             dark_mode: false,
             ui_scale: default_ui_scale(),
+            capture_hotkey: default_capture_hotkey(),
+            stop_hotkey: default_stop_hotkey(),
             sharing: SharingMetadata::default(),
         }
     }
@@ -1065,5 +1090,39 @@ mod tests {
         assert!(parse_key_combo("a+b").is_err());
         assert!(parse_key_combo("f13").is_err());
         assert!(parse_key_combo("ab").is_err());
+    }
+
+    #[test]
+    fn old_profiles_load_with_default_hotkeys() {
+        let mut value = serde_json::to_value(MacroProfile::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("capture_hotkey");
+        object.remove("stop_hotkey");
+        let profile: MacroProfile = serde_json::from_value(value).unwrap();
+        assert_eq!(profile.capture_hotkey, "f6");
+        assert_eq!(profile.stop_hotkey, "f8");
+    }
+
+    #[test]
+    fn parses_valid_hotkey_pair() {
+        let (capture, stop) = parse_hotkeys("f6", "ctrl+f8").unwrap();
+        assert_eq!(capture.key, KeyCode::F(6));
+        assert!(!capture.ctrl);
+        assert_eq!(stop.key, KeyCode::F(8));
+        assert!(stop.ctrl);
+    }
+
+    #[test]
+    fn rejects_identical_hotkeys() {
+        let error = parse_hotkeys("ctrl+f6", "CTRL+F6").unwrap_err();
+        assert!(error.contains("不能相同"));
+    }
+
+    #[test]
+    fn rejects_unparseable_hotkeys() {
+        let error = parse_hotkeys("printscreen", "f8").unwrap_err();
+        assert!(error.contains("截图热键无效"));
+        let error = parse_hotkeys("f6", "").unwrap_err();
+        assert!(error.contains("停止热键无效"));
     }
 }
