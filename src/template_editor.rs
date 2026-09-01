@@ -86,11 +86,13 @@ impl TemplateTestView {
                     ui.label(RichText::new(&self.template_name).strong());
                     ui.label(
                         RichText::new(format!("阈值 {:.2}", self.threshold))
-                            .color(theme::SECONDARY_LABEL),
+                            .color(theme::secondary_label()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (label, color) = match self.result {
-                            Some(found) => (format!("匹配成功 · {:.3}", found.score), theme::GREEN),
+                            Some(found) => {
+                                (format!("匹配成功 · {:.3}", found.score), theme::green())
+                            }
                             None => ("未达到阈值".to_owned(), Color32::from_rgb(255, 59, 48)),
                         };
                         ui.label(RichText::new(label).color(color).strong());
@@ -99,7 +101,7 @@ impl TemplateTestView {
                 ui.label(
                     RichText::new("橙色框为搜索区域，绿色框为最佳匹配位置")
                         .size(12.0)
-                        .color(theme::TERTIARY_LABEL),
+                        .color(theme::tertiary_label()),
                 );
                 ui.add_space(6.0);
 
@@ -127,7 +129,7 @@ impl TemplateTestView {
                 ui.painter().rect_stroke(
                     region_rect,
                     4.0,
-                    Stroke::new(2.0, theme::ORANGE),
+                    Stroke::new(2.0, theme::orange()),
                     egui::StrokeKind::Inside,
                 );
                 if let Some(found) = self.result {
@@ -145,7 +147,7 @@ impl TemplateTestView {
                     ui.painter().rect_stroke(
                         match_rect,
                         4.0,
-                        Stroke::new(3.0, theme::GREEN),
+                        Stroke::new(3.0, theme::green()),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -214,7 +216,7 @@ impl TemplateDraft {
                         self.image.width(),
                         self.image.height()
                     ))
-                    .color(theme::SECONDARY_LABEL),
+                    .color(theme::secondary_label()),
                 );
                 ui.label("在图片上拖动框选识别目标，尽量只包含稳定的按钮或文字区域。");
                 ui.add_space(6.0);
@@ -262,13 +264,13 @@ impl TemplateDraft {
                     ui.painter().rect_stroke(
                         selection_rect,
                         5.0,
-                        Stroke::new(2.0, theme::BLUE),
+                        Stroke::new(2.0, theme::blue()),
                         egui::StrokeKind::Inside,
                     );
                     ui.painter().rect_filled(
                         Rect::from_min_size(selection_rect.min, Vec2::new(118.0, 24.0)),
                         5.0,
-                        theme::BLUE,
+                        theme::blue(),
                     );
                     ui.painter().text(
                         selection_rect.min + Vec2::new(7.0, 5.0),

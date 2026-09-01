@@ -399,6 +399,8 @@ pub struct MacroProfile {
     #[serde(default = "default_click_jitter")]
     pub click_jitter: bool,
     #[serde(default)]
+    pub dark_mode: bool,
+    #[serde(default)]
     pub sharing: SharingMetadata,
 }
 
@@ -443,6 +445,7 @@ impl Default for MacroProfile {
             templates: Vec::new(),
             click_method: ClickMethod::default(),
             click_jitter: default_click_jitter(),
+            dark_mode: false,
             sharing: SharingMetadata::default(),
         }
     }

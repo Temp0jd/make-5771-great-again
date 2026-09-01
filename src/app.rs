@@ -122,10 +122,9 @@ pub struct Make5771App {
 
 impl Make5771App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::install(&cc.egui_ctx);
-
         let mut profile =
             storage::load_profile(&storage::default_profile_path()).unwrap_or_default();
+        theme::install(&cc.egui_ctx, profile.dark_mode);
         let target_window = platform::find_target_window(&profile.target_window).ok();
         if profile.templates.is_empty()
             && let Some(target) = &target_window
@@ -1082,14 +1081,14 @@ impl Make5771App {
                 egui::Align2::LEFT_TOP,
                 "Make 5771 Great Again",
                 egui::FontId::proportional(22.0),
-                theme::LABEL,
+                theme::label(),
             );
             ui.painter().text(
                 drag_rect.left_bottom() + Vec2::new(42.0, -1.0),
                 egui::Align2::LEFT_BOTTOM,
                 "Mythag University · Keeper's Terminal",
                 egui::FontId::proportional(11.0),
-                theme::TERTIARY_LABEL,
+                theme::tertiary_label(),
             );
             if drag.hovered() {
                 ui.ctx().set_cursor_icon(if drag.dragged() {
@@ -1139,11 +1138,13 @@ impl Make5771App {
                 }
                 ui.add_space(8.0);
                 let (dot, label) = match self.target_window.as_ref() {
-                    Some(target) if platform::is_foreground(target) => (theme::GREEN, "游戏在前台"),
-                    Some(_) => (theme::ORANGE, "等待游戏前台"),
-                    None => (theme::ORANGE, "等待连接"),
+                    Some(target) if platform::is_foreground(target) => {
+                        (theme::green(), "游戏在前台")
+                    }
+                    Some(_) => (theme::orange(), "等待游戏前台"),
+                    None => (theme::orange(), "等待连接"),
                 };
-                ui.label(RichText::new(label).color(theme::SECONDARY_LABEL));
+                ui.label(RichText::new(label).color(theme::secondary_label()));
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
                 ui.painter().circle_filled(rect.center(), 4.5, dot);
             });
@@ -1153,7 +1154,7 @@ impl Make5771App {
     fn run_page(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.heading(RichText::new("运行").size(28.0));
-        ui.label(RichText::new("选择流程并设置本次运行方式").color(theme::SECONDARY_LABEL));
+        ui.label(RichText::new("选择流程并设置本次运行方式").color(theme::secondary_label()));
         ui.add_space(10.0);
 
         theme::card().show(ui, |ui| {
@@ -1162,7 +1163,7 @@ impl Make5771App {
                     ui.label(
                         RichText::new("当前流程")
                             .size(12.0)
-                            .color(theme::SECONDARY_LABEL),
+                            .color(theme::secondary_label()),
                     );
                     ui.label(RichText::new(&self.profile.name).size(19.0).strong());
                     ui.label(
@@ -1173,7 +1174,7 @@ impl Make5771App {
                             self.profile.expected_client_height
                         ))
                         .size(12.0)
-                        .color(theme::TERTIARY_LABEL),
+                        .color(theme::tertiary_label()),
                     );
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1202,7 +1203,7 @@ impl Make5771App {
             ui.label(
                 RichText::new("循环方式")
                     .size(12.0)
-                    .color(theme::SECONDARY_LABEL),
+                    .color(theme::secondary_label()),
             );
             ui.add_space(5.0);
             ui.horizontal(|ui| {
@@ -1212,17 +1213,17 @@ impl Make5771App {
                         egui::Button::new(RichText::new(mode.label()).color(if selected {
                             Color32::WHITE
                         } else {
-                            theme::SECONDARY_LABEL
+                            theme::secondary_label()
                         }))
                         .fill(if selected {
-                            theme::BLUE
+                            theme::blue()
                         } else {
-                            theme::SURFACE_MUTED
+                            theme::surface_muted()
                         })
                         .stroke(if selected {
                             Stroke::NONE
                         } else {
-                            Stroke::new(1.0, theme::SEPARATOR)
+                            Stroke::new(1.0, theme::separator())
                         })
                         .min_size(Vec2::new(115.0, 36.0));
                     if ui.add(button).clicked() {
@@ -1256,7 +1257,7 @@ impl Make5771App {
                 LoopMode::Continuous => {
                     ui.label(
                         RichText::new("持续运行，直到按下 F8 或点击停止")
-                            .color(theme::SECONDARY_LABEL),
+                            .color(theme::secondary_label()),
                     );
                 }
             }
@@ -1274,9 +1275,9 @@ impl Make5771App {
         theme::card().show(ui, |ui| {
             ui.horizontal(|ui| {
                 let status_color = match self.runner_status {
-                    RunnerStatus::Ready => theme::GREEN,
-                    RunnerStatus::Running => theme::BLUE,
-                    RunnerStatus::Paused | RunnerStatus::Finishing => theme::ORANGE,
+                    RunnerStatus::Ready => theme::green(),
+                    RunnerStatus::Running => theme::blue(),
+                    RunnerStatus::Paused | RunnerStatus::Finishing => theme::orange(),
                 };
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
                 ui.painter().circle_filled(rect.center(), 5.0, status_color);
@@ -1287,14 +1288,14 @@ impl Make5771App {
                     );
                     ui.label(
                         RichText::new(format!("已完成 {} 局", self.completed_rounds))
-                            .color(theme::SECONDARY_LABEL),
+                            .color(theme::secondary_label()),
                     );
                 });
             });
             ui.label(
                 RichText::new(format!("当前步骤：{}", self.current_step))
                     .size(12.0)
-                    .color(theme::TERTIARY_LABEL),
+                    .color(theme::tertiary_label()),
             );
 
             let average_round = (!self.round_durations.is_empty()).then(|| {
@@ -1326,7 +1327,7 @@ impl Make5771App {
                 ui.label(
                     RichText::new(stats.join(" · "))
                         .size(12.0)
-                        .color(theme::SECONDARY_LABEL),
+                        .color(theme::secondary_label()),
                 );
             }
         });
@@ -1370,7 +1371,7 @@ impl Make5771App {
                 ui.heading(RichText::new("流程编辑").size(28.0));
                 ui.label(
                     RichText::new("编排线性步骤、画面分支和分支内动作")
-                        .color(theme::SECONDARY_LABEL),
+                        .color(theme::secondary_label()),
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1396,7 +1397,7 @@ impl Make5771App {
             ui.label(
                 RichText::new(".m5771pack 会同时包含流程与图片模板")
                     .size(11.0)
-                    .color(theme::TERTIARY_LABEL),
+                    .color(theme::tertiary_label()),
             );
         });
         ui.horizontal(|ui| {
@@ -1531,7 +1532,7 @@ impl Make5771App {
                                     ui.painter().circle_filled(
                                         marker.center(),
                                         3.0,
-                                        theme::TERTIARY_LABEL,
+                                        theme::tertiary_label(),
                                     );
                                 }
                                 let label = format!("{}   {}", index + 1, step.name);
@@ -1540,17 +1541,17 @@ impl Make5771App {
                                         .max(150.0);
                                 let button =
                                     egui::Button::new(RichText::new(label).color(if selected {
-                                        theme::BLUE
+                                        theme::blue()
                                     } else {
-                                        theme::LABEL
+                                        theme::label()
                                     }))
                                     .fill(if selected {
-                                        theme::BLUE.gamma_multiply(0.10)
+                                        theme::blue().gamma_multiply(0.10)
                                     } else {
                                         Color32::TRANSPARENT
                                     })
                                     .stroke(if selected {
-                                        Stroke::new(1.0, theme::BLUE.gamma_multiply(0.35))
+                                        Stroke::new(1.0, theme::blue().gamma_multiply(0.35))
                                     } else {
                                         Stroke::NONE
                                     })
@@ -1583,14 +1584,14 @@ impl Make5771App {
                 ui.label(
                     RichText::new("名称")
                         .size(12.0)
-                        .color(theme::SECONDARY_LABEL),
+                        .color(theme::secondary_label()),
                 );
                 ui.text_edit_singleline(&mut step.name);
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("类型")
                         .size(12.0)
-                        .color(theme::SECONDARY_LABEL),
+                        .color(theme::secondary_label()),
                 );
                 egui::ComboBox::from_id_salt("step-kind")
                     .selected_text(step.kind.label())
@@ -1631,7 +1632,7 @@ impl Make5771App {
                         ui.label(
                             RichText::new("将当前局计入已完成局数，然后开始下一轮。")
                                 .size(11.0)
-                                .color(theme::SECONDARY_LABEL),
+                                .color(theme::secondary_label()),
                         );
                     }
                     StepKind::Branch => {
@@ -1640,7 +1641,7 @@ impl Make5771App {
                                 "通用 If/Else 条件节点尚未开放；请先使用可执行的“等待任一目标”。",
                             )
                             .size(11.0)
-                            .color(theme::ORANGE),
+                            .color(theme::orange()),
                         );
                     }
                 }
@@ -1653,7 +1654,7 @@ impl Make5771App {
                     ui.label(
                         RichText::new("请先在模板库中创建图片模板")
                             .size(11.0)
-                            .color(theme::ORANGE),
+                            .color(theme::orange()),
                     );
                 }
                 ui.separator();
@@ -1671,7 +1672,9 @@ impl Make5771App {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.heading(RichText::new("模板库").size(28.0));
-                ui.label(RichText::new("管理用于视觉识别的画面片段").color(theme::SECONDARY_LABEL));
+                ui.label(
+                    RichText::new("管理用于视觉识别的画面片段").color(theme::secondary_label()),
+                );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(theme::primary_button("导入截图")).clicked() {
@@ -1698,12 +1701,12 @@ impl Make5771App {
                     ui.label(RichText::new("还没有图片模板").size(18.0).strong());
                     ui.label(
                         RichText::new("连接游戏窗口后，框选“开始”“Auto”和“结算”等目标")
-                            .color(theme::SECONDARY_LABEL),
+                            .color(theme::secondary_label()),
                     );
                     ui.label(
                         RichText::new("也可以将 PNG/JPG 拖到窗口中")
                             .size(12.0)
-                            .color(theme::TERTIARY_LABEL),
+                            .color(theme::tertiary_label()),
                     );
                 });
             } else {
@@ -1716,7 +1719,7 @@ impl Make5771App {
                     ui.label(
                         RichText::new("点击模板右侧的“测试”后自动切回游戏截图")
                             .size(11.0)
-                            .color(theme::TERTIARY_LABEL),
+                            .color(theme::tertiary_label()),
                     );
                 });
                 ui.separator();
@@ -1742,7 +1745,7 @@ impl Make5771App {
                                         }
                                         response.on_hover_text("点击预览模板图片");
                                     }
-                                    None => template_icon(ui, 30.0, theme::BLUE),
+                                    None => template_icon(ui, 30.0, theme::blue()),
                                 }
                                 ui.vertical(|ui| {
                                     ui.label(RichText::new(&template.name).strong());
@@ -1752,7 +1755,7 @@ impl Make5771App {
                                             template.width, template.height, template.path
                                         ))
                                         .size(11.0)
-                                        .color(theme::TERTIARY_LABEL),
+                                        .color(theme::tertiary_label()),
                                     );
                                 });
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1768,7 +1771,7 @@ impl Make5771App {
                                         ui.label(
                                             RichText::new(format!("{references} 处引用"))
                                                 .size(11.0)
-                                                .color(theme::ORANGE),
+                                                .color(theme::orange()),
                                         );
                                     }
                                     if let Some(region) = template.search_region {
@@ -1778,7 +1781,7 @@ impl Make5771App {
                                                 region.width, region.height
                                             ))
                                             .size(11.0)
-                                            .color(theme::TERTIARY_LABEL),
+                                            .color(theme::tertiary_label()),
                                         );
                                     }
                                 });
@@ -1800,7 +1803,7 @@ impl Make5771App {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.heading(RichText::new("运行日志").size(28.0));
-                ui.label(RichText::new("查看识别、点击与异常记录").color(theme::SECONDARY_LABEL));
+                ui.label(RichText::new("查看识别、点击与异常记录").color(theme::secondary_label()));
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("清空").clicked() {
@@ -1826,7 +1829,7 @@ impl Make5771App {
                     ui.label(RichText::new("还没有日志").size(18.0).strong());
                     ui.label(
                         RichText::new("开始运行或连接游戏窗口后，这里会显示识别与点击记录")
-                            .color(theme::SECONDARY_LABEL),
+                            .color(theme::secondary_label()),
                     );
                 });
                 return;
@@ -1839,15 +1842,15 @@ impl Make5771App {
                 .show(ui, |ui| {
                     for entry in &self.logs {
                         let color = match entry.level {
-                            LogLevel::Info => theme::BLUE,
-                            LogLevel::Success => theme::GREEN,
-                            LogLevel::Warning => theme::ORANGE,
+                            LogLevel::Info => theme::blue(),
+                            LogLevel::Success => theme::green(),
+                            LogLevel::Warning => theme::orange(),
                         };
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(&entry.time)
                                     .monospace()
-                                    .color(theme::TERTIARY_LABEL),
+                                    .color(theme::tertiary_label()),
                             );
                             let (rect, _) =
                                 ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
@@ -1865,7 +1868,8 @@ impl Make5771App {
             ui.vertical(|ui| {
                 ui.heading(RichText::new("设置").size(28.0));
                 ui.label(
-                    RichText::new("管理流程信息、目标窗口与执行保护").color(theme::SECONDARY_LABEL),
+                    RichText::new("管理流程信息、目标窗口与执行保护")
+                        .color(theme::secondary_label()),
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1877,12 +1881,34 @@ impl Make5771App {
         ui.add_space(12.0);
 
         theme::card().show(ui, |ui| {
+            ui.label(RichText::new("界面").size(18.0).strong());
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("深色模式");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .toggle_value(&mut self.profile.dark_mode, "开启")
+                        .changed()
+                    {
+                        theme::apply(ui.ctx(), self.profile.dark_mode);
+                    }
+                });
+            });
+            ui.label(
+                RichText::new("切换后立即生效，随流程配置一并保存。")
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
+        });
+
+        ui.add_space(10.0);
+        theme::card().show(ui, |ui| {
             ui.label(RichText::new("基本信息").size(18.0).strong());
             ui.separator();
             ui.label(
                 RichText::new("流程名称")
                     .size(12.0)
-                    .color(theme::SECONDARY_LABEL),
+                    .color(theme::secondary_label()),
             );
             ui.add(
                 egui::TextEdit::singleline(&mut self.profile.name)
@@ -1904,20 +1930,20 @@ impl Make5771App {
             ui.label(
                 RichText::new("这些信息会随 .m5771pack 一起发布，方便别人判断是否适用。")
                     .size(11.0)
-                    .color(theme::SECONDARY_LABEL),
+                    .color(theme::secondary_label()),
             );
             ui.separator();
             ui.columns(2, |columns| {
                 columns[0].label(
                     RichText::new("作者")
                         .size(12.0)
-                        .color(theme::SECONDARY_LABEL),
+                        .color(theme::secondary_label()),
                 );
                 columns[0].text_edit_singleline(&mut self.profile.sharing.author);
                 columns[1].label(
                     RichText::new("游戏版本")
                         .size(12.0)
-                        .color(theme::SECONDARY_LABEL),
+                        .color(theme::secondary_label()),
                 );
                 columns[1].text_edit_singleline(&mut self.profile.sharing.game_version);
             });
@@ -1925,20 +1951,20 @@ impl Make5771App {
                 columns[0].label(
                     RichText::new("游戏语言")
                         .size(12.0)
-                        .color(theme::SECONDARY_LABEL),
+                        .color(theme::secondary_label()),
                 );
                 columns[0].text_edit_singleline(&mut self.profile.sharing.game_language);
                 columns[1].label(
                     RichText::new("标签（逗号分隔）")
                         .size(12.0)
-                        .color(theme::SECONDARY_LABEL),
+                        .color(theme::secondary_label()),
                 );
                 columns[1].text_edit_singleline(&mut self.profile.sharing.tags);
             });
             ui.label(
                 RichText::new("说明")
                     .size(12.0)
-                    .color(theme::SECONDARY_LABEL),
+                    .color(theme::secondary_label()),
             );
             ui.add(
                 egui::TextEdit::multiline(&mut self.profile.sharing.description)
@@ -1955,12 +1981,12 @@ impl Make5771App {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let (color, status) = match self.target_window.as_ref() {
                         Some(target) if platform::is_foreground(target) => {
-                            (theme::GREEN, "已连接且在前台")
+                            (theme::green(), "已连接且在前台")
                         }
-                        Some(_) => (theme::ORANGE, "已连接，等待前台"),
-                        None => (theme::ORANGE, "未连接"),
+                        Some(_) => (theme::orange(), "已连接，等待前台"),
+                        None => (theme::orange(), "未连接"),
                     };
-                    ui.label(RichText::new(status).color(theme::SECONDARY_LABEL));
+                    ui.label(RichText::new(status).color(theme::secondary_label()));
                     let (dot, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
                     ui.painter().circle_filled(dot.center(), 4.5, color);
                 });
@@ -1969,7 +1995,7 @@ impl Make5771App {
             ui.label(
                 RichText::new("自动匹配的窗口标题")
                     .size(12.0)
-                    .color(theme::SECONDARY_LABEL),
+                    .color(theme::secondary_label()),
             );
             ui.add(
                 egui::TextEdit::singleline(&mut self.profile.target_window)
@@ -1989,7 +2015,7 @@ impl Make5771App {
             ui.label(
                 RichText::new("客户区基准尺寸")
                     .size(12.0)
-                    .color(theme::SECONDARY_LABEL),
+                    .color(theme::secondary_label()),
             );
             ui.horizontal(|ui| {
                 ui.label("宽");
@@ -2020,7 +2046,7 @@ impl Make5771App {
                 ui.label(
                     RichText::new("改变基准尺寸后，旧模板的局部搜索区可能需要重新截取。")
                         .size(11.0)
-                        .color(theme::ORANGE),
+                        .color(theme::orange()),
                 );
             }
         });
@@ -2055,7 +2081,7 @@ impl Make5771App {
                         "后台点击不移动鼠标、不要求游戏在前台；如果游戏没有反应，请换回前台点击。",
                     )
                     .size(11.0)
-                    .color(theme::ORANGE),
+                    .color(theme::orange()),
                 );
             }
         });
@@ -2070,7 +2096,7 @@ impl Make5771App {
                 ui.label(
                     RichText::new("快捷键为全局注册；如果被其他软件占用，日志页会显示错误。")
                         .size(11.0)
-                        .color(theme::TERTIARY_LABEL),
+                        .color(theme::tertiary_label()),
                 );
             });
             theme::card().show(&mut columns[1], |ui| {
@@ -2098,7 +2124,7 @@ impl Make5771App {
             ui.label(
                 RichText::new("所有配置和模板均保存在程序当前工作目录，不会上传。")
                     .size(11.0)
-                    .color(theme::TERTIARY_LABEL),
+                    .color(theme::tertiary_label()),
             );
             ui.horizontal(|ui| {
                 if ui.button("新建流程").clicked() {
@@ -2133,7 +2159,7 @@ impl Make5771App {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("选择软件需要识别和操作的游戏窗口")
-                            .color(theme::SECONDARY_LABEL),
+                            .color(theme::secondary_label()),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add(
@@ -2172,30 +2198,33 @@ impl Make5771App {
                                 .target_window
                                 .as_ref()
                                 .is_some_and(|target| target.handle == window.handle);
-                            let response =
-                                ui.add(
-                                    egui::Button::new(
-                                        RichText::new(format!(
-                                            "{}\n{} x {}",
-                                            window.title, window.client_width, window.client_height
-                                        ))
-                                        .color(if selected { theme::BLUE } else { theme::LABEL }),
-                                    )
-                                    .fill(if selected {
-                                        theme::BLUE.gamma_multiply(0.10)
-                                    } else {
-                                        theme::SURFACE_MUTED
-                                    })
-                                    .stroke(Stroke::new(
-                                        1.0,
-                                        if selected {
-                                            theme::BLUE.gamma_multiply(0.45)
-                                        } else {
-                                            theme::SEPARATOR
-                                        },
+                            let response = ui.add(
+                                egui::Button::new(
+                                    RichText::new(format!(
+                                        "{}\n{} x {}",
+                                        window.title, window.client_width, window.client_height
                                     ))
-                                    .min_size(Vec2::new(ui.available_width(), 54.0)),
-                                );
+                                    .color(if selected {
+                                        theme::blue()
+                                    } else {
+                                        theme::label()
+                                    }),
+                                )
+                                .fill(if selected {
+                                    theme::blue().gamma_multiply(0.10)
+                                } else {
+                                    theme::surface_muted()
+                                })
+                                .stroke(Stroke::new(
+                                    1.0,
+                                    if selected {
+                                        theme::blue().gamma_multiply(0.45)
+                                    } else {
+                                        theme::separator()
+                                    },
+                                ))
+                                .min_size(Vec2::new(ui.available_width(), 54.0)),
+                            );
                             if response.clicked() {
                                 chosen = Some(window.clone());
                             }
@@ -2238,13 +2267,13 @@ impl Make5771App {
                 .show(ctx, |ui| {
                     ui.label(
                         RichText::new("新建后会替换当前工作区。如需保留当前流程，请先导出分享包。")
-                            .color(theme::ORANGE),
+                            .color(theme::orange()),
                     );
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new("流程名称")
                             .size(12.0)
-                            .color(theme::SECONDARY_LABEL),
+                            .color(theme::secondary_label()),
                     );
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_flow_name)
@@ -2253,7 +2282,7 @@ impl Make5771App {
                     ui.label(
                         RichText::new("起始结构")
                             .size(12.0)
-                            .color(theme::SECONDARY_LABEL),
+                            .color(theme::secondary_label()),
                     );
                     for preset in NewFlowPreset::ALL {
                         ui.radio_value(&mut self.new_flow_preset, preset, preset.label());
@@ -2266,7 +2295,7 @@ impl Make5771App {
                             NewFlowPreset::Blank => "只创建一个待配置步骤，适合从零编排。",
                         })
                         .size(11.0)
-                        .color(theme::TERTIARY_LABEL),
+                        .color(theme::tertiary_label()),
                     );
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -2300,19 +2329,19 @@ impl Make5771App {
                 .show(ctx, |ui| {
                     ui.label(
                         RichText::new("导入会替换当前工作区的流程，但不会删除现有模板文件。")
-                            .color(theme::ORANGE),
+                            .color(theme::orange()),
                     );
                     if let Some(path) = &self.pending_import_path {
                         ui.label(
                             RichText::new(format!("待导入：{}", path.display()))
                                 .size(11.0)
-                                .color(theme::SECONDARY_LABEL),
+                                .color(theme::secondary_label()),
                         );
                     } else {
                         ui.label(
                             RichText::new("继续后将打开 .m5771pack 文件选择器。")
                                 .size(11.0)
-                                .color(theme::SECONDARY_LABEL),
+                                .color(theme::secondary_label()),
                         );
                     }
                     ui.label(
@@ -2320,7 +2349,7 @@ impl Make5771App {
                             "包内图片会写入独立的 imports 目录；分享包不能携带可执行脚本。",
                         )
                         .size(11.0)
-                        .color(theme::TERTIARY_LABEL),
+                        .color(theme::tertiary_label()),
                     );
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -2374,7 +2403,7 @@ impl Make5771App {
                                 ui.label(
                                     RichText::new(format!("文件：{}", template.path))
                                         .size(11.0)
-                                        .color(theme::SECONDARY_LABEL),
+                                        .color(theme::secondary_label()),
                                 );
                             });
                         });
@@ -2383,7 +2412,7 @@ impl Make5771App {
                                 RichText::new(format!(
                                     "该模板被 {references} 个步骤或分支引用，删除后这些引用会被清空。"
                                 ))
-                                .color(theme::ORANGE),
+                                .color(theme::orange()),
                             );
                         }
                         ui.label(
@@ -2391,7 +2420,7 @@ impl Make5771App {
                                 "图片文件会移入 trash/templates 回收目录，不会立即永久删除。",
                             )
                             .size(11.0)
-                            .color(theme::TERTIARY_LABEL),
+                            .color(theme::tertiary_label()),
                         );
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -2462,7 +2491,7 @@ impl Make5771App {
                     ui.label(
                         RichText::new("文件名")
                             .size(12.0)
-                            .color(theme::SECONDARY_LABEL),
+                            .color(theme::secondary_label()),
                     );
                     ui.add(
                         egui::TextEdit::singleline(&mut self.save_as_name)
@@ -2474,7 +2503,7 @@ impl Make5771App {
                             storage::PROFILE_SUFFIX
                         ))
                         .size(11.0)
-                        .color(theme::TERTIARY_LABEL),
+                        .color(theme::tertiary_label()),
                     );
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -2554,7 +2583,7 @@ impl Make5771App {
                                     template.width, template.height, template.path
                                 ))
                                 .size(11.0)
-                                .color(theme::TERTIARY_LABEL),
+                                .color(theme::tertiary_label()),
                             );
                             ui.add_space(6.0);
                             if let Some(texture) =
@@ -2568,7 +2597,7 @@ impl Make5771App {
                                         .fit_to_exact_size(size * scale.max(0.1)),
                                 );
                             } else {
-                                ui.label(RichText::new("模板图片读取失败").color(theme::ORANGE));
+                                ui.label(RichText::new("模板图片读取失败").color(theme::orange()));
                             }
                         });
                     if !open {
@@ -2584,23 +2613,110 @@ impl Make5771App {
         ui.horizontal_centered(|ui| {
             for tab in AppTab::ALL {
                 let selected = self.active_tab == tab;
-                let button = egui::Button::new(RichText::new(tab.label()).color(if selected {
-                    theme::BLUE
+                let (rect, response) =
+                    ui.allocate_exact_size(Vec2::new(96.0, 52.0), Sense::click());
+                let color = if selected {
+                    theme::blue()
                 } else {
-                    theme::SECONDARY_LABEL
-                }))
-                .fill(if selected {
-                    theme::BLUE.gamma_multiply(0.10)
-                } else {
-                    Color32::TRANSPARENT
-                })
-                .stroke(Stroke::NONE)
-                .min_size(Vec2::new(130.0, 40.0));
-                if ui.add(button).clicked() {
+                    theme::secondary_label()
+                };
+                if selected {
+                    ui.painter().rect_filled(
+                        rect.shrink2(Vec2::new(4.0, 3.0)),
+                        12.0,
+                        theme::blue().gamma_multiply(0.12),
+                    );
+                } else if response.hovered() {
+                    ui.painter().rect_filled(
+                        rect.shrink2(Vec2::new(4.0, 3.0)),
+                        12.0,
+                        theme::surface_muted(),
+                    );
+                }
+                nav_icon(
+                    ui.painter(),
+                    tab,
+                    rect.center_top() + Vec2::new(0.0, 16.0),
+                    color,
+                );
+                ui.painter().text(
+                    rect.center_bottom() - Vec2::new(0.0, 9.0),
+                    egui::Align2::CENTER_CENTER,
+                    tab.label(),
+                    egui::FontId::proportional(11.0),
+                    color,
+                );
+                if response.clicked() {
                     self.active_tab = tab;
                 }
             }
         });
+    }
+}
+
+/// Simple painter-drawn glyphs for the bottom tab bar (no icon font needed).
+fn nav_icon(painter: &egui::Painter, tab: AppTab, center: egui::Pos2, color: Color32) {
+    match tab {
+        AppTab::Run => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + Vec2::new(-4.0, -6.5),
+                    center + Vec2::new(-4.0, 6.5),
+                    center + Vec2::new(7.0, 0.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        AppTab::Flow => {
+            for (index, width) in [10.0_f32, 14.0, 7.0].iter().enumerate() {
+                let y = center.y + (index as f32 - 1.0) * 6.0;
+                painter.circle_filled(egui::Pos2::new(center.x - 7.0, y), 1.8, color);
+                painter.line_segment(
+                    [
+                        egui::Pos2::new(center.x - 3.0, y),
+                        egui::Pos2::new(center.x - 3.0 + width, y),
+                    ],
+                    Stroke::new(1.8, color),
+                );
+            }
+        }
+        AppTab::Templates => {
+            let rect = egui::Rect::from_center_size(center, Vec2::splat(15.0));
+            painter.rect_stroke(rect, 3.0, Stroke::new(1.6, color), egui::StrokeKind::Inside);
+            painter.circle_filled(center + Vec2::new(-3.0, -3.0), 1.6, color);
+            for (from, to) in [
+                (Vec2::new(-5.5, 5.5), Vec2::new(-0.5, 0.5)),
+                (Vec2::new(-0.5, 0.5), Vec2::new(2.5, 3.5)),
+                (Vec2::new(2.5, 3.5), Vec2::new(5.5, 0.5)),
+            ] {
+                painter.line_segment([center + from, center + to], Stroke::new(1.6, color));
+            }
+        }
+        AppTab::Logs => {
+            let rect = egui::Rect::from_center_size(center, Vec2::new(13.0, 16.0));
+            painter.rect_stroke(rect, 2.5, Stroke::new(1.6, color), egui::StrokeKind::Inside);
+            for index in 0..3 {
+                let y = center.y + (index as f32 - 1.0) * 4.5;
+                painter.line_segment(
+                    [
+                        egui::Pos2::new(center.x - 3.5, y),
+                        egui::Pos2::new(center.x + 3.5, y),
+                    ],
+                    Stroke::new(1.4, color),
+                );
+            }
+        }
+        AppTab::Settings => {
+            painter.circle_stroke(center, 4.5, Stroke::new(1.8, color));
+            for index in 0..8 {
+                let direction = Vec2::angled(index as f32 * std::f32::consts::TAU / 8.0);
+                painter.line_segment(
+                    [center + direction * 6.5, center + direction * 8.5],
+                    Stroke::new(1.6, color),
+                );
+            }
+        }
     }
 }
 
@@ -2636,7 +2752,7 @@ fn wait_any_editor(
     ui.label(
         RichText::new("每次只执行第一个匹配的分支，从上到下代表优先级。")
             .size(11.0)
-            .color(theme::SECONDARY_LABEL),
+            .color(theme::secondary_label()),
     );
     ui.add_space(4.0);
 
@@ -2751,7 +2867,7 @@ fn visual_condition_editor(
             "连续达到确认次数后才执行结果动作；“点击指定模板”会点击第一条命中的“出现”条件。",
         )
         .size(11.0)
-        .color(theme::SECONDARY_LABEL),
+        .color(theme::secondary_label()),
     );
     ui.add_space(4.0);
 
@@ -2838,7 +2954,7 @@ fn edit_workflow_branch(
     ui.label(
         RichText::new("分支名称")
             .size(11.0)
-            .color(theme::SECONDARY_LABEL),
+            .color(theme::secondary_label()),
     );
     ui.text_edit_singleline(&mut branch.name);
     template_picker(
@@ -2876,7 +2992,7 @@ fn edit_workflow_branch(
         ui.label(
             RichText::new("没有后续动作；命中后直接执行分支结果。")
                 .size(11.0)
-                .color(theme::TERTIARY_LABEL),
+                .color(theme::tertiary_label()),
         );
     }
     let mut action_command = None;
@@ -2967,7 +3083,7 @@ fn template_picker(
     ui.label(
         RichText::new(label)
             .size(11.0)
-            .color(theme::SECONDARY_LABEL),
+            .color(theme::secondary_label()),
     );
     ui.horizontal(|ui| {
         let selected_entry = selected.as_ref().and_then(|path| {
@@ -3006,7 +3122,7 @@ fn threshold_editor(ui: &mut egui::Ui, threshold: &mut f32) {
     ui.label(
         RichText::new("识别相似度")
             .size(11.0)
-            .color(theme::SECONDARY_LABEL),
+            .color(theme::secondary_label()),
     );
     ui.add(egui::Slider::new(threshold, 0.50..=1.00).fixed_decimals(2));
 }
@@ -3045,7 +3161,7 @@ fn format_duration_secs(secs: u64) -> String {
 
 fn settings_value_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(theme::SECONDARY_LABEL));
+        ui.label(RichText::new(label).color(theme::secondary_label()));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(RichText::new(value).strong());
         });
@@ -3055,13 +3171,14 @@ fn settings_value_row(ui: &mut egui::Ui, label: &str, value: &str) {
 fn safety_status_row(ui: &mut egui::Ui, label: &str) {
     ui.horizontal(|ui| {
         let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-        ui.painter().circle_filled(dot.center(), 4.0, theme::GREEN);
+        ui.painter()
+            .circle_filled(dot.center(), 4.0, theme::green());
         ui.label(label);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
                 RichText::new("始终开启")
                     .size(11.0)
-                    .color(theme::SECONDARY_LABEL),
+                    .color(theme::secondary_label()),
             );
         });
     });
@@ -3165,14 +3282,14 @@ fn window_control_button(ui: &mut egui::Ui, control: WindowControl) -> egui::Res
         let hover_color = if is_close {
             Color32::from_rgb(255, 59, 48)
         } else {
-            theme::SURFACE_MUTED
+            theme::surface_muted()
         };
         ui.painter().rect_filled(response.rect, 9.0, hover_color);
     }
     let color = if is_close && response.hovered() {
         Color32::WHITE
     } else {
-        theme::SECONDARY_LABEL
+        theme::secondary_label()
     };
     let center = response.rect.center();
     let stroke = Stroke::new(1.5, color);
@@ -3198,7 +3315,7 @@ fn window_control_button(ui: &mut egui::Ui, control: WindowControl) -> egui::Res
                 egui::Rect::from_min_size(center + Vec2::new(-6.0, -2.0), Vec2::new(9.0, 8.0));
             ui.painter()
                 .rect_stroke(back, 1.0, stroke, egui::StrokeKind::Inside);
-            ui.painter().rect_filled(front, 1.0, theme::BACKGROUND);
+            ui.painter().rect_filled(front, 1.0, theme::background());
             ui.painter()
                 .rect_stroke(front, 1.0, stroke, egui::StrokeKind::Inside);
         }
@@ -3374,7 +3491,7 @@ impl eframe::App for Make5771App {
         egui::Panel::top("top-bar")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BACKGROUND)
+                    .fill(theme::background())
                     .inner_margin(egui::Margin::symmetric(24, 16)),
             )
             .show(ui, |ui| self.top_bar(ui));
@@ -3382,8 +3499,8 @@ impl eframe::App for Make5771App {
         egui::Panel::bottom("navigation")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE)
-                    .stroke(Stroke::new(1.0, theme::SEPARATOR))
+                    .fill(theme::surface())
+                    .stroke(Stroke::new(1.0, theme::separator()))
                     .inner_margin(egui::Margin::symmetric(16, 10)),
             )
             .show(ui, |ui| self.bottom_navigation(ui));
@@ -3391,7 +3508,7 @@ impl eframe::App for Make5771App {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BACKGROUND)
+                    .fill(theme::background())
                     .inner_margin(egui::Margin::symmetric(24, 12)),
             )
             .show(ui, |ui| {
