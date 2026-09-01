@@ -1048,18 +1048,16 @@ impl Make5771App {
             return;
         };
         match storage::import_workflow_package(&path) {
-            Ok((profile, summary)) => {
+            Ok((mut profile, summary)) => {
+                let (merge_stats, path_remap) = self.merge_shared_templates(&profile.templates);
+                remap_profile_template_paths(&mut profile, &path_remap);
+                profile.shared_templates = true;
                 let save_path = storage::unique_profile_path(&profile.name);
                 if let Err(error) = storage::save_profile(&save_path, &profile) {
                     self.toast = Some(format!("导入后保存失败：{error}"));
                     self.push_log(LogLevel::Warning, format!("导入后保存失败：{error}"));
                     return;
                 }
-                let merged = if profile.shared_templates {
-                    self.merge_shared_templates(&profile.templates)
-                } else {
-                    0
-                };
                 self.profile = profile;
                 self.current_profile_path = save_path.clone();
                 self.selected_profile = Some(save_path);
@@ -1069,8 +1067,16 @@ impl Make5771App {
                 self.active_tab = AppTab::Flow;
                 self.template_draft = None;
                 self.template_test_view = None;
+                let merge_note = if summary.template_count == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "，模板已并入公共库（新增 {}、复用 {}、重名改名 {}）",
+                        merge_stats.added, merge_stats.reused, merge_stats.renamed
+                    )
+                };
                 let message = format!(
-                    "已导入流程“{}”{}，包含 {} 个图片模板{}",
+                    "已导入流程“{}”{}，包含 {} 个图片模板{merge_note}",
                     summary.profile_name,
                     if summary.author.trim().is_empty() {
                         String::new()
@@ -1078,11 +1084,6 @@ impl Make5771App {
                         format!("（作者：{}）", summary.author)
                     },
                     summary.template_count,
-                    if merged > 0 {
-                        format!("，其中 {merged} 个已并入公共模板库")
-                    } else {
-                        String::new()
-                    }
                 );
                 self.toast = Some(message.clone());
                 self.push_log(LogLevel::Success, message);
@@ -1095,9 +1096,21 @@ impl Make5771App {
         }
     }
 
-    /// Merges imported templates into the shared library (deduplicated by
-    /// path, ids reassigned) and persists it. Returns how many were added.
-    fn merge_shared_templates(&mut self, templates: &[TemplateAsset]) -> usize {
+    /// Merges imported templates into the shared library, resolving name
+    /// collisions: same name + identical image bytes reuses the existing
+    /// entry (callers remap step references to its path), same name with
+    /// different content is added under a "名字 (N)" suffix. Persists the
+    /// library when it changed. Returns merge stats and a path-remap map for
+    /// reused templates (imported path -> existing shared path).
+    fn merge_shared_templates(
+        &mut self,
+        templates: &[TemplateAsset],
+    ) -> (
+        TemplateMergeStats,
+        std::collections::HashMap<String, String>,
+    ) {
+        let mut stats = TemplateMergeStats::default();
+        let mut remap = std::collections::HashMap::new();
         let mut next_id = self
             .shared_templates
             .iter()
@@ -1105,28 +1118,44 @@ impl Make5771App {
             .max()
             .unwrap_or(0)
             + 1;
-        let mut added = 0_usize;
         for template in templates {
-            if self
+            if let Some(existing) = self
                 .shared_templates
                 .iter()
-                .any(|candidate| candidate.path == template.path)
+                .find(|candidate| candidate.path == template.path)
             {
+                remap.insert(template.path.clone(), existing.path.clone());
+                stats.reused += 1;
+                continue;
+            }
+            let same_name = self
+                .shared_templates
+                .iter()
+                .find(|candidate| candidate.name == template.name);
+            if let Some(existing) = same_name
+                && files_identical(&existing.path, &template.path)
+            {
+                remap.insert(template.path.clone(), existing.path.clone());
+                stats.reused += 1;
                 continue;
             }
             let mut template = template.clone();
+            if same_name.is_some() {
+                template.name = unique_template_name(&self.shared_templates, &template.name);
+                stats.renamed += 1;
+            }
             template.id = next_id;
             next_id += 1;
             self.shared_templates.push(template);
-            added += 1;
+            stats.added += 1;
         }
-        if added > 0
+        if stats.added > 0
             && let Err(error) = storage::save_shared_templates(&self.shared_templates)
         {
             self.toast = Some(format!("公共模板库保存失败：{error}"));
             self.push_log(LogLevel::Warning, format!("公共模板库保存失败：{error}"));
         }
-        added
+        (stats, remap)
     }
 
     fn export_flow_package(&mut self) {
@@ -4012,6 +4041,65 @@ fn delay_editor(ui: &mut egui::Ui, label: &str, delay_ms: &mut u32) {
 
 /// Display label for a configured hotkey string, e.g. "Ctrl+F6"; falls back
 /// to the raw text when it cannot be parsed.
+/// Outcome of merging imported templates into the shared library.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TemplateMergeStats {
+    added: usize,
+    reused: usize,
+    renamed: usize,
+}
+
+/// Byte-for-byte comparison of two template image files; any read failure
+/// counts as different (caller then adds the template under a new name).
+fn files_identical(a: &str, b: &str) -> bool {
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Picks a display name not present in the library: "名字", then "名字 (2)",
+/// "名字 (3)", …
+fn unique_template_name(existing: &[TemplateAsset], base: &str) -> String {
+    if !existing.iter().any(|template| template.name == base) {
+        return base.to_owned();
+    }
+    for suffix in 2.. {
+        let candidate = format!("{base} ({suffix})");
+        if !existing.iter().any(|template| template.name == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Rewrites every template reference in the workflow steps according to the
+/// merge remap (imported path -> existing shared path).
+fn remap_profile_template_paths(
+    profile: &mut MacroProfile,
+    remap: &std::collections::HashMap<String, String>,
+) {
+    let apply = |slot: &mut Option<String>| {
+        if let Some(path) = slot.as_ref()
+            && let Some(new_path) = remap.get(path)
+        {
+            *slot = Some(new_path.clone());
+        }
+    };
+    for step in &mut profile.steps {
+        apply(&mut step.template);
+        for branch in &mut step.branches {
+            apply(&mut branch.trigger_template);
+            for action in &mut branch.actions {
+                apply(&mut action.template);
+            }
+        }
+        for term in &mut step.visual_condition.terms {
+            apply(&mut term.template);
+        }
+    }
+}
+
 fn hotkey_label(text: &str) -> String {
     parse_key_combo(text)
         .map(|combo| combo.describe())
@@ -4497,5 +4585,79 @@ impl eframe::App for Make5771App {
         }
 
         window_resize_borders(ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset(id: u64, name: &str, path: &str) -> TemplateAsset {
+        TemplateAsset {
+            id,
+            name: name.to_owned(),
+            path: path.to_owned(),
+            width: 10,
+            height: 10,
+            reference_width: 100,
+            reference_height: 100,
+            search_region: None,
+        }
+    }
+
+    #[test]
+    fn unique_template_name_suffixes_collisions() {
+        let existing = vec![asset(1, "确认", "a.png"), asset(2, "确认 (2)", "b.png")];
+        assert_eq!(unique_template_name(&existing, "新图"), "新图");
+        assert_eq!(unique_template_name(&existing, "确认"), "确认 (3)");
+    }
+
+    #[test]
+    fn remap_rewrites_all_template_references() {
+        let mut profile = MacroProfile::default();
+        profile.steps.clear();
+        let mut step = WorkflowStep::new(1, "s", StepKind::WaitAny, 0);
+        step.template = Some("old-step.png".to_owned());
+        let mut branch = WorkflowBranch::new(1, "b");
+        branch.trigger_template = Some("old-trigger.png".to_owned());
+        let mut action = BranchAction::new(1, "a", BranchActionKind::WaitAndClick);
+        action.template = Some("old-action.png".to_owned());
+        branch.actions.push(action);
+        step.branches.push(branch);
+        step.visual_condition
+            .terms
+            .push(crate::model::VisualConditionTerm::new(
+                1,
+                "t",
+                crate::model::ConditionExpectation::Present,
+            ));
+        step.visual_condition.terms[0].template = Some("old-term.png".to_owned());
+        profile.steps.push(step);
+
+        let remap: std::collections::HashMap<String, String> = [
+            ("old-step.png", "shared/1.png"),
+            ("old-trigger.png", "shared/2.png"),
+            ("old-action.png", "shared/3.png"),
+            ("old-term.png", "shared/4.png"),
+        ]
+        .iter()
+        .map(|(from, to)| (from.to_string(), to.to_string()))
+        .collect();
+        remap_profile_template_paths(&mut profile, &remap);
+
+        let step = &profile.steps[0];
+        assert_eq!(step.template.as_deref(), Some("shared/1.png"));
+        assert_eq!(
+            step.branches[0].trigger_template.as_deref(),
+            Some("shared/2.png")
+        );
+        assert_eq!(
+            step.branches[0].actions[0].template.as_deref(),
+            Some("shared/3.png")
+        );
+        assert_eq!(
+            step.visual_condition.terms[0].template.as_deref(),
+            Some("shared/4.png")
+        );
     }
 }
