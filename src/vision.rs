@@ -16,18 +16,6 @@ pub enum MatchAlgorithm {
     Classic,
 }
 
-impl MatchAlgorithm {
-    pub const ALL: [Self; 3] = [Self::Precise, Self::Fast, Self::Classic];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Precise => "精准（彩色，推荐）",
-            Self::Fast => "极速（灰度，最快）",
-            Self::Classic => "经典（旧算法）",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchRegion {
     pub x: u32,
@@ -72,6 +60,104 @@ pub struct MatchReport {
     pub best_score: f32,
 }
 
+/// Significant-pixel analysis of a template (OpenCV mask idea): pixels whose
+/// color stays within `BACKGROUND_EPSILON` of the template's average color
+/// are treated as background and carry zero weight in scoring, so large flat
+/// areas cannot earn similarity on their own.
+#[derive(Debug, Clone)]
+pub struct TemplateWeights {
+    /// Row-major pixel indices that count in weighted scoring.
+    pub significant_indices: Vec<u32>,
+    /// Significant pixels lying on the coarse sample grid (falls back to all
+    /// significant pixels when the grid misses them).
+    pub significant_samples: Vec<u32>,
+    pub significant_count: u64,
+    /// Channel sum over significant pixels only.
+    #[allow(dead_code, reason = "precomputed for diagnostics; asserted in tests")]
+    pub significant_sum: u64,
+    /// Channel sum over every pixel (drives the window-sum lower bound).
+    pub total_sum: u64,
+    pub pixel_count: u64,
+}
+
+impl TemplateWeights {
+    /// Max per-channel deviation from the average color below which a pixel
+    /// counts as background.
+    pub const BACKGROUND_EPSILON: u32 = 12;
+
+    /// Weighted matching is pointless below this significant-pixel ratio;
+    /// callers warn and suggest a tighter crop.
+    pub const MIN_SIGNIFICANT_RATIO: f32 = 0.15;
+
+    pub fn analyze(template: &RgbaImage) -> Self {
+        let raw = template.as_raw();
+        let pixel_count = (template.width() as usize * template.height() as usize).max(1);
+        let mut channel_sums = [0_u64; 3];
+        for pixel in raw.as_chunks::<4>().0 {
+            for (channel, sum) in channel_sums.iter_mut().enumerate() {
+                *sum += u64::from(pixel[channel]);
+            }
+        }
+        let mean = channel_sums.map(|sum| sum / pixel_count as u64);
+
+        let mut significant_indices = Vec::new();
+        let mut significant_sum = 0_u64;
+        let mut total_sum = 0_u64;
+        for (index, pixel) in raw.as_chunks::<4>().0.iter().enumerate() {
+            let channel_sum = u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]);
+            total_sum += channel_sum;
+            let max_deviation = (0..3)
+                .map(|channel| u64::from(pixel[channel]).abs_diff(mean[channel]))
+                .max()
+                .unwrap_or(0);
+            if max_deviation >= u64::from(Self::BACKGROUND_EPSILON) {
+                significant_indices.push(index as u32);
+                significant_sum += channel_sum;
+            }
+        }
+
+        let sample_step = ((pixel_count as f32 / 144.0).sqrt().ceil() as usize).max(2);
+        let template_width = template.width() as usize;
+        let mut significant_samples: Vec<u32> = significant_indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                let x = *index as usize % template_width;
+                let y = *index as usize / template_width;
+                x.is_multiple_of(sample_step) && y.is_multiple_of(sample_step)
+            })
+            .collect();
+        if significant_samples.is_empty() && !significant_indices.is_empty() {
+            // The sample grid misses every significant pixel (tiny detail);
+            // score over the significant pixels directly.
+            significant_samples = significant_indices.clone();
+        }
+
+        let significant_count = significant_indices.len() as u64;
+        Self {
+            significant_indices,
+            significant_samples,
+            significant_count,
+            significant_sum,
+            total_sum,
+            pixel_count: pixel_count as u64,
+        }
+    }
+
+    pub fn significant_ratio(&self) -> f32 {
+        if self.pixel_count == 0 {
+            return 0.0;
+        }
+        self.significant_count as f32 / self.pixel_count as f32
+    }
+
+    /// True when so little of the template participates in scoring that the
+    /// match is likely unstable; the UI suggests a tighter crop.
+    pub fn is_mostly_background(&self) -> bool {
+        self.significant_ratio() < Self::MIN_SIGNIFICANT_RATIO
+    }
+}
+
 /// Finds the closest grayscale template using mean absolute pixel similarity,
 /// dispatching on the configured algorithm. `Precise` needs RGB input; the
 /// grayscale entry falls back to `Fast` for it.
@@ -91,8 +177,11 @@ pub fn find_template_report(
 }
 
 /// Finds the closest RGB template using three-channel mean absolute
-/// similarity (the `Precise` engine: integral-image lower-bound prefilter
-/// plus banded multithreading, deterministic merge).
+/// similarity (unweighted `Precise` engine: integral-image lower-bound
+/// prefilter plus banded multithreading, deterministic merge). Production
+/// code uses the weighted variant; this entry is kept for benchmarks and
+/// tests.
+#[allow(dead_code, reason = "kept as the unweighted baseline for tests")]
 pub fn find_template_report_rgb(
     frame: &RgbaImage,
     template: &RgbaImage,
@@ -368,8 +457,16 @@ trait ScanOps: Sync {
     fn template_size(&self) -> (u32, u32);
     /// Maximum absolute pixel difference per pixel: 255 gray, 765 RGB.
     fn channel_scale(&self) -> f32;
+    /// Pixels participating in the final score: the full template for
+    /// unweighted scans, only significant pixels for weighted ones.
+    fn scoring_pixels(&self) -> u64;
     /// Sum of the matched channels over the whole template.
     fn template_sum(&self) -> u64;
+    /// Difference budget for the window-sum lower bound. Weighted scans widen
+    /// it: their accepted positions can carry arbitrarily large *background*
+    /// difference, so the unweighted window bound must look further ahead
+    /// (see RgbWeightedScan).
+    fn bound_max_diff(&self, threshold: f32) -> u64;
     fn coarse_score(&self, origin_x: u32, origin_y: u32) -> f32;
     fn diff_at(&self, origin_x: u32, origin_y: u32, abort_at: u64) -> Option<u64>;
     /// Window-sum table over frame pixels starting at (x0, y0), w × h pixels;
@@ -433,9 +530,10 @@ fn find_banded<S: ScanOps>(
     }
 
     let threshold = threshold.clamp(0.0, 1.0);
-    let pixel_count = u64::from(template_width) * u64::from(template_height);
+    let pixel_count = scan.scoring_pixels();
     let channel_scale = scan.channel_scale();
     let max_diff = ((1.0 - threshold) * pixel_count as f32 * channel_scale) as u64;
+    let bound_max_diff = scan.bound_max_diff(threshold);
     let max_x = region.x + region.width - template_width;
     let max_y = region.y + region.height - template_height;
 
@@ -457,6 +555,7 @@ fn find_banded<S: ScanOps>(
         scan,
         threshold,
         max_diff,
+        bound_max_diff,
         pixel_count,
         template_sum: scan.template_sum(),
         region,
@@ -508,6 +607,155 @@ fn find_banded<S: ScanOps>(
         }),
         best_score,
     }
+}
+
+/// RGB scan with significant-pixel weighting: only the template's
+/// significant pixels (see `TemplateWeights`) participate in coarse and exact
+/// scoring, so flat template backgrounds cannot earn similarity.
+///
+/// Candidate generation keeps the *unweighted* window-sum lower bound, but
+/// with the threshold widened by `WEIGHTED_BOUND_MARGIN` (floored at 0.5):
+/// an accepted weighted match may differ arbitrarily in background pixels, so
+/// its unweighted window difference can exceed the plain budget. Widening the
+/// bound recovers those candidates; the margin only affects recall, never
+/// acceptance — acceptance is decided by the exact weighted difference. The
+/// documented trade-off: a position whose significant pixels match perfectly
+/// while its background differs hugely (beyond the widened budget) can still
+/// be missed.
+struct RgbWeightedScan<'a> {
+    scan: RgbScan<'a>,
+    weights: &'a TemplateWeights,
+}
+
+/// How far the window-sum bound's threshold is lowered for weighted scans.
+const WEIGHTED_BOUND_MARGIN: f32 = 0.15;
+
+impl RgbWeightedScan<'_> {
+    fn coarse_score(&self, origin_x: u32, origin_y: u32) -> f32 {
+        let scan = &self.scan;
+        let mut difference = 0_u64;
+        let mut samples = 0_u64;
+        for &index in &self.weights.significant_samples {
+            let tx = index as usize % scan.template_width;
+            let ty = index as usize / scan.template_width;
+            let frame_base =
+                ((origin_y as usize + ty) * scan.frame_width + origin_x as usize + tx) * 4;
+            let template_base = index as usize * 4;
+            for channel in 0..3 {
+                difference += scan.frame[frame_base + channel]
+                    .abs_diff(scan.template[template_base + channel])
+                    as u64;
+            }
+            samples += 1;
+        }
+        1.0 - difference as f32 / (samples.max(1) as f32 * 765.0)
+    }
+
+    /// Weighted three-channel difference over significant pixels only,
+    /// bailing out as soon as `abort_at` is reached.
+    fn diff_at(&self, origin_x: u32, origin_y: u32, abort_at: u64) -> Option<u64> {
+        let scan = &self.scan;
+        let mut difference = 0_u64;
+        for &index in &self.weights.significant_indices {
+            let tx = index as usize % scan.template_width;
+            let ty = index as usize / scan.template_width;
+            let frame_base =
+                ((origin_y as usize + ty) * scan.frame_width + origin_x as usize + tx) * 4;
+            let template_base = index as usize * 4;
+            for channel in 0..3 {
+                difference += u64::from(
+                    scan.frame[frame_base + channel]
+                        .abs_diff(scan.template[template_base + channel]),
+                );
+            }
+            if difference >= abort_at {
+                return None;
+            }
+        }
+        Some(difference)
+    }
+}
+
+impl ScanOps for RgbWeightedScan<'_> {
+    fn frame_size(&self) -> (u32, u32) {
+        self.scan.frame_size()
+    }
+
+    fn template_size(&self) -> (u32, u32) {
+        self.scan.template_size()
+    }
+
+    fn channel_scale(&self) -> f32 {
+        765.0
+    }
+
+    fn scoring_pixels(&self) -> u64 {
+        self.weights.significant_count
+    }
+
+    fn template_sum(&self) -> u64 {
+        self.weights.total_sum
+    }
+
+    fn bound_max_diff(&self, threshold: f32) -> u64 {
+        let widened = (threshold - WEIGHTED_BOUND_MARGIN).max(0.5);
+        ((1.0 - widened) * self.weights.pixel_count as f32 * self.channel_scale()) as u64
+    }
+
+    fn coarse_score(&self, origin_x: u32, origin_y: u32) -> f32 {
+        RgbWeightedScan::coarse_score(self, origin_x, origin_y)
+    }
+
+    fn diff_at(&self, origin_x: u32, origin_y: u32, abort_at: u64) -> Option<u64> {
+        RgbWeightedScan::diff_at(self, origin_x, origin_y, abort_at)
+    }
+
+    fn build_sum_table(&self, x0: u32, y0: u32, w: usize, h: usize) -> SumTable {
+        self.scan.build_sum_table(x0, y0, w, h)
+    }
+}
+
+/// Weighted RGB matching (the default recognition path): like
+/// `find_template_report_rgb`, but template background pixels carry no
+/// weight. A fully flat template (no significant pixels) degrades to the
+/// unweighted engine.
+pub fn find_template_report_rgb_weighted(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    region: SearchRegion,
+    threshold: f32,
+) -> MatchReport {
+    let bands = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(MAX_FAST_BANDS);
+    find_precise_weighted_impl(frame, template, weights, region, threshold, bands)
+}
+
+fn find_precise_weighted_impl(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    region: SearchRegion,
+    threshold: f32,
+    max_bands: usize,
+) -> MatchReport {
+    if weights.significant_count == 0 {
+        // Nothing to weight: the template is entirely flat.
+        return find_precise_impl(frame, template, region, threshold, max_bands);
+    }
+    let scan = RgbWeightedScan {
+        scan: RgbScan {
+            frame: frame.as_raw(),
+            frame_width: frame.width() as usize,
+            template: template.as_raw(),
+            template_width: template.width() as usize,
+            template_height: template.height() as usize,
+        },
+        weights,
+    };
+    find_banded(&scan, region, threshold, max_bands)
 }
 
 /// Raw-buffer view of RGBA frame and template (row-major, stride = 4·width);
@@ -587,6 +835,14 @@ impl ScanOps for RgbScan<'_> {
         765.0
     }
 
+    fn scoring_pixels(&self) -> u64 {
+        (self.template_width * self.template_height) as u64
+    }
+
+    fn bound_max_diff(&self, threshold: f32) -> u64 {
+        ((1.0 - threshold) * self.scoring_pixels() as f32 * self.channel_scale()) as u64
+    }
+
     fn template_sum(&self) -> u64 {
         self.template
             .as_chunks::<4>()
@@ -628,6 +884,14 @@ impl ScanOps for Scan<'_> {
         255.0
     }
 
+    fn scoring_pixels(&self) -> u64 {
+        (self.template_width * self.template_height) as u64
+    }
+
+    fn bound_max_diff(&self, threshold: f32) -> u64 {
+        ((1.0 - threshold) * self.scoring_pixels() as f32 * self.channel_scale()) as u64
+    }
+
     fn template_sum(&self) -> u64 {
         self.template.iter().map(|&value| u64::from(value)).sum()
     }
@@ -653,6 +917,7 @@ struct FastScan<'a, S: ScanOps> {
     scan: &'a S,
     threshold: f32,
     max_diff: u64,
+    bound_max_diff: u64,
     pixel_count: u64,
     template_sum: u64,
     region: SearchRegion,
@@ -686,7 +951,7 @@ fn scan_band<S: ScanOps>(fast: &FastScan<'_, S>, k0: u32, k1: u32) -> FastState 
     let sum_bound_passes = |x: u32, y: u32| -> bool {
         sat.window_sum(x, y, template_width, template_height, fast.region.x, pos_y0)
             .abs_diff(fast.template_sum)
-            <= fast.max_diff
+            <= fast.bound_max_diff
     };
 
     let mut state = FastState::default();
@@ -1657,6 +1922,293 @@ mod tests {
         }
     }
 
+    /// Naive dense weighted reference: every position gets the weighted
+    /// coarse pass over significant samples and promising ones the exact
+    /// weighted difference.
+    fn naive_find_weighted(
+        frame: &RgbaImage,
+        template: &RgbaImage,
+        weights: &TemplateWeights,
+        region: SearchRegion,
+        threshold: f32,
+    ) -> MatchReport {
+        let threshold = threshold.clamp(0.0, 1.0);
+        let significant = weights.significant_count.max(1);
+        let max_diff = ((1.0 - threshold) * significant as f32 * 765.0) as u64;
+        let max_x = region.x + region.width - template.width();
+        let max_y = region.y + region.height - template.height();
+        let mut best: Option<TemplateMatch> = None;
+        let mut best_diff = u64::MAX;
+        let mut best_score = 0.0_f32;
+
+        for y in region.y..=max_y {
+            for x in region.x..=max_x {
+                let coarse = naive_weighted_coarse(frame, template, weights, x, y);
+                best_score = best_score.max(coarse);
+                if coarse + 0.06 < threshold {
+                    continue;
+                }
+                let abort_at = max_diff.saturating_add(1).min(best_diff);
+                let Some(difference) =
+                    naive_weighted_diff(frame, template, weights, x, y, abort_at)
+                else {
+                    continue;
+                };
+                let score = 1.0 - difference as f32 / (significant as f32 * 765.0);
+                best_score = best_score.max(score);
+                best_diff = difference;
+                best = Some(TemplateMatch {
+                    x,
+                    y,
+                    width: template.width(),
+                    height: template.height(),
+                    score,
+                });
+            }
+        }
+
+        MatchReport {
+            matched: best,
+            best_score,
+        }
+    }
+
+    fn weighted_pixel_diff(
+        frame: &RgbaImage,
+        template: &RgbaImage,
+        index: u32,
+        origin_x: u32,
+        origin_y: u32,
+    ) -> u64 {
+        let tx = index % template.width();
+        let ty = index / template.width();
+        let frame_pixel = frame.get_pixel(origin_x + tx, origin_y + ty);
+        let template_pixel = template.get_pixel(tx, ty);
+        let mut difference = 0_u64;
+        for channel in 0..3 {
+            difference += frame_pixel[channel].abs_diff(template_pixel[channel]) as u64;
+        }
+        difference
+    }
+
+    fn naive_weighted_coarse(
+        frame: &RgbaImage,
+        template: &RgbaImage,
+        weights: &TemplateWeights,
+        origin_x: u32,
+        origin_y: u32,
+    ) -> f32 {
+        let mut difference = 0_u64;
+        let mut samples = 0_u64;
+        for &index in &weights.significant_samples {
+            difference += weighted_pixel_diff(frame, template, index, origin_x, origin_y);
+            samples += 1;
+        }
+        1.0 - difference as f32 / (samples.max(1) as f32 * 765.0)
+    }
+
+    fn naive_weighted_diff(
+        frame: &RgbaImage,
+        template: &RgbaImage,
+        weights: &TemplateWeights,
+        origin_x: u32,
+        origin_y: u32,
+        abort_at: u64,
+    ) -> Option<u64> {
+        let mut difference = 0_u64;
+        for &index in &weights.significant_indices {
+            difference += weighted_pixel_diff(frame, template, index, origin_x, origin_y);
+            if difference >= abort_at {
+                return None;
+            }
+        }
+        Some(difference)
+    }
+
+    fn assert_weighted_equivalent(
+        frame: &RgbaImage,
+        template: &RgbaImage,
+        threshold: f32,
+        context: &str,
+    ) {
+        let weights = TemplateWeights::analyze(template);
+        let region = SearchRegion::full(frame);
+        let weighted =
+            find_template_report_rgb_weighted(frame, template, &weights, region, threshold);
+        let reference = naive_find_weighted(frame, template, &weights, region, threshold);
+        if let Some(expected) = reference.matched {
+            let found = weighted
+                .matched
+                .unwrap_or_else(|| panic!("{context}: reference matched but weighted did not"));
+            assert!(
+                (found.score - expected.score).abs() <= 0.02,
+                "{context}: score {:.3} vs reference {:.3}",
+                found.score,
+                expected.score
+            );
+        }
+        assert!(
+            (weighted.best_score - reference.best_score).abs() <= 0.02,
+            "{context}: best score {:.3} vs reference {:.3}",
+            weighted.best_score,
+            reference.best_score
+        );
+    }
+
+    #[test]
+    fn weighted_matches_reference_on_embedded_noise_template() {
+        let (frame, template) = embedded_noise_rgb_case();
+        assert_weighted_equivalent(&frame, &template, 0.90, "weighted embedded noise");
+    }
+
+    #[test]
+    fn weighted_matches_reference_on_pure_noise_without_match() {
+        let (frame, template) = pure_noise_rgb_case();
+        assert_weighted_equivalent(&frame, &template, 0.90, "weighted pure noise");
+    }
+
+    #[test]
+    fn weighted_multithread_matches_single_thread() {
+        for (name, (frame, template)) in [
+            ("embedded noise", embedded_noise_rgb_case()),
+            ("pure noise", pure_noise_rgb_case()),
+        ] {
+            let weights = TemplateWeights::analyze(&template);
+            let region = SearchRegion::full(&frame);
+            let single = find_precise_weighted_impl(&frame, &template, &weights, region, 0.90, 1);
+            let multi = find_precise_weighted_impl(
+                &frame,
+                &template,
+                &weights,
+                region,
+                0.90,
+                MAX_FAST_BANDS,
+            );
+            assert_eq!(
+                single
+                    .matched
+                    .map(|found| (found.x, found.y, found.score.to_bits())),
+                multi
+                    .matched
+                    .map(|found| (found.x, found.y, found.score.to_bits())),
+                "{name}: multithreaded result differs from single-threaded"
+            );
+            assert_eq!(
+                single.best_score.to_bits(),
+                multi.best_score.to_bits(),
+                "{name}: multithreaded best score differs"
+            );
+        }
+    }
+
+    #[test]
+    fn analyze_marks_flat_template_as_background_and_degrades() {
+        let flat = RgbaImage::from_pixel(16, 16, Rgba([150, 150, 150, 255]));
+        let weights = TemplateWeights::analyze(&flat);
+        assert_eq!(weights.significant_count, 0);
+        assert!(weights.significant_indices.is_empty());
+        assert!(weights.is_mostly_background());
+        assert_eq!(weights.total_sum, 16 * 16 * 450);
+
+        // A fully flat template degrades to the unweighted engine exactly.
+        let mut rng = XorShift(0x5771_2A01);
+        let frame = noise_rgb_image(&mut rng, 64, 48);
+        let region = SearchRegion::full(&frame);
+        let unweighted = find_precise_impl(&frame, &flat, region, 0.5, 1);
+        let weighted = find_precise_weighted_impl(&frame, &flat, &weights, region, 0.5, 1);
+        assert_eq!(
+            unweighted
+                .matched
+                .map(|found| (found.x, found.y, found.score.to_bits())),
+            weighted
+                .matched
+                .map(|found| (found.x, found.y, found.score.to_bits()))
+        );
+        assert_eq!(
+            unweighted.best_score.to_bits(),
+            weighted.best_score.to_bits()
+        );
+    }
+
+    #[test]
+    fn analyze_counts_significant_pixels() {
+        // 90% background (160) + 10% text (60): mean 150, so the background
+        // deviates by 10 (< epsilon) and only the text is significant.
+        let mut sparse = RgbaImage::from_pixel(10, 10, Rgba([160, 160, 160, 255]));
+        for x in 0..10 {
+            sparse.put_pixel(x, 0, Rgba([60, 60, 60, 255]));
+        }
+        let weights = TemplateWeights::analyze(&sparse);
+        assert_eq!(weights.significant_count, 10);
+        assert_eq!(weights.significant_sum, 10 * 180);
+        assert_eq!(weights.total_sum, 90 * 480 + 10 * 180);
+        assert!(weights.is_mostly_background());
+
+        // 80% background (100) + 20% slightly-off pixels (114): mean 102,
+        // text deviation is exactly epsilon.
+        let mut dense = RgbaImage::from_pixel(10, 10, Rgba([100, 100, 100, 255]));
+        for x in 0..10 {
+            dense.put_pixel(x, 0, Rgba([114, 114, 114, 255]));
+            dense.put_pixel(x, 1, Rgba([114, 114, 114, 255]));
+        }
+        let weights = TemplateWeights::analyze(&dense);
+        assert_eq!(weights.significant_count, 20);
+        assert!(!weights.is_mostly_background());
+    }
+
+    /// The selling point of weighting: a large flat template background plus
+    /// a small text block. Region A is pure background (unweighted matching
+    /// accepts it — the classic misclick); region B has a slightly different
+    /// background but the exact same text. Weighted matching must pick B.
+    #[test]
+    fn weighted_prefers_text_over_flat_background() {
+        let mut template = RgbaImage::from_pixel(24, 24, Rgba([200, 200, 200, 255]));
+        for y in 10..14 {
+            for x in 10..14 {
+                template.put_pixel(x, y, Rgba([40, 40, 40, 255]));
+            }
+        }
+        let weights = TemplateWeights::analyze(&template);
+        assert_eq!(weights.significant_count, 16);
+
+        // Region A at (8, 8): pure template background, no text at all.
+        let mut frame = RgbaImage::from_pixel(64, 48, Rgba([120, 120, 120, 255]));
+        for y in 0..24 {
+            for x in 0..24 {
+                frame.put_pixel(8 + x, 8 + y, Rgba([200, 200, 200, 255]));
+            }
+        }
+        // Region B at (32, 8): background slightly off, text identical.
+        for y in 0..24 {
+            for x in 0..24 {
+                frame.put_pixel(32 + x, 8 + y, Rgba([190, 200, 210, 255]));
+            }
+        }
+        for y in 10..14 {
+            for x in 10..14 {
+                frame.put_pixel(32 + x, 8 + y, Rgba([40, 40, 40, 255]));
+            }
+        }
+
+        let region = SearchRegion::full(&frame);
+        let unweighted = find_template_report_rgb(&frame, &template, region, 0.97);
+        let impostor = unweighted
+            .matched
+            .expect("unweighted matching should fall for the flat region");
+        assert_eq!(
+            (impostor.x, impostor.y),
+            (8, 8),
+            "unweighted matching picks the text-free flat region — the misclick"
+        );
+
+        let weighted = find_template_report_rgb_weighted(&frame, &template, &weights, region, 0.97);
+        let found = weighted
+            .matched
+            .expect("weighted matching should find the region with the real text");
+        assert_eq!((found.x, found.y), (32, 8));
+        assert!(found.score > 0.99);
+    }
+
     #[test]
     #[ignore = "performance comparison, run with cargo test --release -- --ignored"]
     fn perf_full_hd_scan() {
@@ -1778,6 +2330,98 @@ mod tests {
                  precise {MAX_FAST_BANDS}-thread {precise_multi_elapsed:?}"
             );
             assert_eq!(precise_single.matched, precise_multi.matched);
+
+            // Weighted variants of both scans.
+            let noise_weights = TemplateWeights::analyze(&noise_template);
+            let started = std::time::Instant::now();
+            let weighted_single = find_precise_weighted_impl(
+                &noise_frame,
+                &noise_template,
+                &noise_weights,
+                SearchRegion::full(&noise_frame),
+                0.90,
+                1,
+            );
+            let weighted_single_elapsed = started.elapsed();
+            let started = std::time::Instant::now();
+            let weighted_multi = find_precise_weighted_impl(
+                &noise_frame,
+                &noise_template,
+                &noise_weights,
+                SearchRegion::full(&noise_frame),
+                0.90,
+                MAX_FAST_BANDS,
+            );
+            let weighted_multi_elapsed = started.elapsed();
+            eprintln!(
+                "{width}×{height} noise scan: weighted 1-thread {weighted_single_elapsed:?}, \
+                 weighted {MAX_FAST_BANDS}-thread {weighted_multi_elapsed:?}"
+            );
+            assert_eq!(weighted_single.matched, weighted_multi.matched);
+
+            let real_weights = TemplateWeights::analyze(&real_template);
+            let started = std::time::Instant::now();
+            let weighted_single = find_precise_weighted_impl(
+                &real_frame,
+                &real_template,
+                &real_weights,
+                region,
+                0.90,
+                1,
+            );
+            let weighted_single_elapsed = started.elapsed();
+            let started = std::time::Instant::now();
+            let weighted_multi = find_precise_weighted_impl(
+                &real_frame,
+                &real_template,
+                &real_weights,
+                region,
+                0.90,
+                MAX_FAST_BANDS,
+            );
+            let weighted_multi_elapsed = started.elapsed();
+            eprintln!(
+                "{width}×{height} realistic scan: weighted 1-thread {weighted_single_elapsed:?}, \
+                 weighted {MAX_FAST_BANDS}-thread {weighted_multi_elapsed:?}"
+            );
+            assert_eq!(weighted_single.matched, weighted_multi.matched);
+
+            // Mostly-flat template (2% significant pixels), the weighted
+            // engine's home turf.
+            let mut flat_template = RgbaImage::from_pixel(120, 80, Rgba([200, 200, 200, 255]));
+            for y in 34..46 {
+                for x in 54..66 {
+                    flat_template.put_pixel(x, y, Rgba([40, 40, 40, 255]));
+                }
+            }
+            let flat_weights = TemplateWeights::analyze(&flat_template);
+            let started = std::time::Instant::now();
+            let weighted_single = find_precise_weighted_impl(
+                &real_frame,
+                &flat_template,
+                &flat_weights,
+                region,
+                0.90,
+                1,
+            );
+            let weighted_single_elapsed = started.elapsed();
+            let started = std::time::Instant::now();
+            let weighted_multi = find_precise_weighted_impl(
+                &real_frame,
+                &flat_template,
+                &flat_weights,
+                region,
+                0.90,
+                MAX_FAST_BANDS,
+            );
+            let weighted_multi_elapsed = started.elapsed();
+            eprintln!(
+                "{width}×{height} flat-template scan: weighted 1-thread {weighted_single_elapsed:?}, \
+                 weighted {MAX_FAST_BANDS}-thread {weighted_multi_elapsed:?} \
+                 (significant {}%)",
+                (flat_weights.significant_ratio() * 100.0).round() as u32
+            );
+            assert_eq!(weighted_single.matched, weighted_multi.matched);
         }
     }
 }

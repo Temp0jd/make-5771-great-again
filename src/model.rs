@@ -722,6 +722,8 @@ pub struct MacroProfile {
     pub stop_hotkey: String,
     #[serde(default)]
     pub shared_templates: bool,
+    /// Legacy setting kept only for archive compatibility; recognition always
+    /// uses the color matcher now and this value is ignored.
     #[serde(default)]
     pub match_algorithm: MatchAlgorithm,
     #[serde(default = "default_stable_confirm")]

@@ -81,6 +81,7 @@ struct TemplateTestOutcome {
     frame: image::RgbaImage,
     search_region: SearchRegion,
     threshold: f32,
+    mostly_background: bool,
     result: Result<vision::MatchReport, String>,
 }
 
@@ -646,7 +647,9 @@ impl Make5771App {
         // part runs on a worker thread and reports back through a channel.
         let (sender, receiver) = std::sync::mpsc::channel();
         let threshold = self.template_test_threshold;
-        let algorithm = self.profile.match_algorithm;
+        // Grayscale matching proved too error-prone in practice; the app
+        // always uses the color matcher now.
+        let algorithm = MatchAlgorithm::Precise;
         self.template_test_pending = Some(receiver);
         self.push_log(
             LogLevel::Info,
@@ -668,6 +671,15 @@ impl Make5771App {
                 return;
             }
         };
+        if outcome.mostly_background {
+            self.push_log(
+                LogLevel::Warning,
+                format!(
+                    "模板“{}”背景占比过高，建议截紧到文字/图标区域",
+                    outcome.template_name
+                ),
+            );
+        }
         let result = report.matched;
         let log_message = match result {
             Some(found) => format!(
@@ -2685,38 +2697,18 @@ impl Make5771App {
         theme::card().show(ui, |ui| {
             ui.label(RichText::new("识别算法").size(18.0).strong());
             ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("模板匹配");
-                egui::ComboBox::from_id_salt("match-algorithm")
-                    .selected_text(self.profile.match_algorithm.label())
-                    .show_ui(ui, |ui| {
-                        for algorithm in MatchAlgorithm::ALL {
-                            ui.selectable_value(
-                                &mut self.profile.match_algorithm,
-                                algorithm,
-                                algorithm.label(),
-                            );
-                        }
-                    });
-            });
+            ui.label("精准（彩色 RGB）");
             ui.label(
                 RichText::new(
-                    "精准（彩色，推荐）：RGB 三通道匹配，抗误触最强，1080p 全图约 3-10 ms",
+                    "RGB 三通道匹配，抗误触最强，1080p 全图约 3-10 ms；灰度算法误匹配过多，已停用",
                 )
                 .size(11.0)
                 .color(theme::tertiary_label()),
             );
             ui.label(
-                RichText::new("极速（灰度，最快）：灰度下界过滤 + 多线程，1080p 全图约 1-4 ms")
+                RichText::new("已启用有效像素加权：模板背景不参与打分，抗误触更强")
                     .size(11.0)
                     .color(theme::tertiary_label()),
-            );
-            ui.label(
-                RichText::new(
-                    "经典（旧算法）：步进粗扫单线程，1080p 全图约 13 ms，仅用于排查兼容问题",
-                )
-                .size(11.0)
-                .color(theme::tertiary_label()),
             );
         });
 
@@ -3954,6 +3946,7 @@ fn run_template_test_work(
                 frame,
                 search_region: full_region,
                 threshold,
+                mostly_background: false,
                 result: Err(format!("无法读取模板图片：{error}")),
             };
         }
@@ -3999,9 +3992,18 @@ fn run_template_test_work(
             height: region.height,
         })
         .unwrap_or(full_region);
+    let mut mostly_background = false;
     let report = match algorithm {
         vision::MatchAlgorithm::Precise => {
-            vision::find_template_report_rgb(&frame, &template_rgb, search_region, threshold)
+            let weights = vision::TemplateWeights::analyze(&template_rgb);
+            mostly_background = weights.is_mostly_background();
+            vision::find_template_report_rgb_weighted(
+                &frame,
+                &template_rgb,
+                &weights,
+                search_region,
+                threshold,
+            )
         }
         gray_algorithm => {
             let frame_gray = image::imageops::grayscale(&frame);
@@ -4020,6 +4022,7 @@ fn run_template_test_work(
         frame,
         search_region,
         threshold,
+        mostly_background,
         result: Ok(report),
     }
 }

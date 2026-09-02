@@ -15,6 +15,11 @@ use crate::model::{
 use crate::platform::{self, TargetWindow};
 use crate::vision::{self, MatchAlgorithm, SearchRegion};
 
+/// Grayscale matching proved too error-prone in real use, so every
+/// recognition goes through the color matcher. The grayscale implementations
+/// stay in vision.rs for tests and benchmarks.
+const MATCH_ALGORITHM: MatchAlgorithm = MatchAlgorithm::Precise;
+
 #[derive(Debug, Clone)]
 pub enum RunnerEvent {
     Started,
@@ -191,7 +196,12 @@ fn run_workflow(
     let frame_width = startup_frame.width();
     let frame_height = startup_frame.height();
     let templates = match load_templates(&profile, frame_width, frame_height) {
-        Ok(templates) => templates,
+        Ok((templates, warnings)) => {
+            for warning in warnings {
+                let _ = events.send(RunnerEvent::Notice(warning));
+            }
+            templates
+        }
         Err(error) => {
             let _ = events.send(RunnerEvent::Failed(error));
             return;
@@ -296,13 +306,15 @@ fn run_workflow(
 
 /// Loads template images, scaling them from their reference resolution to the
 /// actual client size when they differ (e.g. a shared package used at a
-/// different resolution).
+/// different resolution). Also returns warnings for templates whose
+/// significant-pixel share is too low for stable weighted matching.
 fn load_templates(
     profile: &MacroProfile,
     frame_width: u32,
     frame_height: u32,
-) -> Result<HashMap<String, LoadedTemplate>, String> {
+) -> Result<(HashMap<String, LoadedTemplate>, Vec<String>), String> {
     let mut templates = HashMap::new();
+    let mut warnings = Vec::new();
     for asset in &profile.templates {
         // Both a grayscale and an RGB copy are kept: the matching algorithm
         // chosen in the profile decides which one is scanned.
@@ -355,23 +367,32 @@ fn load_templates(
                 ),
             )
         };
+        let weights = vision::TemplateWeights::analyze(&image_rgb);
+        if weights.is_mostly_background() {
+            warnings.push(format!(
+                "模板“{}”背景占比过高，建议截紧到文字/图标区域",
+                asset.name
+            ));
+        }
         templates.insert(
             asset.path.clone(),
             LoadedTemplate {
                 asset: scaled_asset,
                 image,
                 image_rgb,
+                weights,
                 last_match: Cell::new(None),
             },
         );
     }
-    Ok(templates)
+    Ok((templates, warnings))
 }
 
 struct LoadedTemplate {
     asset: TemplateAsset,
     image: GrayImage,
     image_rgb: RgbaImage,
+    weights: vision::TemplateWeights,
     /// Last match position in client coordinates; used to try a small
     /// neighborhood before paying for a full-region scan.
     last_match: Cell<Option<(u32, u32)>>,
@@ -552,7 +573,7 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
         ensure_expected_size(&frame, ctx)?;
-        let frame_gray = (ctx.profile.match_algorithm != MatchAlgorithm::Precise)
+        let frame_gray = (MATCH_ALGORITHM != MatchAlgorithm::Precise)
             .then(|| image::imageops::grayscale(&frame));
 
         let report = find_loaded_template(
@@ -562,7 +583,7 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
             frame.height(),
             template,
             step.threshold,
-            ctx.profile.match_algorithm,
+            MATCH_ALGORITHM,
         );
         best_seen = best_seen.max(report.best_score);
         if let Some(found) = report.matched {
@@ -695,7 +716,7 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
         ensure_expected_size(&frame, ctx)?;
-        let frame_gray = (ctx.profile.match_algorithm != MatchAlgorithm::Precise)
+        let frame_gray = (MATCH_ALGORITHM != MatchAlgorithm::Precise)
             .then(|| image::imageops::grayscale(&frame));
 
         let mut matched = None;
@@ -715,7 +736,7 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
                 frame.height(),
                 template,
                 branch.threshold,
-                ctx.profile.match_algorithm,
+                MATCH_ALGORITHM,
             );
             if report.best_score > best_seen.0 {
                 best_seen = (report.best_score, branch.name.clone());
@@ -804,7 +825,7 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
         ensure_expected_size(&frame, ctx)?;
-        let frame_gray = (ctx.profile.match_algorithm != MatchAlgorithm::Precise)
+        let frame_gray = (MATCH_ALGORITHM != MatchAlgorithm::Precise)
             .then(|| image::imageops::grayscale(&frame));
 
         let mut satisfied = 0_usize;
@@ -825,7 +846,7 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
                 frame.height(),
                 template,
                 term.threshold,
-                ctx.profile.match_algorithm,
+                MATCH_ALGORITHM,
             );
             if report.best_score > best_seen.0 {
                 best_seen = (report.best_score, term.name.clone());
@@ -980,9 +1001,13 @@ fn find_loaded_template(
 
     let run_match = |region: SearchRegion| -> vision::MatchReport {
         match algorithm {
-            MatchAlgorithm::Precise => {
-                vision::find_template_report_rgb(frame, &template.image_rgb, region, threshold)
-            }
+            MatchAlgorithm::Precise => vision::find_template_report_rgb_weighted(
+                frame,
+                &template.image_rgb,
+                &template.weights,
+                region,
+                threshold,
+            ),
             gray_algorithm => vision::find_template_report(
                 frame_gray.expect("灰度匹配路径必须提供灰度图"),
                 &template.image,
@@ -1148,7 +1173,10 @@ mod tests {
             }),
         });
 
-        let templates = load_templates(&profile, 640, 360).unwrap();
+        let (templates, warnings) = load_templates(&profile, 640, 360).unwrap();
+        // The test template is a solid color block, so it triggers the
+        // mostly-background warning.
+        assert_eq!(warnings.len(), 1);
         let loaded = templates.values().next().unwrap();
         assert_eq!((loaded.image.width(), loaded.image.height()), (4, 3));
         let region = loaded.asset.search_region.unwrap();
