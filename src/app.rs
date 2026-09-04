@@ -647,9 +647,7 @@ impl Make5771App {
         // part runs on a worker thread and reports back through a channel.
         let (sender, receiver) = std::sync::mpsc::channel();
         let threshold = self.template_test_threshold;
-        // Grayscale matching proved too error-prone in practice; the app
-        // always uses the color matcher now.
-        let algorithm = MatchAlgorithm::Precise;
+        let algorithm = self.profile.match_algorithm;
         self.template_test_pending = Some(receiver);
         self.push_log(
             LogLevel::Info,
@@ -2255,8 +2253,13 @@ impl Make5771App {
             } else {
                 ui.horizontal(|ui| {
                     ui.label("测试阈值");
+                    let minimum = if self.profile.match_algorithm == MatchAlgorithm::Hybrid {
+                        vision::MIN_HYBRID_THRESHOLD
+                    } else {
+                        0.50
+                    };
                     ui.add(
-                        egui::Slider::new(&mut self.template_test_threshold, 0.50..=1.00)
+                        egui::Slider::new(&mut self.template_test_threshold, minimum..=1.00)
                             .fixed_decimals(2),
                     );
                     ui.label(
@@ -2671,6 +2674,38 @@ impl Make5771App {
                     ui.toggle_value(&mut self.profile.click_jitter, "开启");
                 });
             });
+            ui.horizontal(|ui| {
+                ui.label("识别模式");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let selected = match self.profile.match_algorithm {
+                        MatchAlgorithm::Hybrid => "混合结构识别（推荐）",
+                        MatchAlgorithm::Precise => "兼容 RGB 识别",
+                        MatchAlgorithm::Fast => "兼容快速灰度",
+                        MatchAlgorithm::Classic => "兼容经典灰度",
+                    };
+                    egui::ComboBox::from_id_salt("recognition_mode")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.profile.match_algorithm,
+                                MatchAlgorithm::Hybrid,
+                                "混合结构识别（推荐）",
+                            );
+                            ui.selectable_value(
+                                &mut self.profile.match_algorithm,
+                                MatchAlgorithm::Precise,
+                                "兼容 RGB 识别",
+                            );
+                        });
+                });
+            });
+            ui.label(
+                RichText::new(
+                    "旧流程保留原 RGB 分数语义；切换混合模式后请逐个测试模板并重新校准阈值",
+                )
+                .size(11.0)
+                .color(theme::tertiary_label()),
+            );
             ui.horizontal(|ui| {
                 ui.label("点击前二次确认");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3937,6 +3972,7 @@ fn run_template_test_work(
     threshold: f32,
     algorithm: vision::MatchAlgorithm,
 ) -> TemplateTestOutcome {
+    let threshold = vision::effective_threshold(algorithm, threshold);
     let full_region = SearchRegion::full(&frame);
     let mut template_rgb = match image::open(&template_asset.path) {
         Ok(image) => image.into_rgba8(),
@@ -3994,6 +4030,17 @@ fn run_template_test_work(
         .unwrap_or(full_region);
     let mut mostly_background = false;
     let report = match algorithm {
+        vision::MatchAlgorithm::Hybrid => {
+            let weights = vision::TemplateWeights::analyze(&template_rgb);
+            mostly_background = weights.is_mostly_background();
+            vision::find_template_report_rgb_hybrid(
+                &frame,
+                &template_rgb,
+                &weights,
+                search_region,
+                threshold,
+            )
+        }
         vision::MatchAlgorithm::Precise => {
             let weights = vision::TemplateWeights::analyze(&template_rgb);
             mostly_background = weights.is_mostly_background();

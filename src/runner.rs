@@ -15,10 +15,15 @@ use crate::model::{
 use crate::platform::{self, TargetWindow};
 use crate::vision::{self, MatchAlgorithm, SearchRegion};
 
-/// Grayscale matching proved too error-prone in real use, so every
-/// recognition goes through the color matcher. The grayscale implementations
-/// stay in vision.rs for tests and benchmarks.
-const MATCH_ALGORITHM: MatchAlgorithm = MatchAlgorithm::Precise;
+fn needs_gray_frame(algorithm: MatchAlgorithm) -> bool {
+    matches!(algorithm, MatchAlgorithm::Fast | MatchAlgorithm::Classic)
+}
+
+/// Two branch candidates this close are treated as ambiguous and no click is
+/// issued until later frames separate them.
+const BRANCH_AMBIGUITY_MARGIN: f32 = 0.025;
+const BRANCH_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+const BRANCH_ABSENT_CHECKS: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub enum RunnerEvent {
@@ -462,6 +467,12 @@ struct StepContext<'a> {
 }
 
 impl StepContext<'_> {
+    fn clear_match_cache(&self) {
+        for template in self.templates.values() {
+            template.last_match.set(None);
+        }
+    }
+
     /// Clicks client coordinates, applying optional humanization and the
     /// configured click method.
     fn click(&mut self, x: u32, y: u32) -> Result<(), String> {
@@ -573,8 +584,8 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
         ensure_expected_size(&frame, ctx)?;
-        let frame_gray = (MATCH_ALGORITHM != MatchAlgorithm::Precise)
-            .then(|| image::imageops::grayscale(&frame));
+        let algorithm = ctx.profile.match_algorithm;
+        let frame_gray = needs_gray_frame(algorithm).then(|| image::imageops::grayscale(&frame));
 
         let report = find_loaded_template(
             &frame,
@@ -583,7 +594,7 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
             frame.height(),
             template,
             step.threshold,
-            MATCH_ALGORITHM,
+            algorithm,
         );
         best_seen = best_seen.max(report.best_score);
         if let Some(found) = report.matched {
@@ -613,7 +624,10 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
     }
     Err(format!(
         "步骤“{}”在 {} 秒内未找到目标（最佳相似度 {:.2}，阈值 {:.2}）",
-        step.name, step.timeout_secs, best_seen, step.threshold
+        step.name,
+        step.timeout_secs,
+        best_seen,
+        vision::effective_threshold(ctx.profile.match_algorithm, step.threshold)
     ))
 }
 
@@ -637,7 +651,11 @@ fn click_match(
         as u32;
     let y = (base_y as i32 + offset_y).clamp(0, ctx.target.client_height.saturating_sub(1) as i32)
         as u32;
-    ctx.click(x, y)
+    ctx.click(x, y)?;
+    // A successful click may change the entire screen. Carrying a location
+    // hint across that transition can make a previous false positive sticky.
+    ctx.clear_match_cache();
+    Ok(())
 }
 
 /// Picks the reference point on the matched box for the configured anchor;
@@ -691,10 +709,46 @@ fn send_keys(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), Strin
     Ok(())
 }
 
+struct BranchLatch {
+    absent_checks: u8,
+    retry_at: Instant,
+}
+
+/// Returns `(clear_latch, suppress_candidate)` for one observation.
+fn observe_branch_latch(
+    latch: &mut BranchLatch,
+    target_present: bool,
+    now: Instant,
+) -> (bool, bool) {
+    if !target_present {
+        latch.absent_checks = latch.absent_checks.saturating_add(1);
+        return (latch.absent_checks >= BRANCH_ABSENT_CHECKS, false);
+    }
+    latch.absent_checks = 0;
+    if now < latch.retry_at {
+        (false, true)
+    } else {
+        // The click may have failed. Permit a bounded retry after cooldown
+        // even if the old visual never disappeared.
+        (true, false)
+    }
+}
+
+fn normalized_branch_confidence(score: f32, threshold: f32) -> f32 {
+    (score - threshold) / (1.0 - threshold).max(0.001)
+}
+
+fn branch_scores_are_ambiguous(best: f32, second: f32) -> bool {
+    best - second < BRANCH_AMBIGUITY_MARGIN
+}
+
 fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepControl, String> {
+    // This is a total step budget. RepeatWait activity must not reset it or a
+    // persistent false positive can keep the runner alive forever.
     let mut timeout_at = Instant::now() + Duration::from_secs(step.timeout_secs as u64);
     let mut state = WaitState::default();
     let mut best_seen = (0.0_f32, String::new());
+    let mut latches: HashMap<u64, BranchLatch> = HashMap::new();
     // (branch id, match position) awaiting double confirmation.
     let mut pending_confirm: Option<(u64, u32, u32)> = None;
 
@@ -703,7 +757,8 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
             continue;
         }
         if state.resumed {
-            // Frames across a pause are not consecutive observations.
+            // Frames across a pause are not consecutive observations. Keep
+            // action latches: pausing does not undo a click already issued.
             state.resumed = false;
             pending_confirm = None;
         }
@@ -716,10 +771,13 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
         ensure_expected_size(&frame, ctx)?;
-        let frame_gray = (MATCH_ALGORITHM != MatchAlgorithm::Precise)
-            .then(|| image::imageops::grayscale(&frame));
+        let algorithm = ctx.profile.match_algorithm;
+        let frame_gray = needs_gray_frame(algorithm).then(|| image::imageops::grayscale(&frame));
 
-        let mut matched = None;
+        // Evaluate every branch. Configuration order is only a deterministic
+        // tie-break; it no longer lets the first weak match beat a later,
+        // stronger one.
+        let mut candidates = Vec::new();
         for branch in &step.branches {
             let path = branch
                 .trigger_template
@@ -736,24 +794,51 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
                 frame.height(),
                 template,
                 branch.threshold,
-                MATCH_ALGORITHM,
+                algorithm,
             );
             if report.best_score > best_seen.0 {
                 best_seen = (report.best_score, branch.name.clone());
             }
+
+            let now = Instant::now();
+            let (clear_latch, suppressed) = latches
+                .get_mut(&branch.id)
+                .map(|latch| observe_branch_latch(latch, report.matched.is_some(), now))
+                .unwrap_or((false, false));
+            if clear_latch {
+                latches.remove(&branch.id);
+            }
             if let Some(found) = report.matched {
-                matched = Some((branch, found));
-                break;
+                // Suppressed matches still participate in ranking: a latched
+                // high-confidence target must block weaker branches rather
+                // than letting them advance by default.
+                let confidence = normalized_branch_confidence(
+                    found.score,
+                    vision::effective_threshold(algorithm, branch.threshold),
+                );
+                candidates.push((branch, found, suppressed, confidence));
             }
         }
 
-        let Some((branch, found)) = matched else {
+        candidates.sort_by(
+            |(left_branch, _, _, left_confidence), (right_branch, _, _, right_confidence)| {
+                right_confidence
+                    .total_cmp(left_confidence)
+                    .then_with(|| left_branch.id.cmp(&right_branch.id))
+            },
+        );
+        let ambiguous =
+            candidates.len() > 1 && branch_scores_are_ambiguous(candidates[0].3, candidates[1].3);
+        if ambiguous || candidates.is_empty() || candidates[0].2 {
             pending_confirm = None;
             interruptible_wait(Duration::from_millis(300), ctx.stop)?;
             continue;
-        };
+        }
+        let (branch, found, _, _) = candidates[0];
 
-        if branch.click_trigger && ctx.profile.stable_confirm {
+        // State-changing and non-clicking branches both require stable visual
+        // evidence; otherwise a one-frame artifact can redirect control flow.
+        if ctx.profile.stable_confirm {
             let position = (branch.id, found.x, found.y);
             let confirmed = pending_confirm.is_some_and(|(id, px, py)| {
                 id == branch.id && same_target((px, py), (found.x, found.y))
@@ -785,7 +870,13 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
         match branch.outcome {
             BranchOutcome::ContinueFlow => return Ok(StepControl::Continue),
             BranchOutcome::RepeatWait => {
-                timeout_at = Instant::now() + Duration::from_secs(step.timeout_secs as u64);
+                latches.insert(
+                    branch.id,
+                    BranchLatch {
+                        absent_checks: 0,
+                        retry_at: Instant::now() + BRANCH_RETRY_COOLDOWN,
+                    },
+                );
                 pending_confirm = None;
                 let _ = ctx.events.send(RunnerEvent::StepChanged(step.name.clone()));
             }
@@ -825,8 +916,8 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
 
         let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
         ensure_expected_size(&frame, ctx)?;
-        let frame_gray = (MATCH_ALGORITHM != MatchAlgorithm::Precise)
-            .then(|| image::imageops::grayscale(&frame));
+        let algorithm = ctx.profile.match_algorithm;
+        let frame_gray = needs_gray_frame(algorithm).then(|| image::imageops::grayscale(&frame));
 
         let mut satisfied = 0_usize;
         let mut matched: Option<(&VisualConditionTerm, vision::TemplateMatch)> = None;
@@ -846,7 +937,7 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
                 frame.height(),
                 template,
                 term.threshold,
-                MATCH_ALGORITHM,
+                algorithm,
             );
             if report.best_score > best_seen.0 {
                 best_seen = (report.best_score, term.name.clone());
@@ -999,20 +1090,28 @@ fn find_loaded_template(
         })
         .unwrap_or_else(|| SearchRegion::full(frame));
 
+    let effective_threshold = vision::effective_threshold(algorithm, threshold);
     let run_match = |region: SearchRegion| -> vision::MatchReport {
         match algorithm {
+            MatchAlgorithm::Hybrid => vision::find_template_report_rgb_hybrid(
+                frame,
+                &template.image_rgb,
+                &template.weights,
+                region,
+                effective_threshold,
+            ),
             MatchAlgorithm::Precise => vision::find_template_report_rgb_weighted(
                 frame,
                 &template.image_rgb,
                 &template.weights,
                 region,
-                threshold,
+                effective_threshold,
             ),
             gray_algorithm => vision::find_template_report(
                 frame_gray.expect("灰度匹配路径必须提供灰度图"),
                 &template.image,
                 region,
-                threshold,
+                effective_threshold,
                 gray_algorithm,
             ),
         }
@@ -1029,8 +1128,26 @@ fn find_loaded_template(
     {
         let tracked_report = run_match(tracked);
         if let Some(found) = tracked_report.matched {
-            template.last_match.set(Some((found.x, found.y)));
-            return tracked_report;
+            // A marginal local hit must compete with the full search instead
+            // of permanently pinning recognition to an old false location.
+            let strong_threshold = (effective_threshold + 0.04).clamp(0.94, 0.98);
+            if found.score >= strong_threshold {
+                template.last_match.set(Some((found.x, found.y)));
+                return tracked_report;
+            }
+            let full_report = run_match(base_region);
+            let report = if full_report
+                .matched
+                .is_some_and(|global| global.score > found.score)
+            {
+                full_report
+            } else {
+                tracked_report
+            };
+            template
+                .last_match
+                .set(report.matched.map(|matched| (matched.x, matched.y)));
+            return report;
         }
     }
     let report = run_match(base_region);
@@ -1302,6 +1419,33 @@ mod tests {
         assert!(same_target((100, 200), (104, 204)));
         assert!(!same_target((100, 200), (105, 200)));
         assert!(!same_target((100, 200), (100, 205)));
+    }
+
+    #[test]
+    fn close_branch_scores_are_treated_as_ambiguous() {
+        assert!(branch_scores_are_ambiguous(0.910, 0.900));
+        assert!(!branch_scores_are_ambiguous(0.950, 0.900));
+    }
+
+    #[test]
+    fn branch_confidence_is_normalized_against_its_own_threshold() {
+        let strict = normalized_branch_confidence(0.95, 0.90);
+        let lenient = normalized_branch_confidence(0.92, 0.80);
+        assert!(lenient > strict);
+    }
+
+    #[test]
+    fn branch_latch_requires_consecutive_absence_and_survives_presence() {
+        let now = Instant::now();
+        let mut latch = BranchLatch {
+            absent_checks: 0,
+            retry_at: now + Duration::from_secs(5),
+        };
+        assert_eq!(observe_branch_latch(&mut latch, false, now), (false, false));
+        assert_eq!(observe_branch_latch(&mut latch, true, now), (false, true));
+        assert_eq!(latch.absent_checks, 0);
+        assert_eq!(observe_branch_latch(&mut latch, false, now), (false, false));
+        assert_eq!(observe_branch_latch(&mut latch, false, now), (true, false));
     }
 
     #[test]

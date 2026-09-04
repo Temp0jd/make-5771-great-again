@@ -722,8 +722,8 @@ pub struct MacroProfile {
     pub stop_hotkey: String,
     #[serde(default)]
     pub shared_templates: bool,
-    /// Legacy setting kept only for archive compatibility; recognition always
-    /// uses the color matcher now and this value is ignored.
+    /// Existing profiles deserialize to `Precise`; newly created profiles use
+    /// `Hybrid` so old threshold calibration is never changed silently.
     #[serde(default)]
     pub match_algorithm: MatchAlgorithm,
     #[serde(default = "default_stable_confirm")]
@@ -778,7 +778,7 @@ impl Default for MacroProfile {
             capture_hotkey: default_capture_hotkey(),
             stop_hotkey: default_stop_hotkey(),
             shared_templates: false,
-            match_algorithm: MatchAlgorithm::default(),
+            match_algorithm: MatchAlgorithm::Hybrid,
             stable_confirm: default_stable_confirm(),
             sharing: SharingMetadata::default(),
         }
@@ -962,7 +962,9 @@ mod tests {
 
     #[test]
     fn default_profile_is_valid() {
-        assert!(MacroProfile::default().validate().is_ok());
+        let profile = MacroProfile::default();
+        assert!(profile.validate().is_ok());
+        assert_eq!(profile.match_algorithm, MatchAlgorithm::Hybrid);
     }
 
     #[test]

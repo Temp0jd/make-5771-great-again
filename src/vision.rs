@@ -1,12 +1,16 @@
 use image::{GrayImage, RgbaImage};
 use serde::{Deserialize, Serialize};
 
-/// Which template-matching engine to use. The default is `Precise`; `Classic`
-/// keeps the previous implementation unchanged for compatibility checks.
+/// Which template-matching engine to use. `Precise` remains the deserialization
+/// default so existing profiles keep their calibrated score semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MatchAlgorithm {
+    /// Weighted RGB candidate matching plus ZNCC structural verification.
+    /// New profiles use this mode; old profiles remain on `Precise` until the
+    /// user explicitly switches and recalibrates their thresholds.
+    Hybrid,
     /// RGB three-channel matching: integral-image lower-bound prefilter plus
-    /// banded multithreading; strongest against misclicks.
+    /// banded multithreading.
     #[default]
     Precise,
     /// Grayscale: integral-image lower-bound prefilter plus banded
@@ -60,13 +64,17 @@ pub struct MatchReport {
     pub best_score: f32,
 }
 
-/// Significant-pixel analysis of a template (OpenCV mask idea): pixels whose
-/// color stays within `BACKGROUND_EPSILON` of the template's average color
-/// are treated as background and carry zero weight in scoring, so large flat
-/// areas cannot earn similarity on their own.
+/// Significant-pixel analysis of a template (OpenCV mask idea).
+///
+/// A PNG containing transparent pixels is treated as an explicit mask:
+/// alpha-zero pixels are ignored and every visible pixel participates. For
+/// ordinary opaque screenshots, pixels close to the template's average color
+/// are treated as background so large flat areas cannot earn similarity on
+/// their own.
 #[derive(Debug, Clone)]
 pub struct TemplateWeights {
-    /// Row-major pixel indices that count in weighted scoring.
+    /// Row-major pixel indices that count in weighted scoring and structural
+    /// verification.
     pub significant_indices: Vec<u32>,
     /// Significant pixels lying on the coarse sample grid (falls back to all
     /// significant pixels when the grid misses them).
@@ -78,12 +86,16 @@ pub struct TemplateWeights {
     /// Channel sum over every pixel (drives the window-sum lower bound).
     pub total_sum: u64,
     pub pixel_count: u64,
+    /// True when transparency supplied the mask rather than the automatic
+    /// average-color heuristic.
+    pub explicit_alpha_mask: bool,
 }
 
 impl TemplateWeights {
     /// Max per-channel deviation from the average color below which a pixel
     /// counts as background.
     pub const BACKGROUND_EPSILON: u32 = 12;
+    const ALPHA_VISIBLE_THRESHOLD: u8 = 16;
 
     /// Weighted matching is pointless below this significant-pixel ratio;
     /// callers warn and suggest a tighter crop.
@@ -99,6 +111,9 @@ impl TemplateWeights {
             }
         }
         let mean = channel_sums.map(|sum| sum / pixel_count as u64);
+        // Require genuinely transparent pixels before interpreting alpha as a
+        // mask; incidental 254-valued metadata must not disable auto masking.
+        let explicit_alpha_mask = raw.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0);
 
         let mut significant_indices = Vec::new();
         let mut significant_sum = 0_u64;
@@ -110,7 +125,12 @@ impl TemplateWeights {
                 .map(|channel| u64::from(pixel[channel]).abs_diff(mean[channel]))
                 .max()
                 .unwrap_or(0);
-            if max_deviation >= u64::from(Self::BACKGROUND_EPSILON) {
+            let included = if explicit_alpha_mask {
+                pixel[3] >= Self::ALPHA_VISIBLE_THRESHOLD
+            } else {
+                max_deviation >= u64::from(Self::BACKGROUND_EPSILON)
+            };
+            if included {
                 significant_indices.push(index as u32);
                 significant_sum += channel_sum;
             }
@@ -141,6 +161,7 @@ impl TemplateWeights {
             significant_sum,
             total_sum,
             pixel_count: pixel_count as u64,
+            explicit_alpha_mask,
         }
     }
 
@@ -158,6 +179,76 @@ impl TemplateWeights {
     }
 }
 
+/// Zero-mean normalized cross-correlation at one candidate position.
+///
+/// The SAD matcher remains the cheap candidate generator; this allocation-free
+/// structural check rejects look-alike controls that share colors and chrome
+/// but have different text or icon shapes. Brightness and contrast shifts are
+/// normalized away. `None` means either image geometry is invalid or one side
+/// has too little variance for correlation to be meaningful.
+pub fn structural_similarity_at(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    x: u32,
+    y: u32,
+) -> Option<f32> {
+    if template.width() == 0
+        || template.height() == 0
+        || x.saturating_add(template.width()) > frame.width()
+        || y.saturating_add(template.height()) > frame.height()
+    {
+        return None;
+    }
+
+    let indices = &weights.significant_indices;
+    if indices.len() < 8 {
+        return None;
+    }
+
+    let frame_raw = frame.as_raw();
+    let template_raw = template.as_raw();
+    let frame_width = frame.width() as usize;
+    let template_width = template.width() as usize;
+    let mut sum_frame = 0.0_f64;
+    let mut sum_template = 0.0_f64;
+    let mut sum_frame_sq = 0.0_f64;
+    let mut sum_template_sq = 0.0_f64;
+    let mut sum_cross = 0.0_f64;
+
+    for &index in indices {
+        let index = index as usize;
+        let tx = index % template_width;
+        let ty = index / template_width;
+        let frame_base = ((y as usize + ty) * frame_width + x as usize + tx) * 4;
+        let template_base = index * 4;
+        let frame_luma = rgb_luma(&frame_raw[frame_base..frame_base + 3]);
+        let template_luma = rgb_luma(&template_raw[template_base..template_base + 3]);
+        sum_frame += frame_luma;
+        sum_template += template_luma;
+        sum_frame_sq += frame_luma * frame_luma;
+        sum_template_sq += template_luma * template_luma;
+        sum_cross += frame_luma * template_luma;
+    }
+
+    let count = indices.len() as f64;
+    let covariance = count * sum_cross - sum_frame * sum_template;
+    let frame_variance = count * sum_frame_sq - sum_frame * sum_frame;
+    let template_variance = count * sum_template_sq - sum_template * sum_template;
+    let denominator = (frame_variance * template_variance).sqrt();
+    if denominator <= f64::EPSILON {
+        return None;
+    }
+    Some((covariance / denominator).clamp(-1.0, 1.0) as f32)
+}
+
+#[inline]
+fn rgb_luma(rgb: &[u8]) -> f64 {
+    // ITU-R BT.601 integer weights; conversion precision is ample for ZNCC.
+    f64::from(77_u32 * u32::from(rgb[0]) + 150_u32 * u32::from(rgb[1]) + 29_u32 * u32::from(rgb[2]))
+        / 256.0
+}
+
 /// Finds the closest grayscale template using mean absolute pixel similarity,
 /// dispatching on the configured algorithm. `Precise` needs RGB input; the
 /// grayscale entry falls back to `Fast` for it.
@@ -170,7 +261,7 @@ pub fn find_template_report(
 ) -> MatchReport {
     match algorithm {
         MatchAlgorithm::Classic => find_classic(frame, template, region, threshold),
-        MatchAlgorithm::Fast | MatchAlgorithm::Precise => {
+        MatchAlgorithm::Fast | MatchAlgorithm::Precise | MatchAlgorithm::Hybrid => {
             find_fast(frame, template, region, threshold)
         }
     }
@@ -513,10 +604,23 @@ fn find_banded<S: ScanOps>(
     threshold: f32,
     max_bands: usize,
 ) -> MatchReport {
-    let empty = MatchReport {
-        matched: None,
-        best_score: 0.0,
-    };
+    let (candidates, best_score) = find_banded_candidates(scan, region, threshold, max_bands, 1);
+    MatchReport {
+        matched: candidates.into_iter().next(),
+        best_score,
+    }
+}
+
+/// Returns up to `candidate_limit` lowest-difference positions. Keeping a
+/// small bounded list lets structural verification recover when the best SAD
+/// look-alike is not the best hybrid match.
+fn find_banded_candidates<S: ScanOps>(
+    scan: &S,
+    region: SearchRegion,
+    threshold: f32,
+    max_bands: usize,
+    candidate_limit: usize,
+) -> (Vec<TemplateMatch>, f32) {
     let (template_width, template_height) = scan.template_size();
     let (frame_width, frame_height) = scan.frame_size();
     if template_width == 0
@@ -526,9 +630,10 @@ fn find_banded<S: ScanOps>(
         || region.x.saturating_add(region.width) > frame_width
         || region.y.saturating_add(region.height) > frame_height
     {
-        return empty;
+        return (Vec::new(), 0.0);
     }
 
+    let candidate_limit = candidate_limit.max(1);
     let threshold = threshold.clamp(0.0, 1.0);
     let pixel_count = scan.scoring_pixels();
     let channel_scale = scan.channel_scale();
@@ -538,75 +643,76 @@ fn find_banded<S: ScanOps>(
     let max_y = region.y + region.height - template_height;
 
     let position_count = u64::from(max_x - region.x + 1) * u64::from(max_y - region.y + 1);
-    if position_count <= DENSE_SCAN_LIMIT {
+    let states = if position_count <= DENSE_SCAN_LIMIT {
         // Small areas: dense single-threaded scan, no summed-area table.
-        let mut state = FastState::default();
+        let mut state = FastState::new(candidate_limit);
         for y in region.y..=max_y {
             for x in region.x..=max_x {
                 state.consider(scan, x, y, threshold, max_diff, pixel_count);
             }
         }
-        return state.report(template_width, template_height, pixel_count, channel_scale);
-    }
-
-    let grid_rows = (max_y - region.y) / PRESCAN_STRIDE + 1;
-    let bands = max_bands.clamp(1, (grid_rows as usize).min(MAX_FAST_BANDS));
-    let fast = FastScan {
-        scan,
-        threshold,
-        max_diff,
-        bound_max_diff,
-        pixel_count,
-        template_sum: scan.template_sum(),
-        region,
-        max_x,
-        max_y,
-    };
-    let band_range = |band: usize| -> (u32, u32) {
-        let k0 = grid_rows * band as u32 / bands as u32;
-        let k1 = grid_rows * (band as u32 + 1) / bands as u32;
-        (k0, k1)
-    };
-    let mut states = Vec::with_capacity(bands);
-    if bands == 1 {
-        let (k0, k1) = band_range(0);
-        states.push(scan_band(&fast, k0, k1));
+        vec![state]
     } else {
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(bands);
-            for band in 0..bands {
-                let (k0, k1) = band_range(band);
-                let fast = &fast;
-                handles.push(scope.spawn(move || scan_band(fast, k0, k1)));
-            }
-            for handle in handles {
-                if let Ok(state) = handle.join() {
-                    states.push(state);
+        let grid_rows = (max_y - region.y) / PRESCAN_STRIDE + 1;
+        let bands = max_bands.clamp(1, (grid_rows as usize).min(MAX_FAST_BANDS));
+        let fast = FastScan {
+            scan,
+            threshold,
+            max_diff,
+            bound_max_diff,
+            pixel_count,
+            template_sum: scan.template_sum(),
+            region,
+            max_x,
+            max_y,
+            candidate_limit,
+        };
+        let band_range = |band: usize| -> (u32, u32) {
+            let k0 = grid_rows * band as u32 / bands as u32;
+            let k1 = grid_rows * (band as u32 + 1) / bands as u32;
+            (k0, k1)
+        };
+        let mut states = Vec::with_capacity(bands);
+        if bands == 1 {
+            let (k0, k1) = band_range(0);
+            states.push(scan_band(&fast, k0, k1));
+        } else {
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(bands);
+                for band in 0..bands {
+                    let (k0, k1) = band_range(band);
+                    let fast = &fast;
+                    handles.push(scope.spawn(move || scan_band(fast, k0, k1)));
                 }
-            }
-        });
-    }
+                for handle in handles {
+                    if let Ok(state) = handle.join() {
+                        states.push(state);
+                    }
+                }
+            });
+        }
+        states
+    };
 
-    let mut best: Option<(u64, u32, u32)> = None;
-    let mut best_score = 0.0_f32;
+    let mut merged = FastState::new(candidate_limit);
     for state in states {
-        best_score = best_score.max(state.best_score);
-        if let Some(candidate) = state.best
-            && best.is_none_or(|current| candidate < current)
-        {
-            best = Some(candidate);
+        merged.best_score = merged.best_score.max(state.best_score);
+        for candidate in state.best {
+            merged.insert(candidate);
         }
     }
-    MatchReport {
-        matched: best.map(|(difference, y, x)| TemplateMatch {
+    let matches = merged
+        .best
+        .into_iter()
+        .map(|(difference, y, x)| TemplateMatch {
             x,
             y,
             width: template_width,
             height: template_height,
             score: 1.0 - difference as f32 / (pixel_count as f32 * channel_scale),
-        }),
-        best_score,
-    }
+        })
+        .collect();
+    (matches, merged.best_score)
 }
 
 /// RGB scan with significant-pixel weighting: only the template's
@@ -698,6 +804,12 @@ impl ScanOps for RgbWeightedScan<'_> {
     }
 
     fn bound_max_diff(&self, threshold: f32) -> u64 {
+        if self.weights.explicit_alpha_mask {
+            // Transparent pixels may contain arbitrary RGB values and are not
+            // scored, so an unmasked whole-window sum cannot safely reject a
+            // candidate selected by an explicit alpha mask.
+            return self.weights.pixel_count * self.channel_scale() as u64;
+        }
         let widened = (threshold - WEIGHTED_BOUND_MARGIN).max(0.5);
         ((1.0 - widened) * self.weights.pixel_count as f32 * self.channel_scale()) as u64
     }
@@ -715,10 +827,75 @@ impl ScanOps for RgbWeightedScan<'_> {
     }
 }
 
-/// Weighted RGB matching (the default recognition path): like
-/// `find_template_report_rgb`, but template background pixels carry no
-/// weight. A fully flat template (no significant pixels) degrades to the
-/// unweighted engine.
+/// Minimum accepted score for the hybrid matcher. Very low user thresholds
+/// are unsafe with normalized pixel differences because unrelated color data
+/// has a surprisingly high baseline.
+pub const MIN_HYBRID_THRESHOLD: f32 = 0.78;
+
+pub fn effective_threshold(algorithm: MatchAlgorithm, threshold: f32) -> f32 {
+    if algorithm == MatchAlgorithm::Hybrid {
+        threshold.max(MIN_HYBRID_THRESHOLD)
+    } else {
+        threshold
+    }
+}
+
+const HYBRID_CANDIDATE_MARGIN: f32 = 0.04;
+const HYBRID_STRUCTURE_WEIGHT: f32 = 0.65;
+const HYBRID_CANDIDATE_LIMIT: usize = 4;
+
+/// Lightweight two-stage matcher used by the runner and template tester.
+/// Weighted RGB SAD proposes candidates, then ZNCC verifies their structure.
+/// No FFT, model runtime or native library is required; each ZNCC check is
+/// allocation-free.
+pub fn find_template_report_rgb_hybrid(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    region: SearchRegion,
+    threshold: f32,
+) -> MatchReport {
+    let effective_threshold = effective_threshold(MatchAlgorithm::Hybrid, threshold);
+    let candidate_threshold = (effective_threshold - HYBRID_CANDIDATE_MARGIN).max(0.65);
+    let bands = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(MAX_FAST_BANDS);
+    let (candidates, scan_best_score) = find_precise_weighted_candidates_impl(
+        frame,
+        template,
+        weights,
+        region,
+        candidate_threshold,
+        bands,
+        HYBRID_CANDIDATE_LIMIT,
+    );
+    let mut best = None;
+    let mut best_hybrid_score = 0.0_f32;
+    for mut found in candidates {
+        let color_score = found.score;
+        let structural_score = structural_similarity_at(frame, template, weights, found.x, found.y);
+        let hybrid_score = structural_score.map_or(color_score, |score| {
+            color_score * (1.0 - HYBRID_STRUCTURE_WEIGHT) + score.max(0.0) * HYBRID_STRUCTURE_WEIGHT
+        });
+        found.score = hybrid_score;
+        if best.is_none_or(|current: TemplateMatch| {
+            hybrid_score > current.score
+                || (hybrid_score == current.score && (found.y, found.x) < (current.y, current.x))
+        }) {
+            best = Some(found);
+            best_hybrid_score = hybrid_score;
+        }
+    }
+    MatchReport {
+        matched: best.filter(|found| found.score >= effective_threshold),
+        best_score: best.map_or(scan_best_score, |_| best_hybrid_score),
+    }
+}
+
+/// Weighted RGB candidate matching: like `find_template_report_rgb`, but
+/// template background pixels carry no weight. A fully flat template (no
+/// significant pixels) degrades to the unweighted engine.
 pub fn find_template_report_rgb_weighted(
     frame: &RgbaImage,
     template: &RgbaImage,
@@ -756,6 +933,34 @@ fn find_precise_weighted_impl(
         weights,
     };
     find_banded(&scan, region, threshold, max_bands)
+}
+
+fn find_precise_weighted_candidates_impl(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    region: SearchRegion,
+    threshold: f32,
+    max_bands: usize,
+    candidate_limit: usize,
+) -> (Vec<TemplateMatch>, f32) {
+    let scan = RgbScan {
+        frame: frame.as_raw(),
+        frame_width: frame.width() as usize,
+        template: template.as_raw(),
+        template_width: template.width() as usize,
+        template_height: template.height() as usize,
+    };
+    if weights.significant_count == 0 {
+        return find_banded_candidates(&scan, region, threshold, max_bands, candidate_limit);
+    }
+    find_banded_candidates(
+        &RgbWeightedScan { scan, weights },
+        region,
+        threshold,
+        max_bands,
+        candidate_limit,
+    )
 }
 
 /// Raw-buffer view of RGBA frame and template (row-major, stride = 4·width);
@@ -923,6 +1128,7 @@ struct FastScan<'a, S: ScanOps> {
     region: SearchRegion,
     max_x: u32,
     max_y: u32,
+    candidate_limit: usize,
 }
 
 /// Processes pre-scan grid rows `[k0, k1)` plus their ±3 refinement
@@ -954,7 +1160,7 @@ fn scan_band<S: ScanOps>(fast: &FastScan<'_, S>, k0: u32, k1: u32) -> FastState 
             <= fast.bound_max_diff
     };
 
-    let mut state = FastState::default();
+    let mut state = FastState::new(fast.candidate_limit);
     let mut grid_y = grid_y0;
     while grid_y <= grid_y1 {
         let mut grid_x = fast.region.x;
@@ -1044,13 +1250,35 @@ fn build_sat_rgb(
 /// Band-local fast-scan result. `best` is ordered lexicographically by
 /// (difference, y, x), so band results merge deterministically regardless of
 /// evaluation order.
-#[derive(Default)]
 struct FastState {
-    best: Option<(u64, u32, u32)>,
+    best: Vec<(u64, u32, u32)>,
     best_score: f32,
+    candidate_limit: usize,
 }
 
 impl FastState {
+    fn new(candidate_limit: usize) -> Self {
+        Self {
+            best: Vec::with_capacity(candidate_limit),
+            best_score: 0.0,
+            candidate_limit,
+        }
+    }
+
+    fn insert(&mut self, candidate: (u64, u32, u32)) {
+        if let Some(index) = self.best.iter().position(|&(_, y, x)| {
+            y.abs_diff(candidate.1) <= PRESCAN_STRIDE && x.abs_diff(candidate.2) <= PRESCAN_STRIDE
+        }) {
+            if candidate >= self.best[index] {
+                return;
+            }
+            self.best.remove(index);
+        }
+        let position = self.best.binary_search(&candidate).unwrap_or_else(|at| at);
+        self.best.insert(position, candidate);
+        self.best.truncate(self.candidate_limit);
+    }
+
     /// Full-resolution evaluation of one candidate position: coarse rejection,
     /// then the exact difference when the position looks promising.
     fn consider<S: ScanOps>(
@@ -1070,39 +1298,21 @@ impl FastState {
         // Ties on difference must run to completion so the (y, x) tie-break
         // can pick the winner; abort only when the position can no longer tie
         // or win.
-        let abort_at = self
-            .best
-            .map(|(difference, _, _)| difference.saturating_add(1))
-            .unwrap_or(u64::MAX)
-            .min(max_diff.saturating_add(1));
+        let abort_at = if self.best.len() >= self.candidate_limit {
+            self.best
+                .last()
+                .map(|(difference, _, _)| difference.saturating_add(1))
+                .unwrap_or(u64::MAX)
+                .min(max_diff.saturating_add(1))
+        } else {
+            max_diff.saturating_add(1)
+        };
         let Some(difference) = scan.diff_at(x, y, abort_at) else {
             return;
         };
         let score = 1.0 - difference as f32 / (pixel_count as f32 * scan.channel_scale());
         self.best_score = self.best_score.max(score);
-        let candidate = (difference, y, x);
-        if self.best.is_none_or(|current| candidate < current) {
-            self.best = Some(candidate);
-        }
-    }
-
-    fn report(
-        self,
-        template_width: u32,
-        template_height: u32,
-        pixel_count: u64,
-        channel_scale: f32,
-    ) -> MatchReport {
-        MatchReport {
-            matched: self.best.map(|(difference, y, x)| TemplateMatch {
-                x,
-                y,
-                width: template_width,
-                height: template_height,
-                score: 1.0 - difference as f32 / (pixel_count as f32 * channel_scale),
-            }),
-            best_score: self.best_score,
-        }
+        self.insert((difference, y, x));
     }
 }
 
@@ -2156,6 +2366,132 @@ mod tests {
         assert!(!weights.is_mostly_background());
     }
 
+    #[test]
+    fn alpha_channel_supplies_an_explicit_mask() {
+        let mut template = RgbaImage::from_pixel(4, 4, Rgba([80, 90, 100, 0]));
+        template.put_pixel(1, 1, Rgba([240, 240, 240, 255]));
+        template.put_pixel(2, 2, Rgba([20, 20, 20, 128]));
+        let weights = TemplateWeights::analyze(&template);
+
+        assert!(weights.explicit_alpha_mask);
+        assert_eq!(weights.significant_indices, vec![5, 10]);
+        assert_eq!(weights.significant_count, 2);
+
+        let incidental_alpha = RgbaImage::from_pixel(4, 4, Rgba([80, 90, 100, 254]));
+        assert!(!TemplateWeights::analyze(&incidental_alpha).explicit_alpha_mask);
+    }
+
+    #[test]
+    fn hybrid_rejects_same_chrome_with_different_symbol() {
+        let mut template = RgbaImage::from_fn(32, 20, |x, _| {
+            let value = 70 + (x * 2) as u8;
+            Rgba([value, value + 10, value + 20, 255])
+        });
+        let mut impostor = template.clone();
+        for y in 4..16 {
+            for x in [9, 10, 20, 21] {
+                template.put_pixel(x, y, Rgba([240, 240, 240, 255]));
+            }
+        }
+        for y in [6, 7, 12, 13] {
+            for x in 6..26 {
+                impostor.put_pixel(x, y, Rgba([240, 240, 240, 255]));
+            }
+        }
+        let weights = TemplateWeights::analyze(&template);
+        let region = SearchRegion::full(&impostor);
+        let color_only = find_template_report_rgb_weighted(
+            &impostor,
+            &template,
+            &weights,
+            region,
+            MIN_HYBRID_THRESHOLD,
+        );
+        assert!(color_only.matched.is_some());
+
+        let hybrid = find_template_report_rgb_hybrid(
+            &impostor,
+            &template,
+            &weights,
+            region,
+            MIN_HYBRID_THRESHOLD,
+        );
+        assert!(hybrid.matched.is_none());
+    }
+
+    #[test]
+    fn hybrid_checks_multiple_candidates_instead_of_only_best_sad() {
+        let mut template = RgbaImage::from_fn(24, 20, |x, _| {
+            let value = 70 + (x * 2) as u8;
+            Rgba([value, value + 10, value + 20, 255])
+        });
+        for y in 4..16 {
+            for x in [7, 8, 15, 16] {
+                template.put_pixel(x, y, Rgba([210, 210, 210, 255]));
+            }
+        }
+        let mut impostor = template.clone();
+        for y in 4..16 {
+            for x in [7, 8, 15, 16] {
+                impostor.put_pixel(x, y, Rgba([100, 110, 120, 255]));
+            }
+        }
+        for y in [6, 7, 12, 13] {
+            for x in 5..19 {
+                impostor.put_pixel(x, y, Rgba([210, 210, 210, 255]));
+            }
+        }
+        let brighter = RgbaImage::from_fn(template.width(), template.height(), |x, y| {
+            let source = template.get_pixel(x, y);
+            Rgba([
+                source[0].saturating_add(35),
+                source[1].saturating_add(35),
+                source[2].saturating_add(35),
+                255,
+            ])
+        });
+        let mut frame = RgbaImage::from_pixel(72, 20, Rgba([20, 20, 20, 255]));
+        image::imageops::replace(&mut frame, &impostor, 0, 0);
+        image::imageops::replace(&mut frame, &brighter, 48, 0);
+        let weights = TemplateWeights::analyze(&template);
+        let region = SearchRegion::full(&frame);
+
+        let color_only =
+            find_template_report_rgb_weighted(&frame, &template, &weights, region, 0.78)
+                .matched
+                .expect("both button candidates should pass the color gate");
+        assert_eq!(color_only.x, 0, "the look-alike should win SAD alone");
+
+        let hybrid = find_template_report_rgb_hybrid(&frame, &template, &weights, region, 0.78)
+            .matched
+            .expect("hybrid matching should recover the structurally correct button");
+        assert_eq!(hybrid.x, 48);
+    }
+
+    #[test]
+    fn structural_similarity_normalizes_brightness_but_rejects_changed_shape() {
+        let template = RgbaImage::from_fn(8, 8, |x, y| {
+            let value = if x == y || x + y == 7 { 220 } else { 40 };
+            Rgba([value, value, value, 255])
+        });
+        let weights = TemplateWeights::analyze(&template);
+        let brighter = RgbaImage::from_fn(8, 8, |x, y| {
+            let value = if x == y || x + y == 7 { 250 } else { 90 };
+            Rgba([value, value, value, 255])
+        });
+        let changed = RgbaImage::from_fn(8, 8, |x, _| {
+            let value = if x < 4 { 220 } else { 40 };
+            Rgba([value, value, value, 255])
+        });
+
+        let same_shape = structural_similarity_at(&brighter, &template, &weights, 0, 0)
+            .expect("structured templates should have a correlation score");
+        let changed_shape = structural_similarity_at(&changed, &template, &weights, 0, 0)
+            .expect("structured templates should have a correlation score");
+        assert!(same_shape > 0.99);
+        assert!(changed_shape < 0.5);
+    }
+
     /// The selling point of weighting: a large flat template background plus
     /// a small text block. Region A is pure background (unweighted matching
     /// accepts it — the classic misclick); region B has a slightly different
@@ -2385,6 +2721,30 @@ mod tests {
                  weighted {MAX_FAST_BANDS}-thread {weighted_multi_elapsed:?}"
             );
             assert_eq!(weighted_single.matched, weighted_multi.matched);
+
+            let mut matched_frame = real_frame.clone();
+            let match_x = width / 2;
+            let match_y = height / 2;
+            image::imageops::replace(
+                &mut matched_frame,
+                &real_template,
+                i64::from(match_x),
+                i64::from(match_y),
+            );
+            let started = std::time::Instant::now();
+            let hybrid = find_template_report_rgb_hybrid(
+                &matched_frame,
+                &real_template,
+                &real_weights,
+                region,
+                0.90,
+            );
+            let hybrid_elapsed = started.elapsed();
+            eprintln!("{width}×{height} exact-match scan: hybrid {hybrid_elapsed:?}");
+            assert_eq!(
+                hybrid.matched.map(|found| (found.x, found.y)),
+                Some((match_x, match_y))
+            );
 
             // Mostly-flat template (2% significant pixels), the weighted
             // engine's home turf.
