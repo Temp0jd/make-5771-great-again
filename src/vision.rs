@@ -843,11 +843,52 @@ pub fn effective_threshold(algorithm: MatchAlgorithm, threshold: f32) -> f32 {
 const HYBRID_CANDIDATE_MARGIN: f32 = 0.04;
 const HYBRID_STRUCTURE_WEIGHT: f32 = 0.65;
 const HYBRID_CANDIDATE_LIMIT: usize = 4;
+const HYBRID_FAST_PATH_STRUCTURE: f32 = 0.985;
 
-/// Lightweight two-stage matcher used by the runner and template tester.
-/// Weighted RGB SAD proposes candidates, then ZNCC verifies their structure.
-/// No FFT, model runtime or native library is required; each ZNCC check is
-/// allocation-free.
+#[cfg(test)]
+fn available_scan_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(MAX_FAST_BANDS)
+}
+
+fn score_hybrid_candidate(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    mut found: TemplateMatch,
+) -> (TemplateMatch, Option<f32>) {
+    let color_score = found.score;
+    let structural_score = structural_similarity_at(frame, template, weights, found.x, found.y);
+    found.score = structural_score.map_or(color_score, |score| {
+        color_score * (1.0 - HYBRID_STRUCTURE_WEIGHT) + score.max(0.0) * HYBRID_STRUCTURE_WEIGHT
+    });
+    (found, structural_score)
+}
+
+fn best_hybrid_candidate(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    candidates: Vec<TemplateMatch>,
+) -> Option<TemplateMatch> {
+    candidates
+        .into_iter()
+        .map(|found| score_hybrid_candidate(frame, template, weights, found).0)
+        .max_by(|left, right| {
+            left.score.total_cmp(&right.score).then_with(|| {
+                // Reverse coordinates so max_by keeps the top-left candidate
+                // when scores tie.
+                (right.y, right.x).cmp(&(left.y, left.x))
+            })
+        })
+}
+
+/// Thorough lightweight matcher used for verification and template testing.
+/// It ranks up to four RGB SAD candidates and verifies their structure without
+/// FFT, model runtimes, native libraries or per-candidate allocations.
+#[cfg(test)]
 pub fn find_template_report_rgb_hybrid(
     frame: &RgbaImage,
     template: &RgbaImage,
@@ -855,47 +896,104 @@ pub fn find_template_report_rgb_hybrid(
     region: SearchRegion,
     threshold: f32,
 ) -> MatchReport {
+    find_template_report_rgb_hybrid_with_bands(
+        frame,
+        template,
+        weights,
+        region,
+        threshold,
+        available_scan_threads(),
+    )
+}
+
+pub fn find_template_report_rgb_hybrid_with_bands(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    region: SearchRegion,
+    threshold: f32,
+    max_bands: usize,
+) -> MatchReport {
     let effective_threshold = effective_threshold(MatchAlgorithm::Hybrid, threshold);
     let candidate_threshold = (effective_threshold - HYBRID_CANDIDATE_MARGIN).max(0.65);
-    let bands = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .min(MAX_FAST_BANDS);
-    let (candidates, scan_best_score) = find_precise_weighted_candidates_impl(
+    let max_bands = max_bands.clamp(1, MAX_FAST_BANDS);
+
+    // The thorough path performs one Top-4 scan. The runner invokes it only
+    // for small tracked/ROI regions, periodic recovery, visual conditions or
+    // exhaustive branch confirmation, avoiding a duplicate full-screen pass.
+    let (candidates, scan_best) = find_precise_weighted_candidates_impl(
         frame,
         template,
         weights,
         region,
         candidate_threshold,
-        bands,
+        max_bands,
         HYBRID_CANDIDATE_LIMIT,
     );
-    let mut best = None;
-    let mut best_hybrid_score = 0.0_f32;
-    for mut found in candidates {
-        let color_score = found.score;
-        let structural_score = structural_similarity_at(frame, template, weights, found.x, found.y);
-        let hybrid_score = structural_score.map_or(color_score, |score| {
-            color_score * (1.0 - HYBRID_STRUCTURE_WEIGHT) + score.max(0.0) * HYBRID_STRUCTURE_WEIGHT
-        });
-        found.score = hybrid_score;
-        if best.is_none_or(|current: TemplateMatch| {
-            hybrid_score > current.score
-                || (hybrid_score == current.score && (found.y, found.x) < (current.y, current.x))
-        }) {
-            best = Some(found);
-            best_hybrid_score = hybrid_score;
-        }
-    }
+    let best = best_hybrid_candidate(frame, template, weights, candidates);
     MatchReport {
         matched: best.filter(|found| found.score >= effective_threshold),
-        best_score: best.map_or(scan_best_score, |_| best_hybrid_score),
+        best_score: best.map_or(scan_best, |found| found.score),
+    }
+}
+
+/// Cheap discovery pass for large regions. It only returns a match when the
+/// best RGB candidate also has near-exact structure; uncertain screens are
+/// deliberately deferred to the periodic thorough pass.
+pub fn find_template_report_rgb_hybrid_fast_with_bands(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    region: SearchRegion,
+    threshold: f32,
+    max_bands: usize,
+) -> MatchReport {
+    hybrid_fast_pass(
+        frame,
+        template,
+        weights,
+        region,
+        effective_threshold(MatchAlgorithm::Hybrid, threshold),
+        max_bands.clamp(1, MAX_FAST_BANDS),
+    )
+}
+
+fn hybrid_fast_pass(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    region: SearchRegion,
+    effective_threshold: f32,
+    max_bands: usize,
+) -> MatchReport {
+    let (first_candidates, scan_best) = find_precise_weighted_candidates_impl(
+        frame,
+        template,
+        weights,
+        region,
+        effective_threshold,
+        max_bands,
+        1,
+    );
+    let Some(first) = first_candidates.into_iter().next() else {
+        return MatchReport {
+            matched: None,
+            best_score: scan_best,
+        };
+    };
+    let (first, structure) = score_hybrid_candidate(frame, template, weights, first);
+    let trusted = first.score >= effective_threshold
+        && structure.is_some_and(|score| score >= HYBRID_FAST_PATH_STRUCTURE);
+    MatchReport {
+        matched: trusted.then_some(first),
+        best_score: first.score,
     }
 }
 
 /// Weighted RGB candidate matching: like `find_template_report_rgb`, but
 /// template background pixels carry no weight. A fully flat template (no
 /// significant pixels) degrades to the unweighted engine.
+#[cfg(test)]
 pub fn find_template_report_rgb_weighted(
     frame: &RgbaImage,
     template: &RgbaImage,
@@ -903,11 +1001,32 @@ pub fn find_template_report_rgb_weighted(
     region: SearchRegion,
     threshold: f32,
 ) -> MatchReport {
-    let bands = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .min(MAX_FAST_BANDS);
-    find_precise_weighted_impl(frame, template, weights, region, threshold, bands)
+    find_template_report_rgb_weighted_with_bands(
+        frame,
+        template,
+        weights,
+        region,
+        threshold,
+        available_scan_threads(),
+    )
+}
+
+pub fn find_template_report_rgb_weighted_with_bands(
+    frame: &RgbaImage,
+    template: &RgbaImage,
+    weights: &TemplateWeights,
+    region: SearchRegion,
+    threshold: f32,
+    max_bands: usize,
+) -> MatchReport {
+    find_precise_weighted_impl(
+        frame,
+        template,
+        weights,
+        region,
+        threshold,
+        max_bands.clamp(1, MAX_FAST_BANDS),
+    )
 }
 
 fn find_precise_weighted_impl(
@@ -2469,6 +2588,28 @@ mod tests {
     }
 
     #[test]
+    fn thorough_hybrid_recovers_low_variance_template_rejected_by_fast_discovery() {
+        let template = RgbaImage::from_pixel(12, 8, Rgba([80, 120, 180, 255]));
+        let weights = TemplateWeights::analyze(&template);
+        assert!(weights.significant_count < 8);
+        let mut frame = RgbaImage::from_pixel(40, 20, Rgba([10, 20, 30, 255]));
+        image::imageops::replace(&mut frame, &template, 17, 6);
+        let region = SearchRegion::full(&frame);
+
+        let fast = find_template_report_rgb_hybrid_fast_with_bands(
+            &frame, &template, &weights, region, 0.90, 2,
+        );
+        assert!(fast.matched.is_none());
+
+        let thorough = find_template_report_rgb_hybrid_with_bands(
+            &frame, &template, &weights, region, 0.90, 2,
+        )
+        .matched
+        .expect("thorough RGB fallback must retain low-variance template compatibility");
+        assert_eq!((thorough.x, thorough.y), (17, 6));
+    }
+
+    #[test]
     fn structural_similarity_normalizes_brightness_but_rejects_changed_shape() {
         let template = RgbaImage::from_fn(8, 8, |x, y| {
             let value = if x == y || x + y == 7 { 220 } else { 40 };
@@ -2731,20 +2872,65 @@ mod tests {
                 i64::from(match_x),
                 i64::from(match_y),
             );
-            let started = std::time::Instant::now();
-            let hybrid = find_template_report_rgb_hybrid(
+            for bands in [2, 4, 8] {
+                let started = std::time::Instant::now();
+                let hybrid_fast = find_template_report_rgb_hybrid_fast_with_bands(
+                    &matched_frame,
+                    &real_template,
+                    &real_weights,
+                    region,
+                    0.90,
+                    bands,
+                );
+                let hybrid_fast_elapsed = started.elapsed();
+                eprintln!(
+                    "{width}×{height} exact-match scan: hybrid-fast {bands}-thread \
+                     {hybrid_fast_elapsed:?}"
+                );
+                assert_eq!(
+                    hybrid_fast.matched.map(|found| (found.x, found.y)),
+                    Some((match_x, match_y))
+                );
+            }
+            let hybrid_thorough = find_template_report_rgb_hybrid_with_bands(
                 &matched_frame,
                 &real_template,
                 &real_weights,
                 region,
                 0.90,
+                4,
             );
-            let hybrid_elapsed = started.elapsed();
-            eprintln!("{width}×{height} exact-match scan: hybrid {hybrid_elapsed:?}");
             assert_eq!(
-                hybrid.matched.map(|found| (found.x, found.y)),
+                hybrid_thorough.matched.map(|found| (found.x, found.y)),
                 Some((match_x, match_y))
             );
+
+            let started = std::time::Instant::now();
+            let hybrid_fast_miss = find_template_report_rgb_hybrid_fast_with_bands(
+                &real_frame,
+                &real_template,
+                &real_weights,
+                region,
+                0.90,
+                4,
+            );
+            let hybrid_fast_miss_elapsed = started.elapsed();
+            let started = std::time::Instant::now();
+            let hybrid_thorough_miss = find_template_report_rgb_hybrid_with_bands(
+                &real_frame,
+                &real_template,
+                &real_weights,
+                region,
+                0.90,
+                4,
+            );
+            let hybrid_thorough_miss_elapsed = started.elapsed();
+            eprintln!(
+                "{width}×{height} no-match scan: hybrid-fast 4-thread \
+                 {hybrid_fast_miss_elapsed:?}, thorough {hybrid_thorough_miss_elapsed:?}"
+            );
+            assert!(hybrid_fast_miss.matched.is_none());
+            assert!(hybrid_thorough_miss.matched.is_none());
 
             // Mostly-flat template (2% significant pixels), the weighted
             // engine's home turf.

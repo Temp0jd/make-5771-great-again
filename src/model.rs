@@ -56,6 +56,73 @@ impl ClickMethod {
     }
 }
 
+/// CPU/latency trade-off for recognition. All modes use the same acceptance
+/// checks; only scan concurrency, cadence and discovery work per poll differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RecognitionPerformance {
+    Eco,
+    #[default]
+    Balanced,
+    Responsive,
+}
+
+impl RecognitionPerformance {
+    pub const ALL: [Self; 3] = [Self::Eco, Self::Balanced, Self::Responsive];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Eco => "低占用（2 线程）",
+            Self::Balanced => "均衡（4 线程，推荐）",
+            Self::Responsive => "极速（最多 8 线程）",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Eco => "降低 CPU 峰值；无目标时约每 550 ms 检查一次",
+            Self::Balanced => "兼顾响应与占用；无目标时约每 350 ms 检查一次",
+            Self::Responsive => "响应最快，但会明显提高 CPU 瞬时占用",
+        }
+    }
+
+    pub fn max_threads(self) -> usize {
+        let configured_limit = match self {
+            Self::Eco => 2,
+            Self::Balanced => 4,
+            Self::Responsive => 8,
+        };
+        static AVAILABLE_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let available = *AVAILABLE_THREADS
+            .get_or_init(|| std::thread::available_parallelism().map_or(1, |count| count.get()));
+        available.min(configured_limit)
+    }
+
+    pub fn poll_interval_ms(self) -> u64 {
+        match self {
+            Self::Eco => 550,
+            Self::Balanced => 350,
+            Self::Responsive => 250,
+        }
+    }
+
+    pub fn branch_scan_budget(self, branch_count: usize) -> usize {
+        match self {
+            Self::Eco => 1,
+            Self::Balanced => 2,
+            Self::Responsive => branch_count,
+        }
+        .min(branch_count)
+    }
+
+    pub fn roi_recovery_checks(self) -> u8 {
+        match self {
+            Self::Eco => 3,
+            Self::Balanced => 2,
+            Self::Responsive => 1,
+        }
+    }
+}
+
 fn default_click_jitter() -> bool {
     true
 }
@@ -726,6 +793,12 @@ pub struct MacroProfile {
     /// `Hybrid` so old threshold calibration is never changed silently.
     #[serde(default)]
     pub match_algorithm: MatchAlgorithm,
+    #[serde(default)]
+    pub recognition_performance: RecognitionPerformance,
+    /// When enabled, a configured ROI is treated as a fast hint and bounded
+    /// misses trigger a full-screen recovery. Missing legacy fields stay false.
+    #[serde(default)]
+    pub adaptive_roi: bool,
     #[serde(default = "default_stable_confirm")]
     pub stable_confirm: bool,
     #[serde(default)]
@@ -779,6 +852,8 @@ impl Default for MacroProfile {
             stop_hotkey: default_stop_hotkey(),
             shared_templates: false,
             match_algorithm: MatchAlgorithm::Hybrid,
+            recognition_performance: RecognitionPerformance::default(),
+            adaptive_roi: true,
             stable_confirm: default_stable_confirm(),
             sharing: SharingMetadata::default(),
         }
@@ -965,6 +1040,24 @@ mod tests {
         let profile = MacroProfile::default();
         assert!(profile.validate().is_ok());
         assert_eq!(profile.match_algorithm, MatchAlgorithm::Hybrid);
+        assert_eq!(
+            profile.recognition_performance,
+            RecognitionPerformance::Balanced
+        );
+        assert!(profile.adaptive_roi);
+    }
+
+    #[test]
+    fn recognition_performance_bounds_work_and_latency() {
+        assert!((1..=2).contains(&RecognitionPerformance::Eco.max_threads()));
+        assert!((1..=4).contains(&RecognitionPerformance::Balanced.max_threads()));
+        assert!((1..=8).contains(&RecognitionPerformance::Responsive.max_threads()));
+        assert_eq!(RecognitionPerformance::Balanced.branch_scan_budget(5), 2);
+        assert_eq!(RecognitionPerformance::Responsive.branch_scan_budget(5), 5);
+        assert!(
+            RecognitionPerformance::Eco.poll_interval_ms()
+                > RecognitionPerformance::Responsive.poll_interval_ms()
+        );
     }
 
     #[test]
@@ -1193,12 +1286,19 @@ mod tests {
         object.remove("stop_hotkey");
         object.remove("shared_templates");
         object.remove("match_algorithm");
+        object.remove("recognition_performance");
+        object.remove("adaptive_roi");
         object.remove("stable_confirm");
         let profile: MacroProfile = serde_json::from_value(value).unwrap();
         assert_eq!(profile.capture_hotkey, "f6");
         assert_eq!(profile.stop_hotkey, "f8");
         assert!(!profile.shared_templates);
         assert_eq!(profile.match_algorithm, MatchAlgorithm::Precise);
+        assert_eq!(
+            profile.recognition_performance,
+            RecognitionPerformance::Balanced
+        );
+        assert!(!profile.adaptive_roi);
         assert!(profile.stable_confirm);
     }
 

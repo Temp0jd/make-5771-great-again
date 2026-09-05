@@ -387,6 +387,7 @@ fn load_templates(
                 image_rgb,
                 weights,
                 last_match: Cell::new(None),
+                recovery_misses: Cell::new(0),
             },
         );
     }
@@ -401,6 +402,9 @@ struct LoadedTemplate {
     /// Last match position in client coordinates; used to try a small
     /// neighborhood before paying for a full-region scan.
     last_match: Cell<Option<(u32, u32)>>,
+    /// Consecutive local/configured-region misses since the last full-screen
+    /// recovery scan.
+    recovery_misses: Cell<u8>,
 }
 
 /// Small deterministic PRNG (xorshift64) for click humanization.
@@ -470,7 +474,17 @@ impl StepContext<'_> {
     fn clear_match_cache(&self) {
         for template in self.templates.values() {
             template.last_match.set(None);
+            template.recovery_misses.set(0);
         }
+    }
+
+    fn recognition_wait(&self, candidate_near: bool) -> Result<(), String> {
+        let millis = if candidate_near {
+            180
+        } else {
+            self.profile.recognition_performance.poll_interval_ms()
+        };
+        interruptible_wait(Duration::from_millis(millis), self.stop)
     }
 
     /// Clicks client coordinates, applying optional humanization and the
@@ -595,6 +609,10 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
             template,
             step.threshold,
             algorithm,
+            ctx.profile.recognition_performance.max_threads(),
+            ctx.profile.recognition_performance.roi_recovery_checks(),
+            ctx.profile.adaptive_roi,
+            false,
         );
         best_seen = best_seen.max(report.best_score);
         if let Some(found) = report.matched {
@@ -602,7 +620,7 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
                 let position = (found.x, found.y);
                 if !pending_confirm.is_some_and(|pending| same_target(pending, position)) {
                     pending_confirm = Some(position);
-                    interruptible_wait(Duration::from_millis(300), ctx.stop)?;
+                    ctx.recognition_wait(true)?;
                     continue;
                 }
             }
@@ -620,7 +638,7 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
             return ctx.wait(step.delay_ms);
         }
         pending_confirm = None;
-        interruptible_wait(Duration::from_millis(300), ctx.stop)?;
+        ctx.recognition_wait(false)?;
     }
     Err(format!(
         "步骤“{}”在 {} 秒内未找到目标（最佳相似度 {:.2}，阈值 {:.2}）",
@@ -742,6 +760,10 @@ fn branch_scores_are_ambiguous(best: f32, second: f32) -> bool {
     best - second < BRANCH_AMBIGUITY_MARGIN
 }
 
+fn branch_in_scan_window(index: usize, cursor: usize, budget: usize, branch_count: usize) -> bool {
+    branch_count > 0 && (index + branch_count - cursor % branch_count) % branch_count < budget
+}
+
 fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepControl, String> {
     // This is a total step budget. RepeatWait activity must not reset it or a
     // persistent false positive can keep the runner alive forever.
@@ -749,8 +771,10 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
     let mut state = WaitState::default();
     let mut best_seen = (0.0_f32, String::new());
     let mut latches: HashMap<u64, BranchLatch> = HashMap::new();
-    // (branch id, match position) awaiting double confirmation.
+    // (branch id, match position) awaiting an exhaustive comparison and,
+    // when enabled, double confirmation.
     let mut pending_confirm: Option<(u64, u32, u32)> = None;
+    let mut scan_cursor = 0_usize;
 
     loop {
         if !ctx.poll_gate(&mut state, &mut timeout_at)? {
@@ -774,11 +798,18 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
         let algorithm = ctx.profile.match_algorithm;
         let frame_gray = needs_gray_frame(algorithm).then(|| image::imageops::grayscale(&frame));
 
-        // Evaluate every branch. Configuration order is only a deterministic
-        // tie-break; it no longer lets the first weak match beat a later,
-        // stronger one.
+        // Discovery scans are staggered in Eco/Balanced mode so several absent
+        // templates do not all consume a full-screen scan on the same frame.
+        // Once any candidate appears, the next frame scans every branch before
+        // authorizing an action, preserving ambiguity protection.
+        let branch_count = step.branches.len();
+        let scan_budget = ctx
+            .profile
+            .recognition_performance
+            .branch_scan_budget(branch_count);
+        let exhaustive = pending_confirm.is_some() || scan_budget >= branch_count;
         let mut candidates = Vec::new();
-        for branch in &step.branches {
+        for (branch_index, branch) in step.branches.iter().enumerate() {
             let path = branch
                 .trigger_template
                 .as_ref()
@@ -787,6 +818,11 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
                 .templates
                 .get(path)
                 .ok_or_else(|| format!("分支“{}”的触发模板未加载", branch.name))?;
+            let in_discovery_window =
+                branch_in_scan_window(branch_index, scan_cursor, scan_budget, branch_count);
+            if !exhaustive && template.last_match.get().is_none() && !in_discovery_window {
+                continue;
+            }
             let report = find_loaded_template(
                 &frame,
                 frame_gray.as_ref(),
@@ -795,6 +831,10 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
                 template,
                 branch.threshold,
                 algorithm,
+                ctx.profile.recognition_performance.max_threads(),
+                ctx.profile.recognition_performance.roi_recovery_checks(),
+                ctx.profile.adaptive_roi,
+                true,
             );
             if report.best_score > best_seen.0 {
                 best_seen = (report.best_score, branch.name.clone());
@@ -820,6 +860,10 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
             }
         }
 
+        if !exhaustive && branch_count > 0 {
+            scan_cursor = (scan_cursor + scan_budget.max(1)) % branch_count;
+        }
+
         candidates.sort_by(
             |(left_branch, _, _, left_confidence), (right_branch, _, _, right_confidence)| {
                 right_confidence
@@ -830,22 +874,32 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
         let ambiguous =
             candidates.len() > 1 && branch_scores_are_ambiguous(candidates[0].3, candidates[1].3);
         if ambiguous || candidates.is_empty() || candidates[0].2 {
+            let candidate_near = !candidates.is_empty();
             pending_confirm = None;
-            interruptible_wait(Duration::from_millis(300), ctx.stop)?;
+            ctx.recognition_wait(candidate_near)?;
             continue;
         }
         let (branch, found, _, _) = candidates[0];
+        let position = (branch.id, found.x, found.y);
+
+        // A throttled discovery result must first survive a frame where every
+        // branch is evaluated. This applies even when optional stable-confirm
+        // is disabled, because ranking a partial branch set is unsafe.
+        if !exhaustive {
+            pending_confirm = Some(position);
+            ctx.recognition_wait(true)?;
+            continue;
+        }
 
         // State-changing and non-clicking branches both require stable visual
         // evidence; otherwise a one-frame artifact can redirect control flow.
         if ctx.profile.stable_confirm {
-            let position = (branch.id, found.x, found.y);
             let confirmed = pending_confirm.is_some_and(|(id, px, py)| {
                 id == branch.id && same_target((px, py), (found.x, found.y))
             });
             if !confirmed {
                 pending_confirm = Some(position);
-                interruptible_wait(Duration::from_millis(300), ctx.stop)?;
+                ctx.recognition_wait(true)?;
                 continue;
             }
         }
@@ -938,6 +992,10 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
                 template,
                 term.threshold,
                 algorithm,
+                ctx.profile.recognition_performance.max_threads(),
+                ctx.profile.recognition_performance.roi_recovery_checks(),
+                ctx.profile.adaptive_roi,
+                true,
             );
             if report.best_score > best_seen.0 {
                 best_seen = (report.best_score, term.name.clone());
@@ -967,7 +1025,7 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
             stable_hits = 0;
         }
         if stable_hits < spec.stable_checks {
-            interruptible_wait(Duration::from_millis(300), ctx.stop)?;
+            ctx.recognition_wait(stable_hits > 0)?;
             continue;
         }
 
@@ -1074,8 +1132,13 @@ fn find_loaded_template(
     template: &LoadedTemplate,
     threshold: f32,
     algorithm: MatchAlgorithm,
+    max_threads: usize,
+    recovery_checks: u8,
+    adaptive_roi: bool,
+    force_thorough: bool,
 ) -> vision::MatchReport {
-    let base_region = template
+    let full_region = SearchRegion::full(frame);
+    let configured_region = template
         .asset
         .search_region
         .filter(|_| {
@@ -1087,25 +1150,37 @@ fn find_loaded_template(
             y: region.y,
             width: region.width,
             height: region.height,
-        })
-        .unwrap_or_else(|| SearchRegion::full(frame));
+        });
+    let base_region = configured_region.unwrap_or(full_region);
 
     let effective_threshold = vision::effective_threshold(algorithm, threshold);
-    let run_match = |region: SearchRegion| -> vision::MatchReport {
+    let run_match = |region: SearchRegion, thorough: bool| -> vision::MatchReport {
         match algorithm {
-            MatchAlgorithm::Hybrid => vision::find_template_report_rgb_hybrid(
+            MatchAlgorithm::Hybrid if !thorough => {
+                vision::find_template_report_rgb_hybrid_fast_with_bands(
+                    frame,
+                    &template.image_rgb,
+                    &template.weights,
+                    region,
+                    effective_threshold,
+                    max_threads,
+                )
+            }
+            MatchAlgorithm::Hybrid => vision::find_template_report_rgb_hybrid_with_bands(
                 frame,
                 &template.image_rgb,
                 &template.weights,
                 region,
                 effective_threshold,
+                max_threads,
             ),
-            MatchAlgorithm::Precise => vision::find_template_report_rgb_weighted(
+            MatchAlgorithm::Precise => vision::find_template_report_rgb_weighted_with_bands(
                 frame,
                 &template.image_rgb,
                 &template.weights,
                 region,
                 effective_threshold,
+                max_threads,
             ),
             gray_algorithm => vision::find_template_report(
                 frame_gray.expect("灰度匹配路径必须提供灰度图"),
@@ -1117,44 +1192,100 @@ fn find_loaded_template(
         }
     };
 
+    let recovery_checks = recovery_checks.max(1);
+    let mut local_report = None;
+    let tracking_base = if adaptive_roi {
+        full_region
+    } else {
+        base_region
+    };
     if let Some((last_x, last_y)) = template.last_match.get()
         && let Some(tracked) = tracking_region(
-            base_region,
+            tracking_base,
             last_x,
             last_y,
             template.image.width(),
             template.image.height(),
         )
     {
-        let tracked_report = run_match(tracked);
-        if let Some(found) = tracked_report.matched {
+        let report = run_match(tracked, true);
+        if let Some(found) = report.matched {
             // A marginal local hit must compete with the full search instead
             // of permanently pinning recognition to an old false location.
             let strong_threshold = (effective_threshold + 0.04).clamp(0.94, 0.98);
             if found.score >= strong_threshold {
                 template.last_match.set(Some((found.x, found.y)));
-                return tracked_report;
+                template.recovery_misses.set(0);
+                return report;
             }
-            let full_report = run_match(base_region);
-            let report = if full_report
-                .matched
-                .is_some_and(|global| global.score > found.score)
-            {
-                full_report
-            } else {
-                tracked_report
-            };
+            let global_report = run_match(tracking_base, true);
+            let report = better_match_report(report, global_report);
             template
                 .last_match
                 .set(report.matched.map(|matched| (matched.x, matched.y)));
+            template.recovery_misses.set(0);
             return report;
         }
+        local_report = Some(report);
     }
-    let report = run_match(base_region);
+
+    let misses = template.recovery_misses.get().saturating_add(1);
+    template.recovery_misses.set(misses);
+
+    // Without an explicit ROI, a remembered target gets cheap local checks on
+    // most polls and a full-screen recovery scan periodically. A never-seen
+    // target is still searched immediately.
+    if !force_thorough
+        && configured_region.is_none()
+        && template.last_match.get().is_some()
+        && misses < recovery_checks
+    {
+        return local_report.unwrap_or(vision::MatchReport {
+            matched: None,
+            best_score: 0.0,
+        });
+    }
+
+    let thorough = force_thorough || configured_region.is_some() || misses >= recovery_checks;
+    let base_report = run_match(base_region, thorough);
+    let base_report =
+        local_report.map_or(base_report, |local| better_match_report(local, base_report));
+    if base_report.matched.is_some() || configured_region.is_none() {
+        template
+            .last_match
+            .set(base_report.matched.map(|found| (found.x, found.y)));
+        if base_report.matched.is_some() || thorough {
+            template.recovery_misses.set(0);
+        }
+        return base_report;
+    }
+
+    // Legacy workflows keep ROI as a hard spatial safety boundary. New
+    // profiles may explicitly opt into bounded full-screen recovery.
+    if !adaptive_roi || misses < recovery_checks {
+        return base_report;
+    }
+    let report = better_match_report(base_report, run_match(full_region, true));
     template
         .last_match
         .set(report.matched.map(|found| (found.x, found.y)));
+    template.recovery_misses.set(0);
     report
+}
+
+fn better_match_report(
+    left: vision::MatchReport,
+    right: vision::MatchReport,
+) -> vision::MatchReport {
+    let matched = match (left.matched, right.matched) {
+        (Some(left), Some(right)) if right.score > left.score => Some(right),
+        (Some(left), _) => Some(left),
+        (None, right) => right,
+    };
+    vision::MatchReport {
+        matched,
+        best_score: left.best_score.max(right.best_score),
+    }
 }
 
 /// Extra pixels scanned around the last known match position before falling
@@ -1446,6 +1577,155 @@ mod tests {
         assert_eq!(latch.absent_checks, 0);
         assert_eq!(observe_branch_latch(&mut latch, false, now), (false, false));
         assert_eq!(observe_branch_latch(&mut latch, false, now), (true, false));
+    }
+
+    #[test]
+    fn branch_discovery_window_rotates_and_wraps() {
+        let first: Vec<_> = (0..5)
+            .filter(|&index| branch_in_scan_window(index, 0, 2, 5))
+            .collect();
+        let wrapped: Vec<_> = (0..5)
+            .filter(|&index| branch_in_scan_window(index, 4, 2, 5))
+            .collect();
+        assert_eq!(first, vec![0, 1]);
+        assert_eq!(wrapped, vec![0, 4]);
+    }
+
+    #[test]
+    fn forced_thorough_discovery_recognizes_low_variance_template() {
+        let template_rgb = image::RgbaImage::from_pixel(12, 8, image::Rgba([80, 120, 180, 255]));
+        let mut frame = image::RgbaImage::from_pixel(40, 20, image::Rgba([10, 20, 30, 255]));
+        image::imageops::replace(&mut frame, &template_rgb, 17, 6);
+        let loaded = LoadedTemplate {
+            asset: TemplateAsset {
+                id: 1,
+                name: "flat".into(),
+                path: "flat.png".into(),
+                width: 12,
+                height: 8,
+                reference_width: 40,
+                reference_height: 20,
+                search_region: None,
+            },
+            image: image::imageops::grayscale(&template_rgb),
+            weights: vision::TemplateWeights::analyze(&template_rgb),
+            image_rgb: template_rgb,
+            last_match: Cell::new(None),
+            recovery_misses: Cell::new(0),
+        };
+
+        let fast = find_loaded_template(
+            &frame,
+            None,
+            40,
+            20,
+            &loaded,
+            0.90,
+            MatchAlgorithm::Hybrid,
+            2,
+            3,
+            false,
+            false,
+        );
+        assert!(fast.matched.is_none());
+        let thorough = find_loaded_template(
+            &frame,
+            None,
+            40,
+            20,
+            &loaded,
+            0.90,
+            MatchAlgorithm::Hybrid,
+            2,
+            3,
+            false,
+            true,
+        )
+        .matched
+        .expect("WaitAny's forced thorough discovery must accept RGB-only templates");
+        assert_eq!((thorough.x, thorough.y), (17, 6));
+    }
+
+    #[test]
+    fn configured_roi_falls_back_to_full_screen_after_bounded_misses() {
+        let template_rgb = image::RgbaImage::from_fn(8, 8, |x, y| {
+            let value = 30 + (x * 17 + y * 9) as u8;
+            image::Rgba([value, 255 - value, value / 2, 255])
+        });
+        let mut frame = image::RgbaImage::from_pixel(80, 40, image::Rgba([5, 5, 5, 255]));
+        image::imageops::replace(&mut frame, &template_rgb, 60, 20);
+        let loaded = LoadedTemplate {
+            asset: TemplateAsset {
+                id: 1,
+                name: "moving target".to_owned(),
+                path: "moving.png".to_owned(),
+                width: 8,
+                height: 8,
+                reference_width: 80,
+                reference_height: 40,
+                search_region: Some(crate::model::SearchRegionSpec {
+                    x: 0,
+                    y: 0,
+                    width: 30,
+                    height: 40,
+                }),
+            },
+            image: image::imageops::grayscale(&template_rgb),
+            weights: vision::TemplateWeights::analyze(&template_rgb),
+            image_rgb: template_rgb,
+            last_match: Cell::new(None),
+            recovery_misses: Cell::new(0),
+        };
+
+        let first = find_loaded_template(
+            &frame,
+            None,
+            80,
+            40,
+            &loaded,
+            0.90,
+            MatchAlgorithm::Hybrid,
+            2,
+            2,
+            true,
+            false,
+        );
+        assert!(first.matched.is_none(), "first poll should stay inside ROI");
+        let recovered = find_loaded_template(
+            &frame,
+            None,
+            80,
+            40,
+            &loaded,
+            0.90,
+            MatchAlgorithm::Hybrid,
+            2,
+            2,
+            true,
+            false,
+        )
+        .matched
+        .expect("second miss should recover on the full screen");
+        assert_eq!((recovered.x, recovered.y), (60, 20));
+
+        loaded.last_match.set(None);
+        loaded.recovery_misses.set(0);
+        for _ in 0..3 {
+            let hard_roi = find_loaded_template(
+                &frame,
+                None,
+                80,
+                40,
+                &loaded,
+                0.90,
+                MatchAlgorithm::Hybrid,
+                2,
+                2,
+                false,
+                false,
+            );
+            assert!(hard_roi.matched.is_none());
+        }
     }
 
     #[test]

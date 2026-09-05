@@ -5,8 +5,9 @@ use crate::mascot::Mascots;
 use crate::model::{
     AppTab, BranchAction, BranchActionKind, BranchOutcome, ClickAnchor, ClickMethod,
     ConditionExpectation, ConditionMatchMode, ConditionOutcome, KeyCombo, KeyInputMode, LogEntry,
-    LogLevel, LoopMode, MacroProfile, RunnerStatus, SearchRegionSpec, StepKind, TemplateAsset,
-    VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_hotkeys, parse_key_combo,
+    LogLevel, LoopMode, MacroProfile, RecognitionPerformance, RunnerStatus, SearchRegionSpec,
+    StepKind, TemplateAsset, VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_hotkeys,
+    parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
 use crate::runner::{RunnerEvent, RunnerHandle};
@@ -648,13 +649,15 @@ impl Make5771App {
         let (sender, receiver) = std::sync::mpsc::channel();
         let threshold = self.template_test_threshold;
         let algorithm = self.profile.match_algorithm;
+        let max_threads = self.profile.recognition_performance.max_threads();
         self.template_test_pending = Some(receiver);
         self.push_log(
             LogLevel::Info,
             format!("正在识别模板“{}”…", template_asset.name),
         );
         std::thread::spawn(move || {
-            let outcome = run_template_test_work(template_asset, frame, threshold, algorithm);
+            let outcome =
+                run_template_test_work(template_asset, frame, threshold, algorithm, max_threads);
             let _ = sender.send(outcome);
         });
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -2707,6 +2710,38 @@ impl Make5771App {
                 .color(theme::tertiary_label()),
             );
             ui.horizontal(|ui| {
+                ui.label("性能模式");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("recognition_performance")
+                        .selected_text(self.profile.recognition_performance.label())
+                        .show_ui(ui, |ui| {
+                            for mode in RecognitionPerformance::ALL {
+                                ui.selectable_value(
+                                    &mut self.profile.recognition_performance,
+                                    mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                });
+            });
+            ui.label(
+                RichText::new(self.profile.recognition_performance.description())
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
+            ui.horizontal(|ui| {
+                ui.label("智能 ROI 越界恢复");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.toggle_value(&mut self.profile.adaptive_roi, "开启");
+                });
+            });
+            ui.label(
+                RichText::new("开启后局部区域连续未命中会全屏恢复；旧流程默认关闭以保留原空间边界")
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
+            ui.horizontal(|ui| {
                 ui.label("点击前二次确认");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.toggle_value(&mut self.profile.stable_confirm, "开启");
@@ -2732,16 +2767,16 @@ impl Make5771App {
         theme::card().show(ui, |ui| {
             ui.label(RichText::new("识别算法").size(18.0).strong());
             ui.separator();
-            ui.label("精准（彩色 RGB）");
+            ui.label("自适应混合识别（纯 Rust）");
             ui.label(
                 RichText::new(
-                    "RGB 三通道匹配，抗误触最强，1080p 全图约 3-10 ms；灰度算法误匹配过多，已停用",
+                    "稳定目标先走单候选快速路径；结果不确定时才执行 Top-4 + ZNCC 结构复核",
                 )
                 .size(11.0)
                 .color(theme::tertiary_label()),
             );
             ui.label(
-                RichText::new("已启用有效像素加权：模板背景不参与打分，抗误触更强")
+                RichText::new("已启用有效像素/透明 Alpha 掩码、可选软 ROI 恢复和 WaitAny 错峰发现")
                     .size(11.0)
                     .color(theme::tertiary_label()),
             );
@@ -3971,6 +4006,7 @@ fn run_template_test_work(
     frame: image::RgbaImage,
     threshold: f32,
     algorithm: vision::MatchAlgorithm,
+    max_threads: usize,
 ) -> TemplateTestOutcome {
     let threshold = vision::effective_threshold(algorithm, threshold);
     let full_region = SearchRegion::full(&frame);
@@ -4033,23 +4069,25 @@ fn run_template_test_work(
         vision::MatchAlgorithm::Hybrid => {
             let weights = vision::TemplateWeights::analyze(&template_rgb);
             mostly_background = weights.is_mostly_background();
-            vision::find_template_report_rgb_hybrid(
+            vision::find_template_report_rgb_hybrid_with_bands(
                 &frame,
                 &template_rgb,
                 &weights,
                 search_region,
                 threshold,
+                max_threads,
             )
         }
         vision::MatchAlgorithm::Precise => {
             let weights = vision::TemplateWeights::analyze(&template_rgb);
             mostly_background = weights.is_mostly_background();
-            vision::find_template_report_rgb_weighted(
+            vision::find_template_report_rgb_weighted_with_bands(
                 &frame,
                 &template_rgb,
                 &weights,
                 search_region,
                 threshold,
+                max_threads,
             )
         }
         gray_algorithm => {
