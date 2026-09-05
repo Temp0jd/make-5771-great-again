@@ -17,7 +17,7 @@
 {
   "format": "make5771.workflow-package",
   "format_version": 1,
-  "app_version": "0.3.11",
+  "app_version": "0.3.12",
   "created_at": "RFC 3339 timestamp",
   "profile": {},
   "assets": [
@@ -33,6 +33,8 @@
 `profile.templates[*].path` 和步骤中的模板引用都使用 `assets[*].key`，不应包含作者电脑上的绝对路径。
 
 `profile.recognition_performance` 可取 `Eco`、`Balanced` 或 `Responsive`，分别限制为 2、4 或最多 8 个识别线程。缺少该字段的旧包默认使用 `Balanced`，识别判定规则不变。
+
+`profile.template_scale_mode` 可取 `UniformFit` 或 `Stretch`。`UniformFit` 按客户区可容纳的统一比例缩放宽高，并将 ROI 映射到居中的内容区，适合跨 16:9、16:10 和超宽屏分享；`Stretch` 沿用旧版宽高分别缩放。新建流程默认 `UniformFit`，缺少该字段的旧包默认 `Stretch`，避免静默改变既有流程。
 
 `profile.adaptive_roi` 控制配置区域连续未命中后是否允许全屏恢复。新建流程默认启用；缺少该字段的旧包反序列化为 `false`，继续把 ROI 作为严格空间边界，避免兼容升级后发生区域外点击。
 

@@ -6,8 +6,8 @@ use crate::model::{
     AppTab, BranchAction, BranchActionKind, BranchOutcome, ClickAnchor, ClickMethod,
     ConditionExpectation, ConditionMatchMode, ConditionOutcome, KeyCombo, KeyInputMode, LogEntry,
     LogLevel, LoopMode, MacroProfile, RecognitionPerformance, RunnerStatus, SearchRegionSpec,
-    StepKind, TemplateAsset, VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_hotkeys,
-    parse_key_combo,
+    StepKind, TemplateAsset, TemplateScaleMode, VisualConditionTerm, WorkflowBranch, WorkflowStep,
+    parse_hotkeys, parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
 use crate::runner::{RunnerEvent, RunnerHandle};
@@ -293,11 +293,12 @@ impl Make5771App {
                     )
                 } else {
                     format!(
-                        "已连接，但客户区为 {} × {}；流程基准为 {} × {}，运行时将按比例缩放模板",
+                        "已连接，但客户区为 {} × {}；流程基准为 {} × {}，运行时将使用“{}”缩放模板",
                         target.client_width,
                         target.client_height,
                         self.profile.expected_client_width,
-                        self.profile.expected_client_height
+                        self.profile.expected_client_height,
+                        self.profile.template_scale_mode.label()
                     )
                 };
                 self.push_log(
@@ -649,6 +650,11 @@ impl Make5771App {
         let (sender, receiver) = std::sync::mpsc::channel();
         let threshold = self.template_test_threshold;
         let algorithm = self.profile.match_algorithm;
+        let scale_mode = self.profile.template_scale_mode;
+        let reference_fallback = (
+            self.profile.expected_client_width,
+            self.profile.expected_client_height,
+        );
         let max_threads = self.profile.recognition_performance.max_threads();
         self.template_test_pending = Some(receiver);
         self.push_log(
@@ -656,8 +662,15 @@ impl Make5771App {
             format!("正在识别模板“{}”…", template_asset.name),
         );
         std::thread::spawn(move || {
-            let outcome =
-                run_template_test_work(template_asset, frame, threshold, algorithm, max_threads);
+            let outcome = run_template_test_work(
+                template_asset,
+                frame,
+                threshold,
+                algorithm,
+                scale_mode,
+                reference_fallback,
+                max_threads,
+            );
             let _ = sender.send(outcome);
         });
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -2731,6 +2744,27 @@ impl Make5771App {
                     .color(theme::tertiary_label()),
             );
             ui.horizontal(|ui| {
+                ui.label("跨分辨率模板缩放");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("template_scale_mode")
+                        .selected_text(self.profile.template_scale_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in TemplateScaleMode::ALL {
+                                ui.selectable_value(
+                                    &mut self.profile.template_scale_mode,
+                                    mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                });
+            });
+            ui.label(
+                RichText::new(self.profile.template_scale_mode.description())
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
+            ui.horizontal(|ui| {
                 ui.label("智能 ROI 越界恢复");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.toggle_value(&mut self.profile.adaptive_roi, "开启");
@@ -4006,6 +4040,8 @@ fn run_template_test_work(
     frame: image::RgbaImage,
     threshold: f32,
     algorithm: vision::MatchAlgorithm,
+    scale_mode: TemplateScaleMode,
+    reference_fallback: (u32, u32),
     max_threads: usize,
 ) -> TemplateTestOutcome {
     let threshold = vision::effective_threshold(algorithm, threshold);
@@ -4025,30 +4061,27 @@ fn run_template_test_work(
     };
     // Templates captured at another resolution are scaled to the frame,
     // matching what the runner does at run time.
-    let reference_width = if template_asset.reference_width > 0 {
-        template_asset.reference_width
-    } else {
-        frame.width()
-    };
-    let reference_height = if template_asset.reference_height > 0 {
-        template_asset.reference_height
-    } else {
-        frame.height()
-    };
+    let (reference_width, reference_height) =
+        template_asset.reference_size(reference_fallback.0, reference_fallback.1);
     let mut scaled_region = template_asset.search_region;
     if reference_width != frame.width() || reference_height != frame.height() {
-        let scale = |value: u32, from: u32, to: u32| {
-            ((u64::from(value) * u64::from(to) + u64::from(from) / 2) / u64::from(from.max(1)))
-                .max(1) as u32
-        };
+        let (width, height) = scale_mode.template_size(
+            template_asset.width,
+            template_asset.height,
+            reference_width,
+            reference_height,
+            frame.width(),
+            frame.height(),
+        );
         template_rgb = image::imageops::resize(
             &template_rgb,
-            scale(template_asset.width, reference_width, frame.width()),
-            scale(template_asset.height, reference_height, frame.height()),
+            width,
+            height,
             image::imageops::FilterType::Triangle,
         );
         scaled_region = scaled_region.map(|region| {
-            region.scaled(
+            scale_mode.search_region(
+                region,
                 reference_width,
                 reference_height,
                 frame.width(),

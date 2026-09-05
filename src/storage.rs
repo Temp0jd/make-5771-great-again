@@ -563,7 +563,9 @@ impl std::error::Error for StorageError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BranchActionKind, BranchOutcome, StepKind, TemplateAsset};
+    use crate::model::{
+        BranchActionKind, BranchOutcome, StepKind, TemplateAsset, TemplateScaleMode,
+    };
 
     #[test]
     fn profile_round_trip() {
@@ -774,6 +776,20 @@ mod tests {
         assert_eq!(package.format_version, PACKAGE_VERSION);
         assert!(package.profile.validate().is_ok());
         assert_eq!(package.assets.len(), package.profile.templates.len());
+        assert_eq!(
+            (
+                package.profile.expected_client_width,
+                package.profile.expected_client_height,
+            ),
+            (2560, 1440)
+        );
+        assert_eq!(
+            package.profile.template_scale_mode,
+            TemplateScaleMode::UniformFit
+        );
+        assert!(package.profile.templates.iter().all(|template| {
+            template.reference_width == 2560 && template.reference_height == 1440
+        }));
         assert_eq!(package.profile.steps.len(), 9);
         let start_names: Vec<_> = package.profile.steps[..8]
             .iter()

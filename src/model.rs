@@ -123,6 +123,121 @@ impl RecognitionPerformance {
     }
 }
 
+/// How templates captured at one client size are resized for another.
+/// `Stretch` preserves the pre-v0.3.12 behavior for profiles that omit the
+/// field; new profiles use `UniformFit` to avoid aspect-ratio distortion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TemplateScaleMode {
+    #[default]
+    Stretch,
+    UniformFit,
+}
+
+impl TemplateScaleMode {
+    pub const ALL: [Self; 2] = [Self::UniformFit, Self::Stretch];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UniformFit => "保持比例（分享推荐）",
+            Self::Stretch => "分别拉伸（旧流程兼容）",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::UniformFit => "按可用客户区等比缩放，避免 16:9 / 16:10 间把按钮压扁或拉高",
+            Self::Stretch => "宽高分别缩放；仅用于依赖旧版拉伸行为的流程",
+        }
+    }
+
+    pub fn template_size(
+        self,
+        width: u32,
+        height: u32,
+        reference_width: u32,
+        reference_height: u32,
+        frame_width: u32,
+        frame_height: u32,
+    ) -> (u32, u32) {
+        match self {
+            Self::Stretch => (
+                scale_rounded(width, frame_width, reference_width).max(1),
+                scale_rounded(height, frame_height, reference_height).max(1),
+            ),
+            Self::UniformFit => {
+                let (numerator, denominator) =
+                    fit_ratio(reference_width, reference_height, frame_width, frame_height);
+                (
+                    scale_rounded(width, numerator, denominator).max(1),
+                    scale_rounded(height, numerator, denominator).max(1),
+                )
+            }
+        }
+    }
+
+    pub fn search_region(
+        self,
+        region: SearchRegionSpec,
+        reference_width: u32,
+        reference_height: u32,
+        frame_width: u32,
+        frame_height: u32,
+    ) -> SearchRegionSpec {
+        match self {
+            Self::Stretch => {
+                region.scaled(reference_width, reference_height, frame_width, frame_height)
+            }
+            Self::UniformFit => {
+                let (numerator, denominator) =
+                    fit_ratio(reference_width, reference_height, frame_width, frame_height);
+                let content_width =
+                    scale_rounded(reference_width, numerator, denominator).min(frame_width);
+                let content_height =
+                    scale_rounded(reference_height, numerator, denominator).min(frame_height);
+                let offset_x = frame_width.saturating_sub(content_width) / 2;
+                let offset_y = frame_height.saturating_sub(content_height) / 2;
+                let x = offset_x
+                    .saturating_add(scale_rounded(region.x, numerator, denominator))
+                    .min(frame_width.saturating_sub(1));
+                let y = offset_y
+                    .saturating_add(scale_rounded(region.y, numerator, denominator))
+                    .min(frame_height.saturating_sub(1));
+                SearchRegionSpec {
+                    x,
+                    y,
+                    width: scale_rounded(region.width, numerator, denominator)
+                        .min(frame_width.saturating_sub(x))
+                        .max(1),
+                    height: scale_rounded(region.height, numerator, denominator)
+                        .min(frame_height.saturating_sub(y))
+                        .max(1),
+                }
+            }
+        }
+    }
+}
+
+fn scale_rounded(value: u32, numerator: u32, denominator: u32) -> u32 {
+    let denominator = u64::from(denominator.max(1));
+    let scaled = (u64::from(value) * u64::from(numerator) + denominator / 2) / denominator;
+    scaled.min(u64::from(u32::MAX)) as u32
+}
+
+fn fit_ratio(
+    reference_width: u32,
+    reference_height: u32,
+    frame_width: u32,
+    frame_height: u32,
+) -> (u32, u32) {
+    if u64::from(frame_width) * u64::from(reference_height)
+        <= u64::from(frame_height) * u64::from(reference_width)
+    {
+        (frame_width, reference_width.max(1))
+    } else {
+        (frame_height, reference_height.max(1))
+    }
+}
+
 fn default_click_jitter() -> bool {
     true
 }
@@ -740,6 +855,26 @@ pub struct TemplateAsset {
     pub search_region: Option<SearchRegionSpec>,
 }
 
+impl TemplateAsset {
+    /// Returns the capture-space dimensions recorded with this template.
+    /// Profiles created before reference dimensions were added fall back to
+    /// the profile's expected client size in both runtime and template tests.
+    pub fn reference_size(&self, fallback_width: u32, fallback_height: u32) -> (u32, u32) {
+        (
+            if self.reference_width > 0 {
+                self.reference_width
+            } else {
+                fallback_width.max(1)
+            },
+            if self.reference_height > 0 {
+                self.reference_height
+            } else {
+                fallback_height.max(1)
+            },
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchRegionSpec {
     pub x: u32,
@@ -795,6 +930,10 @@ pub struct MacroProfile {
     pub match_algorithm: MatchAlgorithm,
     #[serde(default)]
     pub recognition_performance: RecognitionPerformance,
+    /// Missing legacy fields retain the old independent width/height stretch;
+    /// newly created profiles preserve template aspect ratio.
+    #[serde(default)]
+    pub template_scale_mode: TemplateScaleMode,
     /// When enabled, a configured ROI is treated as a fast hint and bounded
     /// misses trigger a full-screen recovery. Missing legacy fields stay false.
     #[serde(default)]
@@ -853,6 +992,7 @@ impl Default for MacroProfile {
             shared_templates: false,
             match_algorithm: MatchAlgorithm::Hybrid,
             recognition_performance: RecognitionPerformance::default(),
+            template_scale_mode: TemplateScaleMode::UniformFit,
             adaptive_roi: true,
             stable_confirm: default_stable_confirm(),
             sharing: SharingMetadata::default(),
@@ -1137,6 +1277,60 @@ mod tests {
     }
 
     #[test]
+    fn uniform_fit_preserves_template_aspect_ratio_and_centers_regions() {
+        assert_eq!(
+            TemplateScaleMode::Stretch.template_size(228, 50, 2560, 1440, 2560, 1600),
+            (228, 56)
+        );
+        assert_eq!(
+            TemplateScaleMode::UniformFit.template_size(228, 50, 2560, 1440, 2560, 1600),
+            (228, 50)
+        );
+        assert_eq!(
+            TemplateScaleMode::UniformFit.search_region(
+                SearchRegionSpec {
+                    x: 100,
+                    y: 100,
+                    width: 200,
+                    height: 100,
+                },
+                2560,
+                1440,
+                2560,
+                1600,
+            ),
+            SearchRegionSpec {
+                x: 100,
+                y: 180,
+                width: 200,
+                height: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_template_reference_size_uses_profile_fallback() {
+        let template = TemplateAsset {
+            id: 1,
+            name: "legacy".to_owned(),
+            path: "legacy.png".to_owned(),
+            width: 100,
+            height: 50,
+            reference_width: 0,
+            reference_height: 0,
+            search_region: None,
+        };
+        assert_eq!(template.reference_size(1920, 1080), (1920, 1080));
+
+        let explicit = TemplateAsset {
+            reference_width: 2560,
+            reference_height: 1440,
+            ..template
+        };
+        assert_eq!(explicit.reference_size(1920, 1080), (2560, 1440));
+    }
+
+    #[test]
     fn old_profiles_load_with_default_click_options() {
         let mut value = serde_json::to_value(MacroProfile::default()).unwrap();
         let object = value.as_object_mut().unwrap();
@@ -1287,6 +1481,7 @@ mod tests {
         object.remove("shared_templates");
         object.remove("match_algorithm");
         object.remove("recognition_performance");
+        object.remove("template_scale_mode");
         object.remove("adaptive_roi");
         object.remove("stable_confirm");
         let profile: MacroProfile = serde_json::from_value(value).unwrap();
@@ -1298,6 +1493,7 @@ mod tests {
             profile.recognition_performance,
             RecognitionPerformance::Balanced
         );
+        assert_eq!(profile.template_scale_mode, TemplateScaleMode::Stretch);
         assert!(!profile.adaptive_roi);
         assert!(profile.stable_confirm);
     }

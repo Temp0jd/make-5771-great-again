@@ -216,11 +216,12 @@ fn run_workflow(
         || frame_height != profile.expected_client_height
     {
         let _ = events.send(RunnerEvent::Notice(format!(
-            "客户区 {} × {} 与流程基准 {} × {} 不符，已按比例缩放模板",
+            "客户区 {} × {} 与流程基准 {} × {} 不符，已使用“{}”缩放模板",
             frame_width,
             frame_height,
             profile.expected_client_width,
-            profile.expected_client_height
+            profile.expected_client_height,
+            profile.template_scale_mode.label()
         )));
     }
     let deadline = if profile.loop_mode == LoopMode::Deadline {
@@ -329,49 +330,50 @@ fn load_templates(
         let image = image::imageops::grayscale(&image_rgb);
         // Older profiles never recorded a reference size; treat them as
         // captured at the profile's base resolution.
-        let reference_width = if asset.reference_width > 0 {
-            asset.reference_width
-        } else {
-            profile.expected_client_width
-        };
-        let reference_height = if asset.reference_height > 0 {
-            asset.reference_height
-        } else {
-            profile.expected_client_height
-        };
+        let (reference_width, reference_height) = asset.reference_size(
+            profile.expected_client_width,
+            profile.expected_client_height,
+        );
 
         let mut scaled_asset = asset.clone();
         scaled_asset.reference_width = frame_width;
         scaled_asset.reference_height = frame_height;
-        let (image, image_rgb) = if reference_width == frame_width
-            && reference_height == frame_height
-        {
-            (image, image_rgb)
-        } else {
-            let scale = |value: u32, from: u32, to: u32| {
-                ((u64::from(value) * u64::from(to) + u64::from(from) / 2) / u64::from(from.max(1)))
-                    .max(1) as u32
+        let (image, image_rgb) =
+            if reference_width == frame_width && reference_height == frame_height {
+                (image, image_rgb)
+            } else {
+                scaled_asset.search_region = asset.search_region.map(|region| {
+                    profile.template_scale_mode.search_region(
+                        region,
+                        reference_width,
+                        reference_height,
+                        frame_width,
+                        frame_height,
+                    )
+                });
+                let (width, height) = profile.template_scale_mode.template_size(
+                    asset.width,
+                    asset.height,
+                    reference_width,
+                    reference_height,
+                    frame_width,
+                    frame_height,
+                );
+                (
+                    image::imageops::resize(
+                        &image,
+                        width,
+                        height,
+                        image::imageops::FilterType::Triangle,
+                    ),
+                    image::imageops::resize(
+                        &image_rgb,
+                        width,
+                        height,
+                        image::imageops::FilterType::Triangle,
+                    ),
+                )
             };
-            scaled_asset.search_region = asset.search_region.map(|region| {
-                region.scaled(reference_width, reference_height, frame_width, frame_height)
-            });
-            let width = scale(asset.width, reference_width, frame_width);
-            let height = scale(asset.height, reference_height, frame_height);
-            (
-                image::imageops::resize(
-                    &image,
-                    width,
-                    height,
-                    image::imageops::FilterType::Triangle,
-                ),
-                image::imageops::resize(
-                    &image_rgb,
-                    width,
-                    height,
-                    image::imageops::FilterType::Triangle,
-                ),
-            )
-        };
         let weights = vision::TemplateWeights::analyze(&image_rgb);
         if weights.is_mostly_background() {
             warnings.push(format!(
@@ -1421,7 +1423,9 @@ mod tests {
             }),
         });
 
-        let (templates, warnings) = load_templates(&profile, 640, 360).unwrap();
+        // 1280×720 into 640×400 must remain 0.5× and be vertically centered;
+        // independent stretching would incorrectly enlarge only the height.
+        let (templates, warnings) = load_templates(&profile, 640, 400).unwrap();
         // The test template is a solid color block, so it triggers the
         // mostly-background warning.
         assert_eq!(warnings.len(), 1);
@@ -1430,9 +1434,10 @@ mod tests {
         let region = loaded.asset.search_region.unwrap();
         assert_eq!(
             (region.x, region.y, region.width, region.height),
-            (320, 180, 160, 90)
+            (320, 200, 160, 90)
         );
         assert_eq!(loaded.asset.reference_width, 640);
+        assert_eq!(loaded.asset.reference_height, 400);
 
         let _ = std::fs::remove_dir_all(root);
     }

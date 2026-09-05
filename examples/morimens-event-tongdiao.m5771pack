@@ -1,8 +1,8 @@
 {
   "format": "make5771.workflow-package",
   "format_version": 1,
-  "app_version": "0.3.11",
-  "created_at": "2026-09-05T16:19:41.335559+08:00",
+  "app_version": "0.3.12",
+  "created_at": "2026-09-05T18:21:48.467592+08:00",
   "profile": {
     "name": "忘却前夜活动刷同调（HONG复刻）",
     "target_window": "忘却前夜",
@@ -393,14 +393,15 @@
     ],
     "sharing": {
       "author": "HONG 方案 237202830 / M5771 转换",
-      "description": "依据“宏方案237202830.hong”逐节点重建。开始调查：挑战→助战→环娜→上场→调查→等待100ms→巧克力→确认→等待100ms→自动→等待10秒；主监视器随后等待“完成调查”或“取消”。检测到完成调查后先等待3秒、重新确认并点击，然后计一局；检测到取消后先等待1秒、重新确认并点击，然后执行失败恢复：重新战斗→等待100ms→巧克力→确认→等待100ms→自动→等待10秒，再返回主监视器。已移除旧包中脱离 HONG 源流程的非线性 Token/Auto 分支和重复 RoundEnd。请从能看到“挑战”的活动主界面启动。",
+      "description": "依据“宏方案237202830.hong”逐节点重建。开始调查：挑战→助战→环娜→上场→调查→等待100ms→巧克力→确认→等待100ms→自动→等待10秒；主监视器随后等待“完成调查”或“取消”。检测到完成调查后先等待3秒、重新确认并点击，然后计一局；检测到取消后先等待1秒、重新确认并点击，然后执行失败恢复：重新战斗→等待100ms→巧克力→确认→等待100ms→自动→等待10秒，再返回主监视器。已移除旧包中脱离 HONG 源流程的非线性 Token/Auto 分支和重复 RoundEnd。请从能看到“挑战”的活动主界面启动。 源 HONG 捕获区域为 2560×1440；跨 16:9/16:10 客户区时采用等比适配，避免旧版宽高分别缩放造成模板变形。",
       "game_version": "",
       "game_language": "简体中文",
       "tags": "活动,同调,HONG复刻"
     },
     "match_algorithm": "Hybrid",
     "recognition_performance": "Balanced",
-    "adaptive_roi": true
+    "adaptive_roi": true,
+    "template_scale_mode": "UniformFit"
   },
   "assets": [
     {
