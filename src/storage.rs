@@ -563,7 +563,7 @@ impl std::error::Error for StorageError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::TemplateAsset;
+    use crate::model::{BranchActionKind, BranchOutcome, StepKind, TemplateAsset};
 
     #[test]
     fn profile_round_trip() {
@@ -774,6 +774,69 @@ mod tests {
         assert_eq!(package.format_version, PACKAGE_VERSION);
         assert!(package.profile.validate().is_ok());
         assert_eq!(package.assets.len(), package.profile.templates.len());
+        assert_eq!(package.profile.steps.len(), 9);
+        let start_names: Vec<_> = package.profile.steps[..8]
+            .iter()
+            .map(|step| step.name.as_str())
+            .collect();
+        assert_eq!(
+            start_names,
+            [
+                "挑战",
+                "助战",
+                "环娜（选择助战对象）",
+                "上场",
+                "调查",
+                "巧克力",
+                "确认",
+                "自动",
+            ]
+        );
+        assert!(
+            package.profile.steps[..8]
+                .iter()
+                .all(|step| step.kind == StepKind::WaitAndClick)
+        );
+        assert_eq!(package.profile.steps[4].delay_ms, 100);
+        assert_eq!(package.profile.steps[6].delay_ms, 100);
+        assert_eq!(package.profile.steps[7].delay_ms, 10_000);
+
+        let monitor = &package.profile.steps[8];
+        assert_eq!(monitor.kind, StepKind::WaitAny);
+        assert_eq!(monitor.timeout_secs, 86_400);
+        assert_eq!(monitor.branches.len(), 2);
+        let completed = &monitor.branches[0];
+        assert_eq!(completed.outcome, BranchOutcome::CompleteRound);
+        assert!(!completed.click_trigger);
+        assert_eq!(completed.actions.len(), 2);
+        assert_eq!(completed.actions[0].kind, BranchActionKind::Delay);
+        assert_eq!(completed.actions[0].delay_ms, 3_000);
+        assert_eq!(completed.actions[1].kind, BranchActionKind::WaitAndClick);
+
+        let cancelled = &monitor.branches[1];
+        assert_eq!(cancelled.outcome, BranchOutcome::RepeatWait);
+        assert!(!cancelled.click_trigger);
+        let recovery_names: Vec<_> = cancelled
+            .actions
+            .iter()
+            .map(|action| action.name.as_str())
+            .collect();
+        assert_eq!(
+            recovery_names,
+            [
+                "HONG：取消检测后等待 1 秒",
+                "点击取消",
+                "重新战斗",
+                "巧克力",
+                "确认",
+                "自动",
+            ]
+        );
+        assert_eq!(cancelled.actions[0].kind, BranchActionKind::Delay);
+        assert_eq!(cancelled.actions[0].delay_ms, 1_000);
+        assert_eq!(cancelled.actions[2].delay_ms, 100);
+        assert_eq!(cancelled.actions[4].delay_ms, 100);
+        assert_eq!(cancelled.actions[5].delay_ms, 10_000);
         for template in &package.profile.templates {
             let asset = package
                 .assets

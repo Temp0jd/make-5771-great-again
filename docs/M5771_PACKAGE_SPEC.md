@@ -17,7 +17,7 @@
 {
   "format": "make5771.workflow-package",
   "format_version": 1,
-  "app_version": "0.3.10",
+  "app_version": "0.3.11",
   "created_at": "RFC 3339 timestamp",
   "profile": {},
   "assets": [

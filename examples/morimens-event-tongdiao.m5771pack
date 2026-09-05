@@ -1,10 +1,10 @@
 {
   "format": "make5771.workflow-package",
   "format_version": 1,
-  "app_version": "0.3.10",
-  "created_at": "2026-09-01T09:58:35.491120+08:00",
+  "app_version": "0.3.11",
+  "created_at": "2026-09-05T16:19:41.335559+08:00",
   "profile": {
-    "name": "活动关卡（刷同调）",
+    "name": "忘却前夜活动刷同调（HONG复刻）",
     "target_window": "忘却前夜",
     "expected_client_width": 2560,
     "expected_client_height": 1440,
@@ -15,14 +15,14 @@
     "steps": [
       {
         "id": 1,
-        "name": "挑战（进入关卡）",
+        "name": "挑战",
         "kind": "WaitAndClick",
         "indent": 0,
         "enabled": true,
         "template": "assets/template-3.png",
         "threshold": 0.84,
         "timeout_secs": 30,
-        "delay_ms": 1500,
+        "delay_ms": 0,
         "branches": [],
         "visual_condition": {
           "mode": "All",
@@ -33,14 +33,14 @@
       },
       {
         "id": 2,
-        "name": "助战（打开助战列表）",
+        "name": "助战",
         "kind": "WaitAndClick",
         "indent": 0,
         "enabled": true,
         "template": "assets/template-9.png",
         "threshold": 0.82,
         "timeout_secs": 30,
-        "delay_ms": 1500,
+        "delay_ms": 0,
         "branches": [],
         "visual_condition": {
           "mode": "All",
@@ -51,14 +51,14 @@
       },
       {
         "id": 3,
-        "name": "助战对象（选择助战）",
+        "name": "环娜（选择助战对象）",
         "kind": "WaitAndClick",
         "indent": 0,
         "enabled": true,
         "template": "assets/template-11.png",
         "threshold": 0.84,
         "timeout_secs": 30,
-        "delay_ms": 1500,
+        "delay_ms": 0,
         "branches": [],
         "visual_condition": {
           "mode": "All",
@@ -69,14 +69,14 @@
       },
       {
         "id": 4,
-        "name": "上场（确认助战）",
+        "name": "上场",
         "kind": "WaitAndClick",
         "indent": 0,
         "enabled": true,
         "template": "assets/template-10.png",
         "threshold": 0.84,
-        "timeout_secs": 20,
-        "delay_ms": 1500,
+        "timeout_secs": 30,
+        "delay_ms": 0,
         "branches": [],
         "visual_condition": {
           "mode": "All",
@@ -87,14 +87,14 @@
       },
       {
         "id": 5,
-        "name": "调查（开始战斗）",
+        "name": "调查",
         "kind": "WaitAndClick",
         "indent": 0,
         "enabled": true,
         "template": "assets/template-4.png",
         "threshold": 0.84,
         "timeout_secs": 30,
-        "delay_ms": 1500,
+        "delay_ms": 100,
         "branches": [],
         "visual_condition": {
           "mode": "All",
@@ -105,88 +105,15 @@
       },
       {
         "id": 6,
-        "name": "战斗中监视（非线性）",
-        "kind": "WaitAny",
+        "name": "巧克力",
+        "kind": "WaitAndClick",
         "indent": 0,
         "enabled": true,
-        "template": null,
-        "threshold": 0.9,
-        "timeout_secs": 3600,
-        "delay_ms": 500,
-        "branches": [
-          {
-            "id": 1,
-            "name": "活动Token（选择一个并确认）",
-            "trigger_template": "assets/template-5.png",
-            "threshold": 0.84,
-            "click_trigger": true,
-            "trigger_delay_ms": 500,
-            "outcome": "RepeatWait",
-            "actions": [
-              {
-                "id": 1,
-                "name": "确认",
-                "kind": "WaitAndClick",
-                "template": "assets/template-6.png",
-                "threshold": 0.84,
-                "timeout_secs": 10,
-                "delay_ms": 800,
-                "optional": true
-              }
-            ]
-          },
-          {
-            "id": 2,
-            "name": "完成调查（通关，计一局）",
-            "trigger_template": "assets/template-1.png",
-            "threshold": 0.84,
-            "click_trigger": true,
-            "trigger_delay_ms": 3000,
-            "outcome": "CompleteRound",
-            "actions": []
-          },
-          {
-            "id": 3,
-            "name": "取消（调查失败）",
-            "trigger_template": "assets/template-2.png",
-            "threshold": 0.84,
-            "click_trigger": true,
-            "trigger_delay_ms": 1000,
-            "outcome": "RepeatWait",
-            "actions": [
-              {
-                "id": 1,
-                "name": "重新战斗",
-                "kind": "WaitAndClick",
-                "template": "assets/template-8.png",
-                "threshold": 0.86,
-                "timeout_secs": 30,
-                "delay_ms": 1500,
-                "optional": false
-              }
-            ]
-          },
-          {
-            "id": 4,
-            "name": "重新战斗（角色死亡）",
-            "trigger_template": "assets/template-8.png",
-            "threshold": 0.86,
-            "click_trigger": true,
-            "trigger_delay_ms": 1500,
-            "outcome": "RepeatWait",
-            "actions": []
-          },
-          {
-            "id": 5,
-            "name": "自动（未开启才点）",
-            "trigger_template": "assets/template-7.png",
-            "threshold": 0.84,
-            "click_trigger": true,
-            "trigger_delay_ms": 1000,
-            "outcome": "RepeatWait",
-            "actions": []
-          }
-        ],
+        "template": "assets/template-5.png",
+        "threshold": 0.84,
+        "timeout_secs": 30,
+        "delay_ms": 0,
+        "branches": [],
         "visual_condition": {
           "mode": "All",
           "stable_checks": 2,
@@ -196,15 +123,154 @@
       },
       {
         "id": 7,
-        "name": "本局结束",
-        "kind": "RoundEnd",
+        "name": "确认",
+        "kind": "WaitAndClick",
+        "indent": 0,
+        "enabled": true,
+        "template": "assets/template-6.png",
+        "threshold": 0.84,
+        "timeout_secs": 30,
+        "delay_ms": 100,
+        "branches": [],
+        "visual_condition": {
+          "mode": "All",
+          "stable_checks": 2,
+          "outcome": "ContinueFlow",
+          "terms": []
+        }
+      },
+      {
+        "id": 8,
+        "name": "自动",
+        "kind": "WaitAndClick",
+        "indent": 0,
+        "enabled": true,
+        "template": "assets/template-7.png",
+        "threshold": 0.84,
+        "timeout_secs": 30,
+        "delay_ms": 10000,
+        "branches": [],
+        "visual_condition": {
+          "mode": "All",
+          "stable_checks": 2,
+          "outcome": "ContinueFlow",
+          "terms": []
+        }
+      },
+      {
+        "id": 9,
+        "name": "HONG 主监视器（通关 / 调查失败）",
+        "kind": "WaitAny",
         "indent": 0,
         "enabled": true,
         "template": null,
         "threshold": 0.9,
-        "timeout_secs": 60,
-        "delay_ms": 500,
-        "branches": [],
+        "timeout_secs": 86400,
+        "delay_ms": 0,
+        "branches": [
+          {
+            "id": 1,
+            "name": "完成调查（通关，计一局）",
+            "trigger_template": "assets/template-1.png",
+            "threshold": 0.84,
+            "click_trigger": false,
+            "trigger_delay_ms": 0,
+            "outcome": "CompleteRound",
+            "actions": [
+              {
+                "id": 1,
+                "name": "HONG：完成调查检测后等待 3 秒",
+                "kind": "Delay",
+                "template": null,
+                "threshold": 0.9,
+                "timeout_secs": 60,
+                "delay_ms": 3000,
+                "optional": false
+              },
+              {
+                "id": 2,
+                "name": "点击完成调查",
+                "kind": "WaitAndClick",
+                "template": "assets/template-1.png",
+                "threshold": 0.84,
+                "timeout_secs": 30,
+                "delay_ms": 0,
+                "optional": false
+              }
+            ]
+          },
+          {
+            "id": 2,
+            "name": "取消（启动调查失败重新开始）",
+            "trigger_template": "assets/template-2.png",
+            "threshold": 0.84,
+            "click_trigger": false,
+            "trigger_delay_ms": 0,
+            "outcome": "RepeatWait",
+            "actions": [
+              {
+                "id": 1,
+                "name": "HONG：取消检测后等待 1 秒",
+                "kind": "Delay",
+                "template": null,
+                "threshold": 0.9,
+                "timeout_secs": 60,
+                "delay_ms": 1000,
+                "optional": false
+              },
+              {
+                "id": 2,
+                "name": "点击取消",
+                "kind": "WaitAndClick",
+                "template": "assets/template-2.png",
+                "threshold": 0.84,
+                "timeout_secs": 30,
+                "delay_ms": 0,
+                "optional": false
+              },
+              {
+                "id": 3,
+                "name": "重新战斗",
+                "kind": "WaitAndClick",
+                "template": "assets/template-8.png",
+                "threshold": 0.86,
+                "timeout_secs": 30,
+                "delay_ms": 100,
+                "optional": false
+              },
+              {
+                "id": 4,
+                "name": "巧克力",
+                "kind": "WaitAndClick",
+                "template": "assets/template-5.png",
+                "threshold": 0.84,
+                "timeout_secs": 30,
+                "delay_ms": 0,
+                "optional": false
+              },
+              {
+                "id": 5,
+                "name": "确认",
+                "kind": "WaitAndClick",
+                "template": "assets/template-6.png",
+                "threshold": 0.84,
+                "timeout_secs": 30,
+                "delay_ms": 100,
+                "optional": false
+              },
+              {
+                "id": 6,
+                "name": "自动",
+                "kind": "WaitAndClick",
+                "template": "assets/template-7.png",
+                "threshold": 0.84,
+                "timeout_secs": 30,
+                "delay_ms": 10000,
+                "optional": false
+              }
+            ]
+          }
+        ],
         "visual_condition": {
           "mode": "All",
           "stable_checks": 2,
@@ -256,7 +322,7 @@
       },
       {
         "id": 5,
-        "name": "活动Token",
+        "name": "巧克力",
         "path": "assets/template-5.png",
         "width": 223,
         "height": 42,
@@ -316,7 +382,7 @@
       },
       {
         "id": 11,
-        "name": "助战对象",
+        "name": "环娜",
         "path": "assets/template-11.png",
         "width": 382,
         "height": 97,
@@ -326,11 +392,11 @@
       }
     ],
     "sharing": {
-      "author": "",
-      "description": "活动关卡全自动循环，部分线性 + 事件驱动：每轮开头按线性顺序执行 挑战→助战→助战对象→上场→调查；随后进入非线性监视——“活动Token”弹出随时选择一个并确认（不消耗体力）；“自动”使用未开启状态的模板且阈值 0.90，已开启不匹配不会误点；通关弹“完成调查”→ 点击计一局并开始下一轮线性段；角色死亡 → 点“重新战斗”自动重开（不计局数）。请从活动主界面（能看到“挑战”）启动流程。建议识别算法用“精准（彩色）”并开启“点击前二次确认”，防战斗误触。基准分辨率 2560×1440，其他分辨率自动缩放模板。",
+      "author": "HONG 方案 237202830 / M5771 转换",
+      "description": "依据“宏方案237202830.hong”逐节点重建。开始调查：挑战→助战→环娜→上场→调查→等待100ms→巧克力→确认→等待100ms→自动→等待10秒；主监视器随后等待“完成调查”或“取消”。检测到完成调查后先等待3秒、重新确认并点击，然后计一局；检测到取消后先等待1秒、重新确认并点击，然后执行失败恢复：重新战斗→等待100ms→巧克力→确认→等待100ms→自动→等待10秒，再返回主监视器。已移除旧包中脱离 HONG 源流程的非线性 Token/Auto 分支和重复 RoundEnd。请从能看到“挑战”的活动主界面启动。",
       "game_version": "",
       "game_language": "简体中文",
-      "tags": "活动,同调"
+      "tags": "活动,同调,HONG复刻"
     },
     "match_algorithm": "Hybrid",
     "recognition_performance": "Balanced",

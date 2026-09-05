@@ -193,8 +193,10 @@
 官方示例包（Release 的 `template.zip` 内含全部三个，也可在 [examples/](examples/) 单独获取）：
 
 - [Auto 起步包](examples/auto-starter.m5771pack)：不含图片的起步骨架，导入后自行绑定截图；
-- [活动关卡（刷同调）示例包](examples/morimens-event-tongdiao.m5771pack)：主循环常驻监视——通关自动开新局并计数、死亡自动重开、活动Token随选随确认、Auto 未开启才点，含 11 张模板；
+- [活动关卡（刷同调）HONG 复刻包](examples/morimens-event-tongdiao.m5771pack)：从宏方案 237202830 逐节点重建开始调查、主监视器和失败恢复流程，完整覆盖挑战、助战、环娜、上场、调查、巧克力、确认、Auto、通关与失败重开，含原始 11 张模板；
 - [Token 选择范例包](examples/token-select-example.m5771pack)：演示「出现 A → 选择 A → 确认」的通用模式。
+
+HONG 原节点与 M5771 步骤/分支的逐项对应见 [docs/HONG_237202830_MAPPING.md](docs/HONG_237202830_MAPPING.md)。
 
 ## 本地开发
 
