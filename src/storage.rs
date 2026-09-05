@@ -413,6 +413,9 @@ fn remap_profile_paths(
                 remap_optional_path(&mut action.template, remap)?;
             }
         }
+        for term in &mut step.visual_condition.terms {
+            remap_optional_path(&mut term.template, remap)?;
+        }
     }
     for template in &mut profile.templates {
         template.path = remap.get(&template.path).cloned().ok_or_else(|| {
@@ -738,6 +741,20 @@ mod tests {
             search_region: None,
         });
         profile.steps[0].template = Some(profile.templates[0].path.clone());
+        let mut visual_step = crate::model::WorkflowStep::new(
+            99,
+            "visual",
+            crate::model::StepKind::VisualCondition,
+            0,
+        );
+        let mut term = crate::model::VisualConditionTerm::new(
+            1,
+            "present",
+            crate::model::ConditionExpectation::Present,
+        );
+        term.template = Some(profile.templates[0].path.clone());
+        visual_step.visual_condition.terms.push(term);
+        profile.steps.push(visual_step);
 
         let package_path = root.join("flow.m5771pack");
         let exported = export_workflow_package(&package_path, &profile).unwrap();
@@ -750,6 +767,10 @@ mod tests {
         assert!(Path::new(&imported.templates[0].path).exists());
         assert_eq!(
             imported.steps[0].template,
+            Some(imported.templates[0].path.clone())
+        );
+        assert_eq!(
+            imported.steps.last().unwrap().visual_condition.terms[0].template,
             Some(imported.templates[0].path.clone())
         );
 

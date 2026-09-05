@@ -17,7 +17,7 @@
 {
   "format": "make5771.workflow-package",
   "format_version": 1,
-  "app_version": "0.3.12",
+  "app_version": "0.3.13",
   "created_at": "RFC 3339 timestamp",
   "profile": {},
   "assets": [
@@ -36,7 +36,11 @@
 
 `profile.template_scale_mode` 可取 `UniformFit` 或 `Stretch`。`UniformFit` 按客户区可容纳的统一比例缩放宽高，并将 ROI 映射到居中的内容区，适合跨 16:9、16:10 和超宽屏分享；`Stretch` 沿用旧版宽高分别缩放。新建流程默认 `UniformFit`，缺少该字段的旧包默认 `Stretch`，避免静默改变既有流程。
 
+`profile.default_search_region` 是流程基准客户区坐标中的默认 ROI。值为 `null` 时全屏搜索；没有 `search_region` 覆盖的模板会继承它。模板自身的 `search_region` 始终优先，并以该模板的参考尺寸为坐标基准；运行时会按 `template_scale_mode` 正确映射两种坐标。缺少该字段的旧包默认全屏。
+
 `profile.adaptive_roi` 控制配置区域连续未命中后是否允许全屏恢复。新建流程默认启用；缺少该字段的旧包反序列化为 `false`，继续把 ROI 作为严格空间边界，避免兼容升级后发生区域外点击。
+
+点击类步骤、WaitAny 分支触发器和分支点击动作可分别携带 `click_count` 与 `click_interval_ms`。次数范围为 1–20，间隔范围为 0–5000 ms；旧包缺少字段时默认单击一次、间隔 100 ms。
 
 `profile.sharing` 用于社区展示和兼容性判断：
 

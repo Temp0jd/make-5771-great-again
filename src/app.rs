@@ -86,6 +86,22 @@ struct TemplateTestOutcome {
     result: Result<vision::MatchReport, String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TemplateTestConfig {
+    algorithm: vision::MatchAlgorithm,
+    scale_mode: TemplateScaleMode,
+    reference_fallback: (u32, u32),
+    default_search_region: Option<SearchRegionSpec>,
+    max_threads: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TemplateRoiDraft {
+    template_id: u64,
+    inherit_default: bool,
+    region: SearchRegionSpec,
+}
+
 pub struct Make5771App {
     active_tab: AppTab,
     profile: MacroProfile,
@@ -115,6 +131,7 @@ pub struct Make5771App {
     countdown_capture_at: Option<std::time::Instant>,
     /// Template currently being renamed in the library: (template id, edit buffer).
     template_rename: Option<(u64, String)>,
+    template_roi_draft: Option<TemplateRoiDraft>,
     pending_capture: Option<image::RgbaImage>,
     capture_purpose: CapturePurpose,
     pending_test_capture: Option<(u64, image::RgbaImage)>,
@@ -219,6 +236,7 @@ impl Make5771App {
             thumbs: TemplateThumbs::default(),
             countdown_capture_at: None,
             template_rename: None,
+            template_roi_draft: None,
             pending_capture: None,
             capture_purpose: CapturePurpose::NewTemplate,
             pending_test_capture: None,
@@ -271,6 +289,91 @@ impl Make5771App {
             &self.shared_templates
         } else {
             &self.profile.templates
+        }
+    }
+
+    fn effective_templates_mut(&mut self) -> &mut Vec<TemplateAsset> {
+        if self.profile.shared_templates {
+            &mut self.shared_templates
+        } else {
+            &mut self.profile.templates
+        }
+    }
+
+    fn open_template_roi_editor(&mut self, template_id: u64) {
+        let Some(template) = self
+            .effective_templates()
+            .iter()
+            .find(|template| template.id == template_id)
+        else {
+            return;
+        };
+        let (width, height) = template.reference_size(
+            self.profile.expected_client_width,
+            self.profile.expected_client_height,
+        );
+        let inherited_region = self.profile.default_search_region.map(|region| {
+            self.profile.template_scale_mode.search_region(
+                region,
+                self.profile.expected_client_width,
+                self.profile.expected_client_height,
+                width,
+                height,
+            )
+        });
+        self.template_roi_draft = Some(TemplateRoiDraft {
+            template_id,
+            inherit_default: template.search_region.is_none(),
+            region: template
+                .search_region
+                .or(inherited_region)
+                .unwrap_or(SearchRegionSpec {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }),
+        });
+    }
+
+    fn apply_template_roi(&mut self, draft: TemplateRoiDraft) {
+        let fallback = (
+            self.profile.expected_client_width,
+            self.profile.expected_client_height,
+        );
+        let old_region;
+        {
+            let Some(template) = self
+                .effective_templates_mut()
+                .iter_mut()
+                .find(|template| template.id == draft.template_id)
+            else {
+                return;
+            };
+            old_region = template.search_region;
+            let (width, height) = template.reference_size(fallback.0, fallback.1);
+            template.search_region =
+                (!draft.inherit_default).then(|| clamp_search_region(draft.region, width, height));
+        }
+        let result = if self.profile.shared_templates {
+            storage::save_shared_templates(&self.shared_templates)
+                .map_err(|error| error.to_string())
+        } else {
+            storage::save_profile(&self.current_profile_path, &self.profile)
+                .map_err(|error| error.to_string())
+        };
+        match result {
+            Ok(()) => self.toast = Some("模板识别范围已保存".to_owned()),
+            Err(error) => {
+                if let Some(template) = self
+                    .effective_templates_mut()
+                    .iter_mut()
+                    .find(|template| template.id == draft.template_id)
+                {
+                    template.search_region = old_region;
+                }
+                self.toast = Some(format!("识别范围保存失败：{error}"));
+            }
         }
     }
 
@@ -649,28 +752,23 @@ impl Make5771App {
         // part runs on a worker thread and reports back through a channel.
         let (sender, receiver) = std::sync::mpsc::channel();
         let threshold = self.template_test_threshold;
-        let algorithm = self.profile.match_algorithm;
-        let scale_mode = self.profile.template_scale_mode;
-        let reference_fallback = (
-            self.profile.expected_client_width,
-            self.profile.expected_client_height,
-        );
-        let max_threads = self.profile.recognition_performance.max_threads();
+        let config = TemplateTestConfig {
+            algorithm: self.profile.match_algorithm,
+            scale_mode: self.profile.template_scale_mode,
+            reference_fallback: (
+                self.profile.expected_client_width,
+                self.profile.expected_client_height,
+            ),
+            default_search_region: self.profile.default_search_region,
+            max_threads: self.profile.recognition_performance.max_threads(),
+        };
         self.template_test_pending = Some(receiver);
         self.push_log(
             LogLevel::Info,
             format!("正在识别模板“{}”…", template_asset.name),
         );
         std::thread::spawn(move || {
-            let outcome = run_template_test_work(
-                template_asset,
-                frame,
-                threshold,
-                algorithm,
-                scale_mode,
-                reference_fallback,
-                max_threads,
-            );
+            let outcome = run_template_test_work(template_asset, frame, threshold, config);
             let _ = sender.send(outcome);
         });
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -779,11 +877,9 @@ impl Make5771App {
                     height: selection.height,
                     reference_width,
                     reference_height,
-                    search_region: Some(suggest_search_region(
-                        selection,
-                        reference_width,
-                        reference_height,
-                    )),
+                    search_region: self.profile.default_search_region.is_none().then(|| {
+                        suggest_search_region(selection, reference_width, reference_height)
+                    }),
                 };
                 if self.profile.shared_templates {
                     self.shared_templates.push(asset);
@@ -1250,7 +1346,13 @@ impl Make5771App {
             return;
         };
         let mut packaged = self.profile.clone();
-        packaged.templates = self.effective_templates().clone();
+        let referenced_paths = referenced_template_paths(&packaged);
+        packaged.templates = self
+            .effective_templates()
+            .iter()
+            .filter(|template| referenced_paths.contains(&template.path))
+            .cloned()
+            .collect();
         match storage::export_workflow_package(&path, &packaged) {
             Ok(summary) => {
                 let message = format!(
@@ -1564,13 +1666,18 @@ impl Make5771App {
             match self.profile.loop_mode {
                 LoopMode::Count => {
                     ui.horizontal(|ui| {
-                        ui.label("运行局数");
+                        ui.label("完成局数");
                         ui.add(
                             egui::DragValue::new(&mut self.profile.loop_count)
                                 .range(1..=9999)
                                 .suffix(" 局"),
                         );
                     });
+                    ui.label(
+                        RichText::new("每执行一次“本局结束”步骤计为 1 局")
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                    );
                 }
                 LoopMode::Deadline => {
                     ui.horizontal(|ui| {
@@ -1790,6 +1897,15 @@ impl Make5771App {
             if ui.button("刷新").clicked() {
                 self.refresh_profiles();
             }
+        });
+        ui.add_space(8.0);
+        theme::card().show(ui, |ui| {
+            default_search_region_editor(
+                ui,
+                &mut self.profile.default_search_region,
+                self.profile.expected_client_width,
+                self.profile.expected_client_height,
+            );
         });
         ui.add_space(10.0);
 
@@ -2082,6 +2198,11 @@ impl Make5771App {
                                     &mut step.click_offset_x,
                                     &mut step.click_offset_y,
                                 );
+                                click_repeat_editor(
+                                    ui,
+                                    &mut step.click_count,
+                                    &mut step.click_interval_ms,
+                                );
                             });
                     }
                     StepKind::WaitAny => {
@@ -2232,17 +2353,22 @@ impl Make5771App {
         ui.add_space(12.0);
         let mut requested_test = None;
         let mut requested_delete = None;
+        let mut requested_roi = None;
         let mut requested_rename: Option<(u64, String)> = None;
         let mut rename_apply = false;
         let mut rename_cancel = false;
         theme::card().show(ui, |ui| {
             ui.set_min_height(360.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.profile.shared_templates, true, "公共模板库");
-                ui.selectable_value(&mut self.profile.shared_templates, false, "随流程独立");
+                ui.label(RichText::new("模板来源").strong());
+                ui.label(if self.profile.shared_templates {
+                    "公共模板库"
+                } else {
+                    "当前流程独立模板（兼容旧流程）"
+                });
             });
             ui.label(
-                RichText::new("公共＝所有流程共用这份模板；独立＝模板随当前流程保存和分享")
+                RichText::new("模板来源随流程确定，避免直接切换造成已有步骤的图片引用失效。")
                     .size(11.0)
                     .color(theme::tertiary_label()),
             );
@@ -2268,7 +2394,7 @@ impl Make5771App {
                 });
             } else {
                 ui.horizontal(|ui| {
-                    ui.label("测试阈值");
+                    ui.label("仅本次测试阈值");
                     let minimum = if self.profile.match_algorithm == MatchAlgorithm::Hybrid {
                         vision::MIN_HYBRID_THRESHOLD
                     } else {
@@ -2279,7 +2405,7 @@ impl Make5771App {
                             .fixed_decimals(2),
                     );
                     ui.label(
-                        RichText::new("点击模板右侧的“测试”后自动切回游戏截图")
+                        RichText::new("单帧测试；实际运行还会进行稳定确认和智能 ROI 恢复")
                             .size(11.0)
                             .color(theme::tertiary_label()),
                     );
@@ -2358,6 +2484,9 @@ impl Make5771App {
                                         requested_rename =
                                             Some((template.id, template.name.clone()));
                                     }
+                                    if ui.button("范围").clicked() {
+                                        requested_roi = Some(template.id);
+                                    }
                                     let references =
                                         count_template_references(&self.profile, &template.path);
                                     if references > 0 {
@@ -2367,16 +2496,21 @@ impl Make5771App {
                                                 .color(theme::orange()),
                                         );
                                     }
-                                    if let Some(region) = template.search_region {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "搜索区 {} × {}",
-                                                region.width, region.height
-                                            ))
+                                    let region_label = match template.search_region {
+                                        Some(region) => format!(
+                                            "自定义 {}×{}+{},{}",
+                                            region.width, region.height, region.x, region.y
+                                        ),
+                                        None if self.profile.default_search_region.is_some() => {
+                                            "继承流程默认".to_owned()
+                                        }
+                                        None => "全屏".to_owned(),
+                                    };
+                                    ui.label(
+                                        RichText::new(region_label)
                                             .size(11.0)
                                             .color(theme::tertiary_label()),
-                                        );
-                                    }
+                                    );
                                 });
                             });
                             ui.separator();
@@ -2389,6 +2523,9 @@ impl Make5771App {
         }
         if let Some(template_id) = requested_delete {
             self.pending_delete_template = Some(template_id);
+        }
+        if let Some(template_id) = requested_roi {
+            self.open_template_roi_editor(template_id);
         }
         if rename_cancel {
             self.template_rename = None;
@@ -2668,7 +2805,7 @@ impl Make5771App {
 
         ui.add_space(10.0);
         theme::card().show(ui, |ui| {
-            ui.label(RichText::new("点击方式").size(18.0).strong());
+            ui.label(RichText::new("点击与识别").size(18.0).strong());
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("执行点击");
@@ -2690,6 +2827,13 @@ impl Make5771App {
                     ui.toggle_value(&mut self.profile.click_jitter, "开启");
                 });
             });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(
+                RichText::new("识别与性能")
+                    .size(12.0)
+                    .color(theme::secondary_label()),
+            );
             ui.horizontal(|ui| {
                 ui.label("识别模式");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2789,31 +2933,12 @@ impl Make5771App {
             if self.profile.click_method == ClickMethod::Background {
                 ui.label(
                     RichText::new(
-                        "后台点击不移动鼠标、不要求游戏在前台；如果游戏没有反应，请换回前台点击。",
+                        "后台点击不移动鼠标；为防误操作，识别和点击仍只在目标窗口处于前台时执行。",
                     )
                     .size(11.0)
                     .color(theme::orange()),
                 );
             }
-        });
-
-        ui.add_space(10.0);
-        theme::card().show(ui, |ui| {
-            ui.label(RichText::new("识别算法").size(18.0).strong());
-            ui.separator();
-            ui.label("自适应混合识别（纯 Rust）");
-            ui.label(
-                RichText::new(
-                    "稳定目标先走单候选快速路径；结果不确定时才执行 Top-4 + ZNCC 结构复核",
-                )
-                .size(11.0)
-                .color(theme::tertiary_label()),
-            );
-            ui.label(
-                RichText::new("已启用有效像素/透明 Alpha 掩码、可选软 ROI 恢复和 WaitAny 错峰发现")
-                    .size(11.0)
-                    .color(theme::tertiary_label()),
-            );
         });
 
         ui.add_space(10.0);
@@ -2918,17 +3043,6 @@ impl Make5771App {
                     .size(11.0)
                     .color(theme::tertiary_label()),
             );
-            ui.horizontal(|ui| {
-                if ui.button("新建流程").clicked() {
-                    self.request_new_flow();
-                }
-                if ui.button("导入分享包").clicked() {
-                    self.request_import_flow(None);
-                }
-                if ui.button("导出分享包").clicked() {
-                    self.export_flow_package();
-                }
-            });
         });
         ui.add_space(12.0);
     }
@@ -3174,6 +3288,11 @@ impl Make5771App {
                 .cloned();
             if let Some(template) = template {
                 let references = count_template_references(&self.profile, &template.path);
+                let other_profiles = if self.profile.shared_templates {
+                    profiles_referencing_template(&template.path, &self.current_profile_path)
+                } else {
+                    Vec::new()
+                };
                 let mut open = true;
                 let mut confirm = false;
                 let mut cancel = false;
@@ -3198,10 +3317,19 @@ impl Make5771App {
                                 );
                             });
                         });
-                        if references > 0 {
+                        if !other_profiles.is_empty() {
                             ui.label(
                                 RichText::new(format!(
-                                    "该模板被 {references} 个步骤或分支引用，删除后这些引用会被清空。"
+                                    "无法删除：另有 {} 个已保存流程仍在引用此公共模板（{}）。",
+                                    other_profiles.len(),
+                                    other_profiles.join("、")
+                                ))
+                                .color(Color32::from_rgb(255, 59, 48)),
+                            );
+                        } else if references > 0 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "该模板被当前流程 {references} 处引用，删除后这些引用会被清空。"
                                 ))
                                 .color(theme::orange()),
                             );
@@ -3215,7 +3343,13 @@ impl Make5771App {
                         );
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.add(theme::primary_button("确认删除")).clicked() {
+                            if ui
+                                .add_enabled(
+                                    other_profiles.is_empty(),
+                                    theme::primary_button("确认删除"),
+                                )
+                                .clicked()
+                            {
                                 confirm = true;
                             }
                             if ui.button("取消").clicked() {
@@ -3231,6 +3365,75 @@ impl Make5771App {
                 }
             } else {
                 self.pending_delete_template = None;
+            }
+        }
+
+        if let Some(mut draft) = self.template_roi_draft {
+            let template = self
+                .effective_templates()
+                .iter()
+                .find(|template| template.id == draft.template_id)
+                .cloned();
+            if let Some(template) = template {
+                let (reference_width, reference_height) = template.reference_size(
+                    self.profile.expected_client_width,
+                    self.profile.expected_client_height,
+                );
+                let mut open = true;
+                let mut save = false;
+                let mut cancel = false;
+                egui::Window::new("模板识别范围")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(520.0)
+                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new(&template.name).size(18.0).strong());
+                        ui.label(
+                            RichText::new(format!(
+                                "坐标基准：{} × {} 客户区",
+                                reference_width, reference_height
+                            ))
+                            .size(11.0)
+                            .color(theme::secondary_label()),
+                        );
+                        ui.separator();
+                        ui.radio_value(&mut draft.inherit_default, true, "继承流程默认范围");
+                        ui.radio_value(&mut draft.inherit_default, false, "此模板使用自定义范围");
+                        if !draft.inherit_default {
+                            search_region_fields(
+                                ui,
+                                &mut draft.region,
+                                reference_width,
+                                reference_height,
+                            );
+                        }
+                        ui.label(
+                            RichText::new("范围越小识别越省性能；目标可能移动时请适当留出边距。")
+                                .size(11.0)
+                                .color(theme::tertiary_label()),
+                        );
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.add(theme::primary_button("保存范围")).clicked() {
+                                save = true;
+                            }
+                            if ui.button("取消").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if save {
+                    self.template_roi_draft = None;
+                    self.apply_template_roi(draft);
+                } else if cancel || !open {
+                    self.template_roi_draft = None;
+                } else {
+                    self.template_roi_draft = Some(draft);
+                }
+            } else {
+                self.template_roi_draft = None;
             }
         }
 
@@ -3658,6 +3861,7 @@ fn visual_condition_editor(
             &mut step.visual_condition.click_offset_x,
             &mut step.visual_condition.click_offset_y,
         );
+        click_repeat_editor(ui, &mut step.click_count, &mut step.click_interval_ms);
         delay_editor(ui, "点击后等待", &mut step.delay_ms);
     }
     ui.label(
@@ -3770,6 +3974,7 @@ fn edit_workflow_branch(
             &mut branch.click_offset_x,
             &mut branch.click_offset_y,
         );
+        click_repeat_editor(ui, &mut branch.click_count, &mut branch.click_interval_ms);
         delay_editor(ui, "点击后等待", &mut branch.trigger_delay_ms);
     }
     ui.horizontal(|ui| {
@@ -3846,6 +4051,7 @@ fn edit_workflow_branch(
                         &mut action.click_offset_x,
                         &mut action.click_offset_y,
                     );
+                    click_repeat_editor(ui, &mut action.click_count, &mut action.click_interval_ms);
                     delay_editor(ui, "点击后等待", &mut action.delay_ms);
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut action.optional, "未找到时跳过（可选动作）");
@@ -3915,9 +4121,14 @@ fn step_summary(step: &WorkflowStep, templates: &[(u64, String, String)]) -> Str
     };
     let mut summary = match step.kind {
         StepKind::WaitAndClick => format!(
-            "{} · 超时 {}s",
+            "{} · 超时 {}s{}",
             template_name(&step.template),
-            step.timeout_secs
+            step.timeout_secs,
+            if step.click_count > 1 {
+                format!(" · 连点 {} 次", step.click_count)
+            } else {
+                String::new()
+            }
         ),
         StepKind::WaitAny => format!(
             "{} 个目标 · 超时 {}s",
@@ -4039,11 +4250,15 @@ fn run_template_test_work(
     template_asset: TemplateAsset,
     frame: image::RgbaImage,
     threshold: f32,
-    algorithm: vision::MatchAlgorithm,
-    scale_mode: TemplateScaleMode,
-    reference_fallback: (u32, u32),
-    max_threads: usize,
+    config: TemplateTestConfig,
 ) -> TemplateTestOutcome {
+    let TemplateTestConfig {
+        algorithm,
+        scale_mode,
+        reference_fallback,
+        default_search_region,
+        max_threads,
+    } = config;
     let threshold = vision::effective_threshold(algorithm, threshold);
     let full_region = SearchRegion::full(&frame);
     let mut template_rgb = match image::open(&template_asset.path) {
@@ -4063,7 +4278,13 @@ fn run_template_test_work(
     // matching what the runner does at run time.
     let (reference_width, reference_height) =
         template_asset.reference_size(reference_fallback.0, reference_fallback.1);
-    let mut scaled_region = template_asset.search_region;
+    let scaled_region = scale_mode.effective_search_region(
+        template_asset.search_region,
+        default_search_region,
+        (reference_width, reference_height),
+        reference_fallback,
+        (frame.width(), frame.height()),
+    );
     if reference_width != frame.width() || reference_height != frame.height() {
         let (width, height) = scale_mode.template_size(
             template_asset.width,
@@ -4079,15 +4300,6 @@ fn run_template_test_work(
             height,
             image::imageops::FilterType::Triangle,
         );
-        scaled_region = scaled_region.map(|region| {
-            scale_mode.search_region(
-                region,
-                reference_width,
-                reference_height,
-                frame.width(),
-                frame.height(),
-            )
-        });
     }
     let search_region = scaled_region
         .map(|region| SearchRegion {
@@ -4286,6 +4498,21 @@ fn click_anchor_offset_editors(
     );
 }
 
+fn click_repeat_editor(ui: &mut egui::Ui, count: &mut u8, interval_ms: &mut u32) {
+    ui.horizontal(|ui| {
+        ui.label("点击次数");
+        ui.add(egui::DragValue::new(count).range(1..=20).suffix(" 次"));
+        if *count > 1 {
+            ui.label("间隔");
+            ui.add(
+                egui::DragValue::new(interval_ms)
+                    .range(0..=5000)
+                    .suffix(" ms"),
+            );
+        }
+    });
+}
+
 fn threshold_editor(ui: &mut egui::Ui, threshold: &mut f32) {
     ui.label(
         RichText::new("识别相似度")
@@ -4419,6 +4646,43 @@ fn safety_status_row(ui: &mut egui::Ui, label: &str) {
     });
 }
 
+fn profiles_referencing_template(path: &str, exclude: &std::path::Path) -> Vec<String> {
+    storage::list_profiles()
+        .into_iter()
+        .filter(|profile_path| profile_path != exclude)
+        .filter_map(|profile_path| {
+            let profile = storage::load_profile(&profile_path).ok()?;
+            (count_template_references(&profile, path) > 0)
+                .then(|| storage::profile_display_name(&profile_path))
+        })
+        .collect()
+}
+
+fn referenced_template_paths(profile: &MacroProfile) -> std::collections::HashSet<String> {
+    let mut paths = std::collections::HashSet::new();
+    for step in &profile.steps {
+        if let Some(path) = &step.template {
+            paths.insert(path.clone());
+        }
+        for branch in &step.branches {
+            if let Some(path) = &branch.trigger_template {
+                paths.insert(path.clone());
+            }
+            for action in &branch.actions {
+                if let Some(path) = &action.template {
+                    paths.insert(path.clone());
+                }
+            }
+        }
+        for term in &step.visual_condition.terms {
+            if let Some(path) = &term.template {
+                paths.insert(path.clone());
+            }
+        }
+    }
+    paths
+}
+
 fn count_template_references(profile: &MacroProfile, path: &str) -> usize {
     let mut count = 0;
     for step in &profile.steps {
@@ -4428,6 +4692,9 @@ fn count_template_references(profile: &MacroProfile, path: &str) -> usize {
             for action in &branch.actions {
                 count += usize::from(action.template.as_deref() == Some(path));
             }
+        }
+        for term in &step.visual_condition.terms {
+            count += usize::from(term.template.as_deref() == Some(path));
         }
     }
     count
@@ -4441,6 +4708,9 @@ fn clear_template_references(profile: &mut MacroProfile, path: &str) {
             for action in &mut branch.actions {
                 clear_matching_path(&mut action.template, path);
             }
+        }
+        for term in &mut step.visual_condition.terms {
+            clear_matching_path(&mut term.template, path);
         }
     }
 }
@@ -4467,6 +4737,127 @@ fn safe_file_name(name: &str) -> String {
     } else {
         sanitized.to_owned()
     }
+}
+
+fn default_search_region_editor(
+    ui: &mut egui::Ui,
+    region: &mut Option<SearchRegionSpec>,
+    reference_width: u32,
+    reference_height: u32,
+) {
+    let reference_width = reference_width.max(1);
+    let reference_height = reference_height.max(1);
+    if let Some(current) = region {
+        *current = clamp_search_region(*current, reference_width, reference_height);
+    }
+    egui::CollapsingHeader::new(match region {
+        Some(region) => format!(
+            "流程默认识别范围 · {}×{}+{},{}",
+            region.width, region.height, region.x, region.y
+        ),
+        None => "流程默认识别范围 · 全屏".to_owned(),
+    })
+    .id_salt("default-search-region")
+    .default_open(false)
+    .show(ui, |ui| {
+        ui.label(
+            RichText::new("无单独设置的模板会继承此范围；HONG 等旧模板也可直接使用。")
+                .size(11.0)
+                .color(theme::secondary_label()),
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("全屏").clicked() {
+                *region = None;
+            }
+            for (label, preset) in [
+                (
+                    "上半屏",
+                    SearchRegionSpec {
+                        x: 0,
+                        y: 0,
+                        width: reference_width,
+                        height: (reference_height / 2).max(1),
+                    },
+                ),
+                (
+                    "下半屏",
+                    SearchRegionSpec {
+                        x: 0,
+                        y: reference_height / 2,
+                        width: reference_width,
+                        height: reference_height - reference_height / 2,
+                    },
+                ),
+                (
+                    "中央区域",
+                    SearchRegionSpec {
+                        x: reference_width / 8,
+                        y: reference_height / 8,
+                        width: (reference_width * 3 / 4).max(1),
+                        height: (reference_height * 3 / 4).max(1),
+                    },
+                ),
+            ] {
+                if ui.button(label).clicked() {
+                    *region = Some(preset);
+                }
+            }
+            if ui.button("自定义").clicked() && region.is_none() {
+                *region = Some(SearchRegionSpec {
+                    x: 0,
+                    y: 0,
+                    width: reference_width,
+                    height: reference_height,
+                });
+            }
+        });
+        if let Some(region) = region {
+            search_region_fields(ui, region, reference_width, reference_height);
+        }
+        ui.label(
+            RichText::new("目标位置不确定时保持全屏；范围越小，CPU 占用越低。")
+                .size(11.0)
+                .color(theme::tertiary_label()),
+        );
+    });
+}
+
+fn search_region_fields(
+    ui: &mut egui::Ui,
+    region: &mut SearchRegionSpec,
+    reference_width: u32,
+    reference_height: u32,
+) {
+    let reference_width = reference_width.max(1);
+    let reference_height = reference_height.max(1);
+    *region = clamp_search_region(*region, reference_width, reference_height);
+    ui.horizontal(|ui| {
+        ui.label("X");
+        ui.add(egui::DragValue::new(&mut region.x).range(0..=reference_width - 1));
+        ui.label("Y");
+        ui.add(egui::DragValue::new(&mut region.y).range(0..=reference_height - 1));
+    });
+    ui.horizontal(|ui| {
+        ui.label("宽");
+        ui.add(egui::DragValue::new(&mut region.width).range(1..=reference_width));
+        ui.label("高");
+        ui.add(egui::DragValue::new(&mut region.height).range(1..=reference_height));
+    });
+    *region = clamp_search_region(*region, reference_width, reference_height);
+}
+
+fn clamp_search_region(
+    mut region: SearchRegionSpec,
+    reference_width: u32,
+    reference_height: u32,
+) -> SearchRegionSpec {
+    let reference_width = reference_width.max(1);
+    let reference_height = reference_height.max(1);
+    region.x = region.x.min(reference_width - 1);
+    region.y = region.y.min(reference_height - 1);
+    region.width = region.width.clamp(1, reference_width - region.x);
+    region.height = region.height.clamp(1, reference_height - region.y);
+    region
 }
 
 fn suggest_search_region(
@@ -4921,6 +5312,10 @@ mod tests {
         .iter()
         .map(|(from, to)| (from.to_string(), to.to_string()))
         .collect();
+        let referenced = referenced_template_paths(&profile);
+        assert_eq!(referenced.len(), 4);
+        assert_eq!(count_template_references(&profile, "old-term.png"), 1);
+
         remap_profile_template_paths(&mut profile, &remap);
 
         let step = &profile.steps[0];

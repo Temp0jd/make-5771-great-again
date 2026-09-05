@@ -175,6 +175,29 @@ impl TemplateScaleMode {
         }
     }
 
+    /// Resolves a template-specific ROI or the workflow fallback directly into
+    /// live-frame coordinates. Each source has a different coordinate space.
+    pub fn effective_search_region(
+        self,
+        template_region: Option<SearchRegionSpec>,
+        default_region: Option<SearchRegionSpec>,
+        template_reference: (u32, u32),
+        profile_reference: (u32, u32),
+        frame_size: (u32, u32),
+    ) -> Option<SearchRegionSpec> {
+        let (region, source_size) = match template_region {
+            Some(region) => (region, template_reference),
+            None => (default_region?, profile_reference),
+        };
+        Some(self.search_region(
+            region,
+            source_size.0,
+            source_size.1,
+            frame_size.0,
+            frame_size.1,
+        ))
+    }
+
     pub fn search_region(
         self,
         region: SearchRegionSpec,
@@ -305,6 +328,14 @@ impl KeyInputMode {
 
 fn default_key_interval_ms() -> u32 {
     60
+}
+
+fn default_click_count() -> u8 {
+    1
+}
+
+fn default_click_interval_ms() -> u32 {
+    100
 }
 
 fn default_capture_hotkey() -> String {
@@ -535,6 +566,8 @@ pub enum StepKind {
     WaitAndClick,
     WaitAny,
     VisualCondition,
+    /// Legacy serialized tombstone. It is intentionally absent from the step
+    /// picker and rejected at runtime; keep it so old drafts still open.
     Branch,
     Delay,
     SendKeys,
@@ -709,6 +742,10 @@ pub struct BranchAction {
     pub click_offset_x: i32,
     #[serde(default)]
     pub click_offset_y: i32,
+    #[serde(default = "default_click_count")]
+    pub click_count: u8,
+    #[serde(default = "default_click_interval_ms")]
+    pub click_interval_ms: u32,
     /// When true, a WaitAndClick action that times out is skipped instead of
     /// failing the whole branch (for screens that only appear sometimes).
     #[serde(default)]
@@ -728,6 +765,8 @@ impl BranchAction {
             click_anchor: ClickAnchor::default(),
             click_offset_x: 0,
             click_offset_y: 0,
+            click_count: default_click_count(),
+            click_interval_ms: default_click_interval_ms(),
             optional: false,
         }
     }
@@ -748,6 +787,10 @@ pub struct WorkflowBranch {
     pub click_offset_x: i32,
     #[serde(default)]
     pub click_offset_y: i32,
+    #[serde(default = "default_click_count")]
+    pub click_count: u8,
+    #[serde(default = "default_click_interval_ms")]
+    pub click_interval_ms: u32,
     #[serde(default)]
     pub actions: Vec<BranchAction>,
 }
@@ -765,6 +808,8 @@ impl WorkflowBranch {
             click_anchor: ClickAnchor::default(),
             click_offset_x: 0,
             click_offset_y: 0,
+            click_count: default_click_count(),
+            click_interval_ms: default_click_interval_ms(),
             actions: Vec::new(),
         }
     }
@@ -789,6 +834,7 @@ pub struct WorkflowStep {
     pub id: u64,
     pub name: String,
     pub kind: StepKind,
+    /// Legacy layout field retained only for profile/package compatibility.
     pub indent: u8,
     pub enabled: bool,
     pub template: Option<String>,
@@ -801,6 +847,10 @@ pub struct WorkflowStep {
     pub click_offset_x: i32,
     #[serde(default)]
     pub click_offset_y: i32,
+    #[serde(default = "default_click_count")]
+    pub click_count: u8,
+    #[serde(default = "default_click_interval_ms")]
+    pub click_interval_ms: u32,
     #[serde(default)]
     pub key_mode: KeyInputMode,
     #[serde(default)]
@@ -830,6 +880,8 @@ impl WorkflowStep {
             click_anchor: ClickAnchor::default(),
             click_offset_x: 0,
             click_offset_y: 0,
+            click_count: default_click_count(),
+            click_interval_ms: default_click_interval_ms(),
             key_mode: KeyInputMode::default(),
             key_text: String::new(),
             key_combo: String::new(),
@@ -934,6 +986,10 @@ pub struct MacroProfile {
     /// newly created profiles preserve template aspect ratio.
     #[serde(default)]
     pub template_scale_mode: TemplateScaleMode,
+    /// Default search area inherited by templates without their own ROI.
+    /// Missing legacy fields remain full-screen (`None`).
+    #[serde(default)]
+    pub default_search_region: Option<SearchRegionSpec>,
     /// When enabled, a configured ROI is treated as a fast hint and bounded
     /// misses trigger a full-screen recovery. Missing legacy fields stay false.
     #[serde(default)]
@@ -993,6 +1049,7 @@ impl Default for MacroProfile {
             match_algorithm: MatchAlgorithm::Hybrid,
             recognition_performance: RecognitionPerformance::default(),
             template_scale_mode: TemplateScaleMode::UniformFit,
+            default_search_region: None,
             adaptive_roi: true,
             stable_confirm: default_stable_confirm(),
             sharing: SharingMetadata::default(),
@@ -1028,6 +1085,15 @@ impl MacroProfile {
         if self.steps.len() > 1000 {
             issues.push("流程步骤数不能超过 1000".to_owned());
         }
+        if let Some(region) = self.default_search_region
+            && !valid_search_region(
+                region,
+                self.expected_client_width,
+                self.expected_client_height,
+            )
+        {
+            issues.push("流程默认识别区域无效".to_owned());
+        }
         for (label, value, limit) in [
             ("作者", &self.sharing.author, 100),
             ("游戏版本", &self.sharing.game_version, 100),
@@ -1054,6 +1120,12 @@ impl MacroProfile {
             if step.timeout_secs == 0 {
                 issues.push(format!("步骤“{}”的超时必须大于零", step.name));
             }
+            if !(1..=20).contains(&step.click_count) {
+                issues.push(format!("步骤“{}”的点击次数必须为 1-20", step.name));
+            }
+            if step.click_interval_ms > 5000 {
+                issues.push(format!("步骤“{}”的连点间隔不能超过 5000 ms", step.name));
+            }
             if step.branches.len() > 100 {
                 issues.push(format!("步骤“{}”的分支数不能超过 100", step.name));
             }
@@ -1062,6 +1134,18 @@ impl MacroProfile {
             }
             if step.visual_condition.terms.len() > 20 {
                 issues.push(format!("步骤“{}”的视觉条件不能超过 20 条", step.name));
+            }
+            if step.visual_condition.outcome == ConditionOutcome::ClickTemplate
+                && !step
+                    .visual_condition
+                    .terms
+                    .iter()
+                    .any(|term| term.expectation == ConditionExpectation::Present)
+            {
+                issues.push(format!(
+                    "步骤“{}”要点击模板时至少需要一条“出现”条件",
+                    step.name
+                ));
             }
             let mut condition_term_ids = std::collections::HashSet::new();
             for term in &step.visual_condition.terms {
@@ -1086,6 +1170,12 @@ impl MacroProfile {
                 if !(0.0..=1.0).contains(&branch.threshold) {
                     issues.push(format!("分支“{}”的相似度不合法", branch.name));
                 }
+                if !(1..=20).contains(&branch.click_count) {
+                    issues.push(format!("分支“{}”的点击次数必须为 1-20", branch.name));
+                }
+                if branch.click_interval_ms > 5000 {
+                    issues.push(format!("分支“{}”的连点间隔不能超过 5000 ms", branch.name));
+                }
                 if branch.actions.len() > 100 {
                     issues.push(format!("分支“{}”的动作数不能超过 100", branch.name));
                 }
@@ -1103,6 +1193,12 @@ impl MacroProfile {
                     }
                     if action.timeout_secs == 0 {
                         issues.push(format!("动作“{}”的超时必须大于零", action.name));
+                    }
+                    if !(1..=20).contains(&action.click_count) {
+                        issues.push(format!("动作“{}”的点击次数必须为 1-20", action.name));
+                    }
+                    if action.click_interval_ms > 5000 {
+                        issues.push(format!("动作“{}”的连点间隔不能超过 5000 ms", action.name));
                     }
                 }
             }
@@ -1126,11 +1222,10 @@ impl MacroProfile {
             if template.width == 0 || template.height == 0 {
                 issues.push(format!("模板“{}”的尺寸无效", template.name));
             }
+            let (reference_width, reference_height) =
+                template.reference_size(self.expected_client_width, self.expected_client_height);
             if let Some(region) = template.search_region
-                && (region.width == 0
-                    || region.height == 0
-                    || region.x.saturating_add(region.width) > template.reference_width
-                    || region.y.saturating_add(region.height) > template.reference_height)
+                && !valid_search_region(region, reference_width, reference_height)
             {
                 issues.push(format!("模板“{}”的搜索区域无效", template.name));
             }
@@ -1142,6 +1237,13 @@ impl MacroProfile {
             Err(issues)
         }
     }
+}
+
+fn valid_search_region(region: SearchRegionSpec, width: u32, height: u32) -> bool {
+    region.width > 0
+        && region.height > 0
+        && region.x.saturating_add(region.width) <= width
+        && region.y.saturating_add(region.height) <= height
 }
 
 fn valid_deadline(value: &str) -> bool {
@@ -1197,6 +1299,27 @@ mod tests {
         assert!(
             RecognitionPerformance::Eco.poll_interval_ms()
                 > RecognitionPerformance::Responsive.poll_interval_ms()
+        );
+    }
+
+    #[test]
+    fn click_visual_condition_requires_a_present_term() {
+        let mut profile = MacroProfile::default();
+        profile.steps[0].kind = StepKind::VisualCondition;
+        profile.steps[0].visual_condition.outcome = ConditionOutcome::ClickTemplate;
+        profile.steps[0]
+            .visual_condition
+            .terms
+            .push(VisualConditionTerm::new(
+                1,
+                "gone",
+                ConditionExpectation::Absent,
+            ));
+        let issues = profile.validate().unwrap_err();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("至少需要一条“出现”条件"))
         );
     }
 
@@ -1309,6 +1432,51 @@ mod tests {
     }
 
     #[test]
+    fn effective_roi_uses_the_coordinate_space_of_its_source() {
+        let default = Some(SearchRegionSpec {
+            x: 640,
+            y: 360,
+            width: 320,
+            height: 180,
+        });
+        let template_override = Some(SearchRegionSpec {
+            x: 400,
+            y: 300,
+            width: 400,
+            height: 300,
+        });
+        let mode = TemplateScaleMode::UniformFit;
+
+        // Profile 16:9, template 4:3 and live frame 16:10 deliberately use
+        // three aspect ratios. The default must map directly profile -> frame.
+        assert_eq!(
+            mode.effective_search_region(None, default, (1600, 1200), (1280, 720), (640, 400),),
+            Some(SearchRegionSpec {
+                x: 320,
+                y: 200,
+                width: 160,
+                height: 90,
+            })
+        );
+        // A template override wins and therefore maps from 4:3 template space.
+        assert_eq!(
+            mode.effective_search_region(
+                template_override,
+                default,
+                (1600, 1200),
+                (1280, 720),
+                (640, 400),
+            ),
+            Some(SearchRegionSpec {
+                x: 186,
+                y: 100,
+                width: 133,
+                height: 100,
+            })
+        );
+    }
+
+    #[test]
     fn legacy_template_reference_size_uses_profile_fallback() {
         let template = TemplateAsset {
             id: 1,
@@ -1358,6 +1526,8 @@ mod tests {
         assert_eq!(step.click_anchor, ClickAnchor::Center);
         assert_eq!(step.click_offset_x, 0);
         assert_eq!(step.click_offset_y, 0);
+        assert_eq!(step.click_count, 1);
+        assert_eq!(step.click_interval_ms, 100);
         assert_eq!(step.key_mode, KeyInputMode::Text);
         assert!(step.key_text.is_empty());
         assert!(step.key_combo.is_empty());
@@ -1447,6 +1617,8 @@ mod tests {
         assert_eq!(branch.click_anchor, ClickAnchor::Center);
         assert_eq!(branch.click_offset_x, 0);
         assert_eq!(branch.click_offset_y, 0);
+        assert_eq!(branch.click_count, 1);
+        assert_eq!(branch.click_interval_ms, 100);
 
         let action: BranchAction = serde_json::from_str(
             r#"{
@@ -1462,6 +1634,8 @@ mod tests {
         .unwrap();
         assert_eq!(action.click_anchor, ClickAnchor::Center);
         assert_eq!(action.click_offset_x, 0);
+        assert_eq!(action.click_count, 1);
+        assert_eq!(action.click_interval_ms, 100);
         assert!(!action.optional);
 
         let spec: VisualConditionSpec = serde_json::from_str(
@@ -1482,6 +1656,7 @@ mod tests {
         object.remove("match_algorithm");
         object.remove("recognition_performance");
         object.remove("template_scale_mode");
+        object.remove("default_search_region");
         object.remove("adaptive_roi");
         object.remove("stable_confirm");
         let profile: MacroProfile = serde_json::from_value(value).unwrap();
@@ -1494,6 +1669,7 @@ mod tests {
             RecognitionPerformance::Balanced
         );
         assert_eq!(profile.template_scale_mode, TemplateScaleMode::Stretch);
+        assert_eq!(profile.default_search_region, None);
         assert!(!profile.adaptive_roi);
         assert!(profile.stable_confirm);
     }

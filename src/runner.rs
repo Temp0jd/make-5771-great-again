@@ -336,21 +336,26 @@ fn load_templates(
         );
 
         let mut scaled_asset = asset.clone();
+        // Template overrides use template-capture coordinates. The workflow
+        // default uses profile-base coordinates and maps directly to the live
+        // frame; composing both spaces is incorrect when their aspect ratios
+        // differ.
+        scaled_asset.search_region = profile.template_scale_mode.effective_search_region(
+            asset.search_region,
+            profile.default_search_region,
+            (reference_width, reference_height),
+            (
+                profile.expected_client_width,
+                profile.expected_client_height,
+            ),
+            (frame_width, frame_height),
+        );
         scaled_asset.reference_width = frame_width;
         scaled_asset.reference_height = frame_height;
         let (image, image_rgb) =
             if reference_width == frame_width && reference_height == frame_height {
                 (image, image_rgb)
             } else {
-                scaled_asset.search_region = asset.search_region.map(|region| {
-                    profile.template_scale_mode.search_region(
-                        region,
-                        reference_width,
-                        reference_height,
-                        frame_width,
-                        frame_height,
-                    )
-                });
                 let (width, height) = profile.template_scale_mode.template_size(
                     asset.width,
                     asset.height,
@@ -626,12 +631,14 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
                     continue;
                 }
             }
-            click_match(
+            click_match_repeated(
                 ctx,
                 &found,
                 step.click_anchor,
                 step.click_offset_x,
                 step.click_offset_y,
+                step.click_count,
+                step.click_interval_ms,
             )?;
             let _ = ctx.events.send(RunnerEvent::MatchFound {
                 name: step.name.clone(),
@@ -659,19 +666,26 @@ fn same_target(a: (u32, u32), b: (u32, u32)) -> bool {
 
 /// Clicks a matched template box at the configured anchor plus pixel offset,
 /// clamped to the client area.
-fn click_match(
+fn click_match_repeated(
     ctx: &mut StepContext<'_>,
     found: &vision::TemplateMatch,
     anchor: ClickAnchor,
     offset_x: i32,
     offset_y: i32,
+    count: u8,
+    interval_ms: u32,
 ) -> Result<(), String> {
     let (base_x, base_y) = anchor_point(found, anchor);
     let x = (base_x as i32 + offset_x).clamp(0, ctx.target.client_width.saturating_sub(1) as i32)
         as u32;
     let y = (base_y as i32 + offset_y).clamp(0, ctx.target.client_height.saturating_sub(1) as i32)
         as u32;
-    ctx.click(x, y)?;
+    for index in 0..count.max(1) {
+        ctx.click(x, y)?;
+        if index + 1 < count {
+            ctx.wait(interval_ms)?;
+        }
+    }
     // A successful click may change the entire screen. Carrying a location
     // hint across that transition can make a previous false positive sticky.
     ctx.clear_match_cache();
@@ -912,12 +926,14 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
             score: found.score,
         });
         if branch.click_trigger {
-            click_match(
+            click_match_repeated(
                 ctx,
                 &found,
                 branch.click_anchor,
                 branch.click_offset_x,
                 branch.click_offset_y,
+                branch.click_count,
+                branch.click_interval_ms,
             )?;
             ctx.wait(branch.trigger_delay_ms)?;
         }
@@ -1009,7 +1025,8 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
             if term_met {
                 satisfied += 1;
             }
-            if matched.is_none()
+            if term.expectation == ConditionExpectation::Present
+                && matched.is_none()
                 && let Some(found) = report.matched
             {
                 matched = Some((term, found));
@@ -1031,26 +1048,34 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
             continue;
         }
 
+        if spec.outcome == ConditionOutcome::ClickTemplate && matched.is_none() {
+            // An `Absent` term can satisfy an OR condition, but it cannot
+            // provide a safe click location. Wait for a Present term instead.
+            stable_hits = 0;
+            ctx.recognition_wait(false)?;
+            continue;
+        }
         let _ = ctx.events.send(RunnerEvent::ConditionMatched {
             step: step.name.clone(),
         });
         match spec.outcome {
             ConditionOutcome::ContinueFlow => return Ok(StepControl::Continue),
             ConditionOutcome::ClickTemplate => {
-                if let Some((term, found)) = matched {
-                    click_match(
-                        ctx,
-                        &found,
-                        spec.click_anchor,
-                        spec.click_offset_x,
-                        spec.click_offset_y,
-                    )?;
-                    let _ = ctx.events.send(RunnerEvent::MatchFound {
-                        name: term.name.clone(),
-                        score: found.score,
-                    });
-                    ctx.wait(step.delay_ms)?;
-                }
+                let (term, found) = matched.expect("click outcome checked for a Present match");
+                click_match_repeated(
+                    ctx,
+                    &found,
+                    spec.click_anchor,
+                    spec.click_offset_x,
+                    spec.click_offset_y,
+                    step.click_count,
+                    step.click_interval_ms,
+                )?;
+                let _ = ctx.events.send(RunnerEvent::MatchFound {
+                    name: term.name.clone(),
+                    score: found.score,
+                });
+                ctx.wait(step.delay_ms)?;
                 return Ok(StepControl::Continue);
             }
             ConditionOutcome::CompleteRound => return Ok(StepControl::CompleteRound),
@@ -1103,6 +1128,8 @@ fn wait_and_click_action(ctx: &mut StepContext<'_>, action: &BranchAction) -> Re
         click_anchor: action.click_anchor,
         click_offset_x: action.click_offset_x,
         click_offset_y: action.click_offset_y,
+        click_count: action.click_count,
+        click_interval_ms: action.click_interval_ms,
         ..WorkflowStep::new(action.id, action.name.clone(), StepKind::WaitAndClick, 0)
     };
     wait_and_click(ctx, &step)
@@ -1438,6 +1465,50 @@ mod tests {
         );
         assert_eq!(loaded.asset.reference_width, 640);
         assert_eq!(loaded.asset.reference_height, 400);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workflow_default_roi_maps_through_template_reference_space() {
+        let root = std::env::temp_dir().join(format!("m5771-default-roi-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let image_path = root.join("template.png");
+        image::RgbaImage::from_pixel(8, 6, image::Rgba([10, 20, 30, 255]))
+            .save(&image_path)
+            .unwrap();
+
+        let mut profile = MacroProfile {
+            expected_client_width: 1280,
+            expected_client_height: 720,
+            default_search_region: Some(crate::model::SearchRegionSpec {
+                x: 640,
+                y: 360,
+                width: 320,
+                height: 180,
+            }),
+            ..MacroProfile::default()
+        };
+        profile.templates.push(TemplateAsset {
+            id: 1,
+            name: "inherited".to_owned(),
+            path: image_path.to_string_lossy().into_owned(),
+            width: 8,
+            height: 6,
+            // Deliberately use a third aspect ratio so a wrong two-stage
+            // profile -> template -> frame mapping produces another ROI.
+            reference_width: 1600,
+            reference_height: 1200,
+            search_region: None,
+        });
+
+        let (templates, _) = load_templates(&profile, 640, 400).unwrap();
+        let loaded = templates.values().next().unwrap();
+        let region = loaded.asset.search_region.unwrap();
+        assert_eq!(
+            (region.x, region.y, region.width, region.height),
+            (320, 200, 160, 90)
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
