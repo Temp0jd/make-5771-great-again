@@ -138,7 +138,6 @@ struct TemplateTestConfig {
     algorithm: vision::MatchAlgorithm,
     scale_mode: TemplateScaleMode,
     reference_fallback: (u32, u32),
-    default_search_region: Option<SearchRegionSpec>,
     adaptive_roi: bool,
     recovery_checks: u8,
     max_threads: usize,
@@ -147,7 +146,7 @@ struct TemplateTestConfig {
 #[derive(Debug, Clone, Copy)]
 struct TemplateRoiDraft {
     template_id: u64,
-    inherit_default: bool,
+    full_frame: bool,
     region: SearchRegionSpec,
 }
 
@@ -534,27 +533,15 @@ impl Make5771App {
             self.profile.expected_client_width,
             self.profile.expected_client_height,
         );
-        let inherited_region = self.profile.default_search_region.map(|region| {
-            self.profile.template_scale_mode.search_region(
-                region,
-                self.profile.expected_client_width,
-                self.profile.expected_client_height,
-                width,
-                height,
-            )
-        });
         self.template_roi_draft = Some(TemplateRoiDraft {
             template_id,
-            inherit_default: template.search_region.is_none(),
-            region: template
-                .search_region
-                .or(inherited_region)
-                .unwrap_or(SearchRegionSpec {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                }),
+            full_frame: template.search_region.is_none(),
+            region: template.search_region.unwrap_or(SearchRegionSpec {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }),
         });
     }
 
@@ -575,7 +562,7 @@ impl Make5771App {
             old_region = template.search_region;
             let (width, height) = template.reference_size(fallback.0, fallback.1);
             template.search_region =
-                (!draft.inherit_default).then(|| clamp_search_region(draft.region, width, height));
+                (!draft.full_frame).then(|| clamp_search_region(draft.region, width, height));
         }
         let result = if self.profile.shared_templates {
             storage::save_shared_templates(&self.shared_templates)
@@ -1099,7 +1086,6 @@ impl Make5771App {
                 self.profile.expected_client_width,
                 self.profile.expected_client_height,
             ),
-            default_search_region: self.profile.default_search_region,
             adaptive_roi: self.profile.adaptive_roi,
             recovery_checks: self.profile.recognition_performance.roi_recovery_checks(),
             max_threads: self.profile.recognition_performance.max_threads(),
@@ -1317,9 +1303,11 @@ impl Make5771App {
                     height: selection.height,
                     reference_width,
                     reference_height,
-                    search_region: self.profile.default_search_region.is_none().then(|| {
-                        suggest_search_region(selection, reference_width, reference_height)
-                    }),
+                    search_region: Some(suggest_search_region(
+                        selection,
+                        reference_width,
+                        reference_height,
+                    )),
                 };
                 let asset_path = asset.path.clone();
                 let old_profile = self.profile.clone();
@@ -2269,7 +2257,7 @@ impl Make5771App {
                 }
                 for warning in report.warnings.iter().take(3) {
                     ui.label(
-                        RichText::new(format!("• {warning}"))
+                        RichText::new(format!("- {warning}"))
                             .size(11.0)
                             .color(theme::orange()),
                     );
@@ -2421,460 +2409,477 @@ impl Make5771App {
                 self.refresh_profiles();
             }
         });
-        ui.add_space(8.0);
-        theme::card().show(ui, |ui| {
-            default_search_region_editor(
-                ui,
-                &mut self.profile.default_search_region,
-                self.profile.expected_client_width,
-                self.profile.expected_client_height,
-            );
-        });
         ui.add_space(10.0);
 
-        let list_width = (ui.available_width() * 0.43).clamp(320.0, 440.0);
         let reference_size = (
             self.profile.expected_client_width,
             self.profile.expected_client_height,
         );
         let profile_scan_interval = self.profile.idle_scan_secs;
         let mut workflow_action: Option<WorkflowTemplateAction> = None;
-        ui.columns(2, |columns| {
-            columns[0].set_width(list_width);
-            theme::card().show(&mut columns[0], |ui| {
-                let mut list_command = None;
-                ui.label(RichText::new(&self.profile.name).size(18.0).strong());
-                ui.horizontal(|ui| {
-                    ui.menu_button("添加步骤 ▾", |ui| {
-                        for (kind, hint) in [
-                            (StepKind::WaitAndClick, "等到目标图片出现后点击它，最常用"),
-                            (
-                                StepKind::WaitAny,
-                                "同时监控多个画面，先出现先处理，适合应对随机弹窗",
-                            ),
-                            (
-                                StepKind::VisualCondition,
-                                "判断画面条件，决定继续、点击或结束本局",
-                            ),
-                            (StepKind::Delay, "原地等待固定时长"),
-                            (StepKind::SendKeys, "向游戏窗口键入文字或按键，仅前台有效"),
-                            (StepKind::RoundEnd, "把当前局计入完成数，并开始下一轮"),
-                        ] {
-                            if ui.button(kind.label()).on_hover_text(hint).clicked() {
-                                list_command = Some(StepListCommand::Add(kind));
-                                ui.close();
-                            }
-                        }
-                    });
-                    ui.label(
-                        RichText::new("行内 ↑↓ 调顺序，⋯ 复制/停用/删除")
-                            .size(11.0)
-                            .color(theme::tertiary_label()),
-                    );
-                });
-                ui.separator();
-
-                let window_height = ui
-                    .ctx()
-                    .input(|input| input.viewport().inner_rect.map(|rect| rect.height()))
-                    .unwrap_or(800.0);
-                let list_height = (window_height - 350.0).clamp(320.0, 720.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("workflow-step-list")
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .max_height(list_height)
-                    .show(ui, |ui| {
-                        for (index, step) in self.profile.steps.iter().enumerate() {
-                            let selected = self.selected_step == Some(step.id);
-                            ui.horizontal(|ui| {
-                                let controls_width = 3.0 * 24.0 + 16.0;
-                                let button_width =
-                                    (ui.available_width() - 18.0 - controls_width).max(120.0);
-                                let button = egui::Button::new(step_row_text(
-                                    step,
-                                    index,
-                                    selected,
-                                    &template_options,
-                                ))
-                                .fill(if selected {
-                                    theme::blue().gamma_multiply(0.10)
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
-                                .stroke(if selected {
-                                    Stroke::new(1.0, theme::blue().gamma_multiply(0.35))
-                                } else {
-                                    Stroke::NONE
-                                })
-                                .min_size(Vec2::new(button_width, 44.0));
-                                if ui.add(button).clicked() {
-                                    self.selected_step = Some(step.id);
-                                }
-                                if ui
-                                    .add_enabled(
-                                        index > 0,
-                                        egui::Button::new(RichText::new("↑").size(12.0))
-                                            .min_size(Vec2::splat(24.0)),
-                                    )
-                                    .on_hover_text("上移")
-                                    .clicked()
-                                {
-                                    list_command = Some(StepListCommand::MoveUp(index));
-                                }
-                                if ui
-                                    .add_enabled(
-                                        index + 1 < self.profile.steps.len(),
-                                        egui::Button::new(RichText::new("↓").size(12.0))
-                                            .min_size(Vec2::splat(24.0)),
-                                    )
-                                    .on_hover_text("下移")
-                                    .clicked()
-                                {
-                                    list_command = Some(StepListCommand::MoveDown(index));
-                                }
-                                ui.menu_button(RichText::new("⋯").size(13.0), |ui| {
-                                    let toggle_label = if step.enabled {
-                                        "停用此步骤"
-                                    } else {
-                                        "启用此步骤"
-                                    };
-                                    if ui.button(toggle_label).clicked() {
-                                        list_command = Some(StepListCommand::ToggleEnabled(index));
-                                        ui.close();
-                                    }
-                                    if ui.button("复制步骤").clicked() {
-                                        list_command = Some(StepListCommand::Duplicate(index));
-                                        ui.close();
-                                    }
-                                    ui.separator();
-                                    if ui
-                                        .add_enabled(
-                                            self.profile.steps.len() > 1,
-                                            egui::Button::new("删除步骤"),
-                                        )
-                                        .clicked()
-                                    {
-                                        list_command = Some(StepListCommand::Delete(index));
-                                        ui.close();
-                                    }
-                                });
-                            });
-                        }
-                    });
-
-                // Commands are produced by the row widgets above, so they must
-                // be applied only after the list has rendered.
-                match list_command {
-                    Some(StepListCommand::Add(kind)) => {
-                        let id = self
-                            .profile
-                            .steps
-                            .iter()
-                            .map(|step| step.id)
-                            .max()
-                            .unwrap_or(0)
-                            + 1;
-                        let count = self
-                            .profile
-                            .steps
-                            .iter()
-                            .filter(|step| step.kind == kind)
-                            .count();
-                        self.profile.steps.push(WorkflowStep::new(
-                            id,
-                            format!("{} {}", kind.label(), count + 1),
-                            kind,
-                            0,
-                        ));
-                        self.selected_step = Some(id);
-                    }
-                    Some(StepListCommand::MoveUp(index)) => {
-                        self.profile.steps.swap(index, index - 1);
-                    }
-                    Some(StepListCommand::MoveDown(index)) => {
-                        self.profile.steps.swap(index, index + 1);
-                    }
-                    Some(StepListCommand::Duplicate(index)) => {
-                        let mut copy = self.profile.steps[index].clone();
-                        copy.id = self
-                            .profile
-                            .steps
-                            .iter()
-                            .map(|step| step.id)
-                            .max()
-                            .unwrap_or(0)
-                            + 1;
-                        copy.name = format!("{} 副本", copy.name);
-                        let new_id = copy.id;
-                        self.profile.steps.insert(index + 1, copy);
-                        self.selected_step = Some(new_id);
-                    }
-                    Some(StepListCommand::ToggleEnabled(index)) => {
-                        let step = &mut self.profile.steps[index];
-                        step.enabled = !step.enabled;
-                    }
-                    Some(StepListCommand::Delete(index)) => {
-                        self.profile.steps.remove(index);
-                        let next_index = index.min(self.profile.steps.len() - 1);
-                        self.selected_step = Some(self.profile.steps[next_index].id);
-                    }
-                    None => {}
-                }
-            });
-
-            theme::card().show(&mut columns[1], |ui| {
-                ui.label(RichText::new("所选步骤").size(18.0).strong());
-                ui.separator();
-                let Some(selected_id) = self.selected_step else {
-                    ui.label("请选择一个步骤");
-                    return;
-                };
-                let Some(step) = self
-                    .profile
-                    .steps
-                    .iter_mut()
-                    .find(|step| step.id == selected_id)
-                else {
-                    ui.label("步骤不存在");
-                    return;
-                };
-
-                ui.label(RichText::new(&step.name).size(16.0).strong());
-                ui.label(
-                    RichText::new(step_summary(step, &template_options))
-                        .size(11.0)
-                        .color(theme::secondary_label()),
-                );
-                egui::CollapsingHeader::new("编辑详细设置")
-                    .id_salt(("step-details", step.id))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("名称")
-                                .size(12.0)
-                                .color(theme::secondary_label()),
-                        );
-                        ui.text_edit_singleline(&mut step.name);
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new("类型")
-                                .size(12.0)
-                                .color(theme::secondary_label()),
-                        );
-                        egui::ComboBox::from_id_salt("step-kind")
-                            .selected_text(step.kind.label())
-                            .show_ui(ui, |ui| {
-                                for (kind, label) in [
-                                    (StepKind::WaitAndClick, "等待并点击"),
-                                    (StepKind::WaitAny, "等待任一目标"),
-                                    (StepKind::VisualCondition, "视觉条件"),
-                                    (StepKind::Delay, "固定等待"),
-                                    (StepKind::SendKeys, "键盘输入"),
-                                    (StepKind::RoundEnd, "本局结束"),
+        ui.horizontal_top(|ui| {
+            let gap = 10.0;
+            let total_width = ui.available_width();
+            let list_width = (total_width * 0.34).clamp(285.0, 400.0);
+            let editor_width = (total_width - list_width - gap).max(420.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(list_width, 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    theme::card().show(ui, |ui| {
+                        let mut list_command = None;
+                        ui.label(RichText::new(&self.profile.name).size(18.0).strong());
+                        ui.horizontal(|ui| {
+                            ui.menu_button("添加步骤", |ui| {
+                                for (kind, hint) in [
+                                    (StepKind::WaitAndClick, "等到目标图片出现后点击它，最常用"),
+                                    (
+                                        StepKind::WaitAny,
+                                        "同时监控多个画面，先出现先处理，适合应对随机弹窗",
+                                    ),
+                                    (
+                                        StepKind::VisualCondition,
+                                        "判断画面条件，决定继续、点击或结束本局",
+                                    ),
+                                    (StepKind::Delay, "原地等待固定时长"),
+                                    (StepKind::SendKeys, "向游戏窗口键入文字或按键，仅前台有效"),
+                                    (StepKind::RoundEnd, "把当前局计入完成数，并开始下一轮"),
                                 ] {
-                                    ui.selectable_value(&mut step.kind, kind, label);
+                                    if ui.button(kind.label()).on_hover_text(hint).clicked() {
+                                        list_command = Some(StepListCommand::Add(kind));
+                                        ui.close();
+                                    }
                                 }
                             });
-                        ui.add_space(6.0);
-                        match step.kind {
-                            StepKind::WaitAndClick => {
-                                workflow_action = template_use_editor(
-                                    ui,
-                                    ("step-template", step.id),
-                                    TemplateUseLocator::Step(step.id),
-                                    "图片模板",
-                                    &mut step.template,
-                                    step.threshold,
-                                    &mut step.search,
-                                    reference_size,
-                                    &template_options,
-                                    &mut self.thumbs,
-                                )
-                                .or(workflow_action);
-                                timeout_editor(ui, &mut step.timeout_secs);
+                            ui.label(
+                                RichText::new("步骤按执行顺序排列；在“操作”中调整顺序")
+                                    .size(11.0)
+                                    .color(theme::tertiary_label()),
+                            );
+                        });
+                        ui.separator();
+
+                        let window_height = ui
+                            .ctx()
+                            .input(|input| input.viewport().inner_rect.map(|rect| rect.height()))
+                            .unwrap_or(800.0);
+                        let list_height = (window_height - 350.0).clamp(320.0, 720.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("workflow-step-list")
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                            )
+                            .max_height(list_height)
+                            .show(ui, |ui| {
+                                for (index, step) in self.profile.steps.iter().enumerate() {
+                                    let selected = self.selected_step == Some(step.id);
+                                    ui.horizontal(|ui| {
+                                        let controls_width = 54.0;
+                                        let button_width =
+                                            (ui.available_width() - controls_width).max(160.0);
+                                        let button = egui::Button::new(step_row_text(
+                                            step,
+                                            index,
+                                            selected,
+                                            &template_options,
+                                        ))
+                                        .fill(if selected {
+                                            theme::blue().gamma_multiply(0.10)
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        })
+                                        .stroke(if selected {
+                                            Stroke::new(1.0, theme::blue().gamma_multiply(0.35))
+                                        } else {
+                                            Stroke::NONE
+                                        })
+                                        .min_size(Vec2::new(button_width, 44.0));
+                                        if ui.add(button).clicked() {
+                                            self.selected_step = Some(step.id);
+                                        }
+                                        ui.menu_button(RichText::new("操作").size(11.0), |ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    index > 0,
+                                                    egui::Button::new("上移一步"),
+                                                )
+                                                .clicked()
+                                            {
+                                                list_command = Some(StepListCommand::MoveUp(index));
+                                                ui.close();
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    index + 1 < self.profile.steps.len(),
+                                                    egui::Button::new("下移一步"),
+                                                )
+                                                .clicked()
+                                            {
+                                                list_command =
+                                                    Some(StepListCommand::MoveDown(index));
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            let toggle_label = if step.enabled {
+                                                "停用此步骤"
+                                            } else {
+                                                "启用此步骤"
+                                            };
+                                            if ui.button(toggle_label).clicked() {
+                                                list_command =
+                                                    Some(StepListCommand::ToggleEnabled(index));
+                                                ui.close();
+                                            }
+                                            if ui.button("复制步骤").clicked() {
+                                                list_command =
+                                                    Some(StepListCommand::Duplicate(index));
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            if ui
+                                                .add_enabled(
+                                                    self.profile.steps.len() > 1,
+                                                    egui::Button::new("删除步骤"),
+                                                )
+                                                .clicked()
+                                            {
+                                                list_command = Some(StepListCommand::Delete(index));
+                                                ui.close();
+                                            }
+                                        });
+                                    });
+                                }
+                            });
+
+                        // Commands are produced by the row widgets above, so they must
+                        // be applied only after the list has rendered.
+                        match list_command {
+                            Some(StepListCommand::Add(kind)) => {
+                                let id = self
+                                    .profile
+                                    .steps
+                                    .iter()
+                                    .map(|step| step.id)
+                                    .max()
+                                    .unwrap_or(0)
+                                    + 1;
+                                let count = self
+                                    .profile
+                                    .steps
+                                    .iter()
+                                    .filter(|step| step.kind == kind)
+                                    .count();
+                                self.profile.steps.push(WorkflowStep::new(
+                                    id,
+                                    format!("{} {}", kind.label(), count + 1),
+                                    kind,
+                                    0,
+                                ));
+                                self.selected_step = Some(id);
+                            }
+                            Some(StepListCommand::MoveUp(index)) => {
+                                self.profile.steps.swap(index, index - 1);
+                            }
+                            Some(StepListCommand::MoveDown(index)) => {
+                                self.profile.steps.swap(index, index + 1);
+                            }
+                            Some(StepListCommand::Duplicate(index)) => {
+                                let mut copy = self.profile.steps[index].clone();
+                                copy.id = self
+                                    .profile
+                                    .steps
+                                    .iter()
+                                    .map(|step| step.id)
+                                    .max()
+                                    .unwrap_or(0)
+                                    + 1;
+                                copy.name = format!("{} 副本", copy.name);
+                                let new_id = copy.id;
+                                self.profile.steps.insert(index + 1, copy);
+                                self.selected_step = Some(new_id);
+                            }
+                            Some(StepListCommand::ToggleEnabled(index)) => {
+                                let step = &mut self.profile.steps[index];
+                                step.enabled = !step.enabled;
+                            }
+                            Some(StepListCommand::Delete(index)) => {
+                                self.profile.steps.remove(index);
+                                let next_index = index.min(self.profile.steps.len() - 1);
+                                self.selected_step = Some(self.profile.steps[next_index].id);
+                            }
+                            None => {}
+                        }
+                    });
+                },
+            );
+            ui.add_space(gap);
+            ui.allocate_ui_with_layout(
+                Vec2::new(editor_width, 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    theme::card().show(ui, |ui| {
+                        ui.label(RichText::new("所选步骤").size(18.0).strong());
+                        ui.separator();
+                        let Some(selected_id) = self.selected_step else {
+                            ui.label("请选择一个步骤");
+                            return;
+                        };
+                        let Some(step) = self
+                            .profile
+                            .steps
+                            .iter_mut()
+                            .find(|step| step.id == selected_id)
+                        else {
+                            ui.label("步骤不存在");
+                            return;
+                        };
+
+                        ui.label(RichText::new(&step.name).size(16.0).strong());
+                        ui.label(
+                            RichText::new(step_summary(step, &template_options))
+                                .size(11.0)
+                                .color(theme::secondary_label()),
+                        );
+                        egui::CollapsingHeader::new("基本设置")
+                            .id_salt(("step-details", step.id))
+                            .default_open(true)
+                            .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new("超过该时间未识别到目标，则本步骤失败")
-                                        .size(11.0)
-                                        .color(theme::tertiary_label()),
+                                    RichText::new("名称")
+                                        .size(12.0)
+                                        .color(theme::secondary_label()),
                                 );
-                                delay_editor(ui, "识别后等待", &mut step.delay_ms);
-                                click_point_picker(
-                                    ui,
-                                    step.template.as_ref(),
-                                    &template_options,
-                                    &mut self.thumbs,
-                                    &mut step.click_anchor,
-                                    &mut step.click_offset_x,
-                                    &mut step.click_offset_y,
+                                ui.text_edit_singleline(&mut step.name);
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("类型")
+                                        .size(12.0)
+                                        .color(theme::secondary_label()),
                                 );
-                                egui::CollapsingHeader::new("高级设置")
-                                    .id_salt(("step-advanced", step.id))
-                                    .default_open(false)
-                                    .show(ui, |ui| {
-                                        threshold_editor(ui, &mut step.threshold);
-                                        scan_interval_editor(
+                                egui::ComboBox::from_id_salt("step-kind")
+                                    .selected_text(step.kind.label())
+                                    .show_ui(ui, |ui| {
+                                        for (kind, label) in [
+                                            (StepKind::WaitAndClick, "等待并点击"),
+                                            (StepKind::WaitAny, "等待任一目标"),
+                                            (StepKind::VisualCondition, "视觉条件"),
+                                            (StepKind::Delay, "固定等待"),
+                                            (StepKind::SendKeys, "键盘输入"),
+                                            (StepKind::RoundEnd, "本局结束"),
+                                        ] {
+                                            ui.selectable_value(&mut step.kind, kind, label);
+                                        }
+                                    });
+                                ui.add_space(6.0);
+                                match step.kind {
+                                    StepKind::WaitAndClick => {
+                                        workflow_action = template_use_editor(
                                             ui,
-                                            &mut step.scan_interval_secs,
-                                            profile_scan_interval,
+                                            ("step-template", step.id),
+                                            TemplateUseLocator::Step(step.id),
+                                            "图片模板",
+                                            &mut step.template,
+                                            step.threshold,
+                                            &mut step.search,
+                                            reference_size,
+                                            &template_options,
+                                            &mut self.thumbs,
+                                        )
+                                        .or(workflow_action);
+                                        timeout_editor(ui, &mut step.timeout_secs);
+                                        ui.label(
+                                            RichText::new("超过该时间未识别到目标，则本步骤失败")
+                                                .size(11.0)
+                                                .color(theme::tertiary_label()),
                                         );
-                                        click_anchor_offset_editors(
+                                        delay_editor(ui, "识别后等待", &mut step.delay_ms);
+                                        click_point_picker(
                                             ui,
-                                            ("step-click", step.id),
+                                            step.template.as_ref(),
+                                            &template_options,
+                                            &mut self.thumbs,
                                             &mut step.click_anchor,
                                             &mut step.click_offset_x,
                                             &mut step.click_offset_y,
                                         );
-                                        click_repeat_editor(
-                                            ui,
-                                            &mut step.click_count,
-                                            &mut step.click_interval_ms,
-                                        );
-                                    });
-                            }
-                            StepKind::WaitAny => wait_any_editor(
-                                ui,
-                                step,
-                                reference_size,
-                                profile_scan_interval,
-                                &template_options,
-                                &mut self.thumbs,
-                                &mut workflow_action,
-                            ),
-                            StepKind::VisualCondition => visual_condition_editor(
-                                ui,
-                                step,
-                                reference_size,
-                                profile_scan_interval,
-                                &template_options,
-                                &mut self.thumbs,
-                                &mut workflow_action,
-                            ),
-                            StepKind::Delay => delay_editor(ui, "等待时间", &mut step.delay_ms),
-                            StepKind::SendKeys => {
-                                ui.label(
-                                    RichText::new("输入模式")
-                                        .size(11.0)
-                                        .color(theme::secondary_label()),
-                                );
-                                egui::ComboBox::from_id_salt(("key-mode", step.id))
-                                    .selected_text(step.key_mode.label())
-                                    .show_ui(ui, |ui| {
-                                        for mode in KeyInputMode::ALL {
-                                            ui.selectable_value(
-                                                &mut step.key_mode,
-                                                mode,
-                                                mode.label(),
-                                            );
-                                        }
-                                    });
-                                match step.key_mode {
-                                    KeyInputMode::Text => {
-                                        ui.label(
-                                            RichText::new("输入文本")
-                                                .size(11.0)
-                                                .color(theme::secondary_label()),
-                                        );
-                                        ui.add(
-                                            egui::TextEdit::multiline(&mut step.key_text)
-                                                .desired_rows(2)
-                                                .desired_width(f32::INFINITY),
-                                        );
-                                        ui.horizontal(|ui| {
-                                            ui.label("输入速率");
-                                            ui.add(
-                                                egui::Slider::new(
-                                                    &mut step.key_interval_ms,
-                                                    10..=500,
-                                                )
-                                                .suffix(" ms"),
-                                            );
-                                        });
-                                        ui.label(
-                                            RichText::new("支持中文；间隔越小打得越快")
-                                                .size(11.0)
-                                                .color(theme::tertiary_label()),
-                                        );
+                                        egui::CollapsingHeader::new("高级设置")
+                                            .id_salt(("step-advanced", step.id))
+                                            .default_open(false)
+                                            .show(ui, |ui| {
+                                                threshold_editor(ui, &mut step.threshold);
+                                                scan_interval_editor(
+                                                    ui,
+                                                    &mut step.scan_interval_secs,
+                                                    profile_scan_interval,
+                                                );
+                                                click_anchor_offset_editors(
+                                                    ui,
+                                                    ("step-click", step.id),
+                                                    &mut step.click_anchor,
+                                                    &mut step.click_offset_x,
+                                                    &mut step.click_offset_y,
+                                                );
+                                                click_repeat_editor(
+                                                    ui,
+                                                    &mut step.click_count,
+                                                    &mut step.click_interval_ms,
+                                                );
+                                            });
                                     }
-                                    KeyInputMode::Combo => {
+                                    StepKind::WaitAny => wait_any_editor(
+                                        ui,
+                                        step,
+                                        reference_size,
+                                        profile_scan_interval,
+                                        &template_options,
+                                        &mut self.thumbs,
+                                        &mut workflow_action,
+                                    ),
+                                    StepKind::VisualCondition => visual_condition_editor(
+                                        ui,
+                                        step,
+                                        reference_size,
+                                        profile_scan_interval,
+                                        &template_options,
+                                        &mut self.thumbs,
+                                        &mut workflow_action,
+                                    ),
+                                    StepKind::Delay => {
+                                        delay_editor(ui, "等待时间", &mut step.delay_ms)
+                                    }
+                                    StepKind::SendKeys => {
                                         ui.label(
-                                            RichText::new("按键组合")
+                                            RichText::new("输入模式")
                                                 .size(11.0)
                                                 .color(theme::secondary_label()),
                                         );
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut step.key_combo)
-                                                .hint_text("如 enter、ctrl+c、alt+f4"),
-                                        );
-                                        if !step.key_combo.trim().is_empty() {
-                                            match parse_key_combo(&step.key_combo) {
-                                                Ok(combo) => {
-                                                    ui.label(
-                                                        RichText::new(format!(
-                                                            "将按下：{}",
-                                                            combo.describe()
-                                                        ))
-                                                        .size(11.0)
-                                                        .color(theme::green()),
+                                        egui::ComboBox::from_id_salt(("key-mode", step.id))
+                                            .selected_text(step.key_mode.label())
+                                            .show_ui(ui, |ui| {
+                                                for mode in KeyInputMode::ALL {
+                                                    ui.selectable_value(
+                                                        &mut step.key_mode,
+                                                        mode,
+                                                        mode.label(),
                                                     );
                                                 }
-                                                Err(error) => {
-                                                    ui.label(
-                                                        RichText::new(error)
-                                                            .size(11.0)
-                                                            .color(Color32::from_rgb(255, 59, 48)),
+                                            });
+                                        match step.key_mode {
+                                            KeyInputMode::Text => {
+                                                ui.label(
+                                                    RichText::new("输入文本")
+                                                        .size(11.0)
+                                                        .color(theme::secondary_label()),
+                                                );
+                                                ui.add(
+                                                    egui::TextEdit::multiline(&mut step.key_text)
+                                                        .desired_rows(2)
+                                                        .desired_width(f32::INFINITY),
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    ui.label("输入速率");
+                                                    ui.add(
+                                                        egui::Slider::new(
+                                                            &mut step.key_interval_ms,
+                                                            10..=500,
+                                                        )
+                                                        .suffix(" ms"),
                                                     );
+                                                });
+                                                ui.label(
+                                                    RichText::new("支持中文；间隔越小打得越快")
+                                                        .size(11.0)
+                                                        .color(theme::tertiary_label()),
+                                                );
+                                            }
+                                            KeyInputMode::Combo => {
+                                                ui.label(
+                                                    RichText::new("按键组合")
+                                                        .size(11.0)
+                                                        .color(theme::secondary_label()),
+                                                );
+                                                ui.add(
+                                                    egui::TextEdit::singleline(&mut step.key_combo)
+                                                        .hint_text("如 enter、ctrl+c、alt+f4"),
+                                                );
+                                                if !step.key_combo.trim().is_empty() {
+                                                    match parse_key_combo(&step.key_combo) {
+                                                        Ok(combo) => {
+                                                            ui.label(
+                                                                RichText::new(format!(
+                                                                    "将按下：{}",
+                                                                    combo.describe()
+                                                                ))
+                                                                .size(11.0)
+                                                                .color(theme::green()),
+                                                            );
+                                                        }
+                                                        Err(error) => {
+                                                            ui.label(
+                                                                RichText::new(error)
+                                                                    .size(11.0)
+                                                                    .color(Color32::from_rgb(
+                                                                        255, 59, 48,
+                                                                    )),
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
+                                        delay_editor(ui, "输入前等待", &mut step.delay_ms);
+                                        ui.label(
+                                            RichText::new(
+                                                "键盘输入前会自动激活游戏窗口（仅前台有效）",
+                                            )
+                                            .size(11.0)
+                                            .color(theme::tertiary_label()),
+                                        );
                                     }
-                                }
-                                delay_editor(ui, "输入前等待", &mut step.delay_ms);
-                                ui.label(
-                                    RichText::new("键盘输入前会自动激活游戏窗口（仅前台有效）")
-                                        .size(11.0)
-                                        .color(theme::tertiary_label()),
-                                );
-                            }
-                            StepKind::RoundEnd => {
-                                ui.label(
-                                    RichText::new("将当前局计入已完成局数，然后开始下一轮。")
-                                        .size(11.0)
-                                        .color(theme::secondary_label()),
-                                );
-                            }
-                            StepKind::Branch => {
-                                ui.label(
+                                    StepKind::RoundEnd => {
+                                        ui.label(
+                                            RichText::new(
+                                                "将当前局计入已完成局数，然后开始下一轮。",
+                                            )
+                                            .size(11.0)
+                                            .color(theme::secondary_label()),
+                                        );
+                                    }
+                                    StepKind::Branch => {
+                                        ui.label(
                             RichText::new(
                                 "通用 If/Else 条件节点尚未开放；请先使用可执行的“等待任一目标”。",
                             )
                             .size(11.0)
                             .color(theme::orange()),
                         );
-                            }
-                        }
-                        if template_options.is_empty()
-                            && matches!(
-                                step.kind,
-                                StepKind::WaitAndClick
-                                    | StepKind::WaitAny
-                                    | StepKind::VisualCondition
-                            )
-                        {
-                            ui.label(
-                                RichText::new("请先在模板库中创建图片模板")
-                                    .size(11.0)
-                                    .color(theme::orange()),
-                            );
-                        }
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("启用此步骤");
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.toggle_value(&mut step.enabled, "开启");
+                                    }
+                                }
+                                if template_options.is_empty()
+                                    && matches!(
+                                        step.kind,
+                                        StepKind::WaitAndClick
+                                            | StepKind::WaitAny
+                                            | StepKind::VisualCondition
+                                    )
+                                {
+                                    ui.label(
+                                        RichText::new("请先在模板库中创建图片模板")
+                                            .size(11.0)
+                                            .color(theme::orange()),
+                                    );
+                                }
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label("启用此步骤");
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.toggle_value(&mut step.enabled, "开启");
+                                    });
+                                });
                             });
-                        });
                     });
-            });
+                },
+            );
         });
         if let Some(action) = workflow_action {
             match action {
@@ -3025,14 +3030,13 @@ impl Make5771App {
                                                 );
                                             }
                                             if ui
-                                                .small_button("✓")
+                                                .small_button("保存")
                                                 .on_hover_text("确认改名")
                                                 .clicked()
                                             {
                                                 rename_apply = true;
                                             }
-                                            if ui.small_button("✕").on_hover_text("取消").clicked()
-                                            {
+                                            if ui.small_button("取消").clicked() {
                                                 rename_cancel = true;
                                             }
                                         });
@@ -3076,9 +3080,6 @@ impl Make5771App {
                                             "自定义 {}×{}+{},{}",
                                             region.width, region.height, region.x, region.y
                                         ),
-                                        None if self.profile.default_search_region.is_some() => {
-                                            "继承流程默认".to_owned()
-                                        }
                                         None => "全屏".to_owned(),
                                     };
                                     ui.label(
@@ -4074,9 +4075,9 @@ impl Make5771App {
                             .color(theme::secondary_label()),
                         );
                         ui.separator();
-                        ui.radio_value(&mut draft.inherit_default, true, "继承流程默认范围");
-                        ui.radio_value(&mut draft.inherit_default, false, "此模板使用自定义范围");
-                        if !draft.inherit_default {
+                        ui.radio_value(&mut draft.full_frame, true, "此模板默认全屏搜索");
+                        ui.radio_value(&mut draft.full_frame, false, "此模板使用自定义范围");
+                        if !draft.full_frame {
                             search_region_fields(
                                 ui,
                                 &mut draft.region,
@@ -4910,7 +4911,7 @@ fn step_row_text(
         theme::tertiary_label()
     };
     job.append(
-        &format!("{}  ", index + 1),
+        &format!("{:02}  ", index + 1),
         0.0,
         format(12.0, theme::tertiary_label()),
     );
@@ -5051,7 +5052,7 @@ fn template_use_editor(
     if search.strategy == SearchStrategy::Inherit {
         ui.horizontal_wrapped(|ui| {
             ui.label(
-                RichText::new("当前沿用旧流程的默认范围")
+                RichText::new("当前沿用模板内保存的旧版范围")
                     .size(11.0)
                     .color(theme::tertiary_label()),
             );
@@ -5067,7 +5068,7 @@ fn template_use_editor(
             ui.selectable_value(
                 &mut search.strategy,
                 SearchStrategy::Inherit,
-                "继承流程/模板旧版范围",
+                "使用模板旧版范围",
             );
         });
     if matches!(
@@ -5164,7 +5165,6 @@ fn run_template_test_work(
         algorithm,
         scale_mode,
         reference_fallback,
-        default_search_region,
         adaptive_roi,
         recovery_checks,
         max_threads,
@@ -5194,13 +5194,15 @@ fn run_template_test_work(
         template_asset.reference_size(reference_fallback.0, reference_fallback.1);
     let (scaled_region, recover_full_frame) = match search.strategy {
         SearchStrategy::Inherit => (
-            scale_mode.effective_search_region(
-                template_asset.search_region,
-                default_search_region,
-                (reference_width, reference_height),
-                reference_fallback,
-                (frame.width(), frame.height()),
-            ),
+            template_asset.search_region.map(|region| {
+                scale_mode.search_region(
+                    region,
+                    reference_width,
+                    reference_height,
+                    frame.width(),
+                    frame.height(),
+                )
+            }),
             adaptive_roi,
         ),
         SearchStrategy::FullFrame => (None, false),
@@ -5762,89 +5764,6 @@ fn safe_file_name(name: &str) -> String {
     } else {
         sanitized.to_owned()
     }
-}
-
-fn default_search_region_editor(
-    ui: &mut egui::Ui,
-    region: &mut Option<SearchRegionSpec>,
-    reference_width: u32,
-    reference_height: u32,
-) {
-    let reference_width = reference_width.max(1);
-    let reference_height = reference_height.max(1);
-    if let Some(current) = region {
-        *current = clamp_search_region(*current, reference_width, reference_height);
-    }
-    egui::CollapsingHeader::new(match region {
-        Some(region) => format!(
-            "流程默认识别范围 · {}×{}+{},{}",
-            region.width, region.height, region.x, region.y
-        ),
-        None => "流程默认识别范围 · 全屏".to_owned(),
-    })
-    .id_salt("default-search-region")
-    .default_open(false)
-    .show(ui, |ui| {
-        ui.label(
-            RichText::new("无单独设置的模板会继承此范围；HONG 等旧模板也可直接使用。")
-                .size(11.0)
-                .color(theme::secondary_label()),
-        );
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("全屏").clicked() {
-                *region = None;
-            }
-            for (label, preset) in [
-                (
-                    "上半屏",
-                    SearchRegionSpec {
-                        x: 0,
-                        y: 0,
-                        width: reference_width,
-                        height: (reference_height / 2).max(1),
-                    },
-                ),
-                (
-                    "下半屏",
-                    SearchRegionSpec {
-                        x: 0,
-                        y: reference_height / 2,
-                        width: reference_width,
-                        height: reference_height - reference_height / 2,
-                    },
-                ),
-                (
-                    "中央区域",
-                    SearchRegionSpec {
-                        x: reference_width / 8,
-                        y: reference_height / 8,
-                        width: (reference_width * 3 / 4).max(1),
-                        height: (reference_height * 3 / 4).max(1),
-                    },
-                ),
-            ] {
-                if ui.button(label).clicked() {
-                    *region = Some(preset);
-                }
-            }
-            if ui.button("自定义").clicked() && region.is_none() {
-                *region = Some(SearchRegionSpec {
-                    x: 0,
-                    y: 0,
-                    width: reference_width,
-                    height: reference_height,
-                });
-            }
-        });
-        if let Some(region) = region {
-            search_region_fields(ui, region, reference_width, reference_height);
-        }
-        ui.label(
-            RichText::new("目标位置不确定时保持全屏；范围越小，CPU 占用越低。")
-                .size(11.0)
-                .color(theme::tertiary_label()),
-        );
-    });
 }
 
 fn search_region_fields(

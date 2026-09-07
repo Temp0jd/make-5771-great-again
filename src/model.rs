@@ -175,29 +175,6 @@ impl TemplateScaleMode {
         }
     }
 
-    /// Resolves a template-specific ROI or the workflow fallback directly into
-    /// live-frame coordinates. Each source has a different coordinate space.
-    pub fn effective_search_region(
-        self,
-        template_region: Option<SearchRegionSpec>,
-        default_region: Option<SearchRegionSpec>,
-        template_reference: (u32, u32),
-        profile_reference: (u32, u32),
-        frame_size: (u32, u32),
-    ) -> Option<SearchRegionSpec> {
-        let (region, source_size) = match template_region {
-            Some(region) => (region, template_reference),
-            None => (default_region?, profile_reference),
-        };
-        Some(self.search_region(
-            region,
-            source_size.0,
-            source_size.1,
-            frame_size.0,
-            frame_size.1,
-        ))
-    }
-
     pub fn search_region(
         self,
         region: SearchRegionSpec,
@@ -397,10 +374,10 @@ impl KeyCode {
             Self::End => "End".to_owned(),
             Self::PageUp => "PageUp".to_owned(),
             Self::PageDown => "PageDown".to_owned(),
-            Self::Up => "↑".to_owned(),
-            Self::Down => "↓".to_owned(),
-            Self::Left => "←".to_owned(),
-            Self::Right => "→".to_owned(),
+            Self::Up => "方向键上".to_owned(),
+            Self::Down => "方向键下".to_owned(),
+            Self::Left => "方向键左".to_owned(),
+            Self::Right => "方向键右".to_owned(),
             Self::F(number) => format!("F{number}"),
             Self::Letter(letter) => letter.to_ascii_uppercase().to_string(),
             Self::Digit(digit) => digit.to_string(),
@@ -591,8 +568,8 @@ impl ConditionMatchMode {
     }
 }
 
-/// Search boundary for one template use. `Inherit` preserves the pre-v0.4
-/// asset ROI -> workflow ROI -> full-frame behavior on imported packages.
+/// Search boundary for one template use. `Inherit` preserves an imported
+/// template's own ROI and otherwise falls back to the full frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SearchStrategy {
     #[default]
@@ -625,6 +602,17 @@ pub struct TemplateUseSearch {
     pub reference_width: u32,
     #[serde(default)]
     pub reference_height: u32,
+}
+
+impl TemplateUseSearch {
+    /// New steps use an explicit full-frame policy. Serde still defaults to
+    /// `Inherit` so imported v0.3/v0.4 profiles retain template-level ROI.
+    pub fn for_new_use() -> Self {
+        Self {
+            strategy: SearchStrategy::FullFrame,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,7 +677,7 @@ impl VisualConditionTerm {
             template: None,
             expectation,
             threshold: 0.90,
-            search: TemplateUseSearch::default(),
+            search: TemplateUseSearch::for_new_use(),
         }
     }
 }
@@ -813,7 +801,7 @@ impl BranchAction {
             click_count: default_click_count(),
             click_interval_ms: default_click_interval_ms(),
             optional: false,
-            search: TemplateUseSearch::default(),
+            search: TemplateUseSearch::for_new_use(),
             scan_interval_secs: None,
         }
     }
@@ -860,7 +848,7 @@ impl WorkflowBranch {
             click_count: default_click_count(),
             click_interval_ms: default_click_interval_ms(),
             actions: Vec::new(),
-            search: TemplateUseSearch::default(),
+            search: TemplateUseSearch::for_new_use(),
         }
     }
 }
@@ -943,7 +931,7 @@ impl WorkflowStep {
             key_interval_ms: default_key_interval_ms(),
             branches: Vec::new(),
             visual_condition: VisualConditionSpec::default(),
-            search: TemplateUseSearch::default(),
+            search: TemplateUseSearch::for_new_use(),
             scan_interval_secs: None,
         }
     }
@@ -1047,10 +1035,6 @@ pub struct MacroProfile {
     /// newly created profiles preserve template aspect ratio.
     #[serde(default)]
     pub template_scale_mode: TemplateScaleMode,
-    /// Default search area inherited by templates without their own ROI.
-    /// Missing legacy fields remain full-screen (`None`).
-    #[serde(default)]
-    pub default_search_region: Option<SearchRegionSpec>,
     /// When enabled, a configured ROI is treated as a fast hint and bounded
     /// misses trigger a full-screen recovery. Missing legacy fields stay false.
     #[serde(default)]
@@ -1111,7 +1095,6 @@ impl Default for MacroProfile {
             recognition_performance: RecognitionPerformance::default(),
             idle_scan_secs: Some(3),
             template_scale_mode: TemplateScaleMode::UniformFit,
-            default_search_region: None,
             adaptive_roi: true,
             stable_confirm: default_stable_confirm(),
             sharing: SharingMetadata::default(),
@@ -1152,15 +1135,6 @@ impl MacroProfile {
             .is_some_and(|value| !matches!(value, 1 | 3 | 5))
         {
             issues.push("普通扫描间隔只能为 1、3 或 5 秒".to_owned());
-        }
-        if let Some(region) = self.default_search_region
-            && !valid_search_region(
-                region,
-                self.expected_client_width,
-                self.expected_client_height,
-            )
-        {
-            issues.push("流程默认识别区域无效".to_owned());
         }
         for (label, value, limit) in [
             ("作者", &self.sharing.author, 100),
@@ -1540,51 +1514,6 @@ mod tests {
     }
 
     #[test]
-    fn effective_roi_uses_the_coordinate_space_of_its_source() {
-        let default = Some(SearchRegionSpec {
-            x: 640,
-            y: 360,
-            width: 320,
-            height: 180,
-        });
-        let template_override = Some(SearchRegionSpec {
-            x: 400,
-            y: 300,
-            width: 400,
-            height: 300,
-        });
-        let mode = TemplateScaleMode::UniformFit;
-
-        // Profile 16:9, template 4:3 and live frame 16:10 deliberately use
-        // three aspect ratios. The default must map directly profile -> frame.
-        assert_eq!(
-            mode.effective_search_region(None, default, (1600, 1200), (1280, 720), (640, 400),),
-            Some(SearchRegionSpec {
-                x: 320,
-                y: 200,
-                width: 160,
-                height: 90,
-            })
-        );
-        // A template override wins and therefore maps from 4:3 template space.
-        assert_eq!(
-            mode.effective_search_region(
-                template_override,
-                default,
-                (1600, 1200),
-                (1280, 720),
-                (640, 400),
-            ),
-            Some(SearchRegionSpec {
-                x: 186,
-                y: 100,
-                width: 133,
-                height: 100,
-            })
-        );
-    }
-
-    #[test]
     fn legacy_template_reference_size_uses_profile_fallback() {
         let template = TemplateAsset {
             id: 1,
@@ -1768,9 +1697,12 @@ mod tests {
         object.remove("recognition_performance");
         object.remove("idle_scan_secs");
         object.remove("template_scale_mode");
-        object.remove("default_search_region");
         object.remove("adaptive_roi");
         object.remove("stable_confirm");
+        object.insert(
+            "default_search_region".to_owned(),
+            serde_json::json!({"x": 100, "y": 100, "width": 300, "height": 200}),
+        );
         let profile: MacroProfile = serde_json::from_value(value).unwrap();
         assert_eq!(profile.capture_hotkey, "f6");
         assert_eq!(profile.stop_hotkey, "f8");
@@ -1782,7 +1714,6 @@ mod tests {
         );
         assert_eq!(profile.idle_scan_secs, None);
         assert_eq!(profile.template_scale_mode, TemplateScaleMode::Stretch);
-        assert_eq!(profile.default_search_region, None);
         assert!(!profile.adaptive_roi);
         assert!(profile.stable_confirm);
     }
@@ -1791,6 +1722,23 @@ mod tests {
     fn scan_cadence_and_per_use_search_validate_with_legacy_defaults() {
         let mut profile = MacroProfile::default();
         assert_eq!(profile.idle_scan_secs, Some(3));
+        assert_eq!(profile.steps[0].search.strategy, SearchStrategy::FullFrame);
+        assert_eq!(
+            WorkflowBranch::new(9, "branch").search.strategy,
+            SearchStrategy::FullFrame
+        );
+        assert_eq!(
+            BranchAction::new(10, "action", BranchActionKind::WaitAndClick)
+                .search
+                .strategy,
+            SearchStrategy::FullFrame
+        );
+        assert_eq!(
+            VisualConditionTerm::new(11, "term", ConditionExpectation::Present)
+                .search
+                .strategy,
+            SearchStrategy::FullFrame
+        );
         profile.idle_scan_secs = Some(5);
         profile.steps[0].scan_interval_secs = Some(1);
         profile.steps[0].search = TemplateUseSearch {

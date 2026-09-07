@@ -169,26 +169,58 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
 }
 
 fn install_system_font(ctx: &egui::Context) {
-    let candidates = [
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\msyh.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    // Windows installations differ by language pack. Load one CJK-capable UI
+    // font and a symbol fallback instead of assuming Microsoft YaHei exists.
+    let font_groups: [(&str, &[&str]); 2] = [
+        (
+            "system-ui",
+            &[
+                r"C:\Windows\Fonts\msyh.ttc",
+                r"C:\Windows\Fonts\msyh.ttf",
+                r"C:\Windows\Fonts\msjh.ttc",
+                r"C:\Windows\Fonts\YuGothM.ttc",
+                r"C:\Windows\Fonts\msgothic.ttc",
+                r"C:\Windows\Fonts\simsun.ttc",
+                r"C:\Windows\Fonts\simhei.ttf",
+                r"C:\Windows\Fonts\Deng.ttf",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ],
+        ),
+        (
+            "system-symbols",
+            &[
+                r"C:\Windows\Fonts\seguisym.ttf",
+                r"C:\Windows\Fonts\segoeui.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ],
+        ),
     ];
 
-    let Some(bytes) = candidates.iter().find_map(|path| std::fs::read(path).ok()) else {
-        return;
-    };
-
     let mut fonts = FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("system-ui".to_owned(), FontData::from_owned(bytes).into());
+    let mut loaded_names = Vec::new();
+    for (name, candidates) in font_groups {
+        if let Some(bytes) = candidates.iter().find_map(|path| std::fs::read(path).ok()) {
+            fonts
+                .font_data
+                .insert(name.to_owned(), FontData::from_owned(bytes).into());
+            loaded_names.push(name.to_owned());
+        }
+    }
+    if loaded_names.is_empty() {
+        return;
+    }
+    let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
+    for (index, name) in loaded_names.iter().enumerate() {
+        proportional.insert(index, name.clone());
+    }
+    // Preserve the built-in monospaced ASCII face, then fall back to the
+    // system fonts only for CJK/symbol glyphs it cannot render.
     fonts
         .families
-        .entry(FontFamily::Proportional)
+        .entry(FontFamily::Monospace)
         .or_default()
-        .insert(0, "system-ui".to_owned());
+        .extend(loaded_names);
     ctx.set_fonts(fonts);
 }
 

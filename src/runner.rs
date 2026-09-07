@@ -338,20 +338,17 @@ fn load_templates(
         );
 
         let mut scaled_asset = asset.clone();
-        // Template overrides use template-capture coordinates. The workflow
-        // default uses profile-base coordinates and maps directly to the live
-        // frame; composing both spaces is incorrect when their aspect ratios
-        // differ.
-        scaled_asset.search_region = profile.template_scale_mode.effective_search_region(
-            asset.search_region,
-            profile.default_search_region,
-            (reference_width, reference_height),
-            (
-                profile.expected_client_width,
-                profile.expected_client_height,
-            ),
-            (frame_width, frame_height),
-        );
+        // Template ROI uses the capture reference coordinates. Per-use ROI is
+        // resolved later because it may have a different recorded frame size.
+        scaled_asset.search_region = asset.search_region.map(|region| {
+            profile.template_scale_mode.search_region(
+                region,
+                reference_width,
+                reference_height,
+                frame_width,
+                frame_height,
+            )
+        });
         scaled_asset.reference_width = frame_width;
         scaled_asset.reference_height = frame_height;
         let (image, image_rgb) =
@@ -1631,50 +1628,6 @@ mod tests {
         );
         assert_eq!(loaded.asset.reference_width, 640);
         assert_eq!(loaded.asset.reference_height, 400);
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn workflow_default_roi_maps_through_template_reference_space() {
-        let root = std::env::temp_dir().join(format!("m5771-default-roi-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let image_path = root.join("template.png");
-        image::RgbaImage::from_pixel(8, 6, image::Rgba([10, 20, 30, 255]))
-            .save(&image_path)
-            .unwrap();
-
-        let mut profile = MacroProfile {
-            expected_client_width: 1280,
-            expected_client_height: 720,
-            default_search_region: Some(crate::model::SearchRegionSpec {
-                x: 640,
-                y: 360,
-                width: 320,
-                height: 180,
-            }),
-            ..MacroProfile::default()
-        };
-        profile.templates.push(TemplateAsset {
-            id: 1,
-            name: "inherited".to_owned(),
-            path: image_path.to_string_lossy().into_owned(),
-            width: 8,
-            height: 6,
-            // Deliberately use a third aspect ratio so a wrong two-stage
-            // profile -> template -> frame mapping produces another ROI.
-            reference_width: 1600,
-            reference_height: 1200,
-            search_region: None,
-        });
-
-        let (templates, _) = load_templates(&profile, 640, 400).unwrap();
-        let loaded = templates.values().next().unwrap();
-        let region = loaded.asset.search_region.unwrap();
-        assert_eq!(
-            (region.x, region.y, region.width, region.height),
-            (320, 200, 160, 90)
-        );
 
         let _ = std::fs::remove_dir_all(root);
     }

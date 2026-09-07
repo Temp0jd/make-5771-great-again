@@ -17,7 +17,7 @@
 {
   "format": "make5771.workflow-package",
   "format_version": 1,
-  "app_version": "0.4.1",
+  "app_version": "0.4.2",
   "created_at": "RFC 3339 timestamp",
   "profile": {},
   "assets": [
@@ -38,7 +38,7 @@
 
 `profile.template_scale_mode` 可取 `UniformFit` 或 `Stretch`。`UniformFit` 按客户区可容纳的统一比例缩放宽高，并将 ROI 映射到居中的内容区，适合跨 16:9、16:10 和超宽屏分享；`Stretch` 沿用旧版宽高分别缩放。新建流程默认 `UniformFit`，缺少该字段的旧包默认 `Stretch`，避免静默改变既有流程。
 
-`profile.default_search_region` 是流程基准客户区坐标中的默认 ROI。值为 `null` 时全屏搜索；没有 `search_region` 覆盖的模板会继承它。模板自身的 `search_region` 始终优先，并以该模板的参考尺寸为坐标基准；运行时会按 `template_scale_mode` 正确映射两种坐标。缺少该字段的旧包默认全屏。
+v0.4.2 起不再提供流程级默认 ROI，以避免模板范围、流程范围和步骤范围三层继承造成歧义。旧包中的 `profile.default_search_region` 会作为未知字段安全忽略。模板自身的 `search_region` 仅供旧版 `Inherit` 搜索策略兼容；新建步骤默认全屏，并推荐直接在每次模板使用处选择全屏、区域优先或严格区域。
 
 `profile.adaptive_roi` 控制旧版继承区域连续未命中后是否允许全屏恢复。新建流程默认启用；缺少该字段的旧包反序列化为 `false`，继续把 ROI 作为严格空间边界，避免兼容升级后发生区域外点击。
 
