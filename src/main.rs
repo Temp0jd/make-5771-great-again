@@ -9,6 +9,7 @@ mod storage;
 mod template_editor;
 mod theme;
 mod vision;
+mod workflow_ui;
 
 use app::Make5771App;
 use eframe::egui;

@@ -5,6 +5,7 @@ use image::RgbaImage;
 
 use crate::theme;
 use crate::vision::{SearchRegion, TemplateMatch};
+use crate::workflow_ui::{self, DiagnosticSeverity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PixelSelection {
@@ -58,6 +59,8 @@ pub struct TemplateTestView {
     candidates: Vec<TemplateMatch>,
     threshold: f32,
     search_strategy: String,
+    mostly_background: bool,
+    expert_mode: bool,
 }
 
 impl TemplateTestView {
@@ -76,6 +79,8 @@ impl TemplateTestView {
         threshold: f32,
         search_strategy: impl Into<String>,
         mascot: egui::TextureHandle,
+        mostly_background: bool,
+        expert_mode: bool,
     ) -> Self {
         let size = [image.width() as usize, image.height() as usize];
         let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
@@ -95,43 +100,91 @@ impl TemplateTestView {
             candidates,
             threshold,
             search_strategy: search_strategy.into(),
+            mostly_background,
+            expert_mode,
         }
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> bool {
         let mut open = true;
-        egui::Window::new("模板识别测试")
+        let diag = workflow_ui::analyze_test_outcome(
+            self.result,
+            self.best_score,
+            self.threshold,
+            &self.candidates,
+            self.mostly_background,
+            &self.search_strategy,
+            self.expert_mode,
+        );
+
+        egui::Window::new("模板识别测试与诊断")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(820.0)
-            .default_height(580.0)
+            .default_width(840.0)
+            .default_height(640.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(egui::Image::new(&self.mascot).fit_to_exact_size(Vec2::splat(36.0)));
-                    ui.label(RichText::new(&self.template_name).strong());
+                    ui.label(RichText::new(&self.template_name).size(16.0).strong());
                     ui.label(
-                        RichText::new(format!("阈值 {:.2}", self.threshold))
+                        RichText::new(format!("测试阈值 {:.2}", self.threshold))
                             .color(theme::secondary_label()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (label, color) = match self.result {
-                            Some(found) => (
-                                format!("匹配成功 · {:.3} · {}", found.score, self.search_strategy),
-                                theme::green(),
-                            ),
+                            Some(found) => {
+                                (format!("达到阈值 · {:.3}", found.score), theme::green())
+                            }
                             None => (
-                                format!("未达到阈值 · 最佳 {:.3}", self.best_score),
+                                format!("未命中 · 最佳 {:.3}", self.best_score),
                                 Color32::from_rgb(255, 59, 48),
                             ),
                         };
                         ui.label(RichText::new(label).color(color).strong());
                     });
                 });
+
+                // Actionable diagnostic card
+                theme::section_card().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (icon, color) = match diag.severity {
+                            DiagnosticSeverity::Success => ("通过", theme::green()),
+                            DiagnosticSeverity::Warning => ("注意", theme::orange()),
+                            DiagnosticSeverity::Error => ("失败", theme::red()),
+                        };
+                        ui.label(
+                            RichText::new(format!("{icon} {}", diag.title))
+                                .color(color)
+                                .strong(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("范围策略：{}", self.search_strategy))
+                                    .size(11.0)
+                                    .color(theme::tertiary_label()),
+                            );
+                        });
+                    });
+                    ui.label(RichText::new(&diag.detail).size(12.0).color(theme::label()));
+                    ui.label(
+                        RichText::new(&diag.advice)
+                            .size(11.5)
+                            .color(theme::secondary_label()),
+                    );
+                    if let Some(expert_note) = &diag.expert_note {
+                        ui.label(RichText::new(expert_note).size(11.0).color(theme::purple()));
+                    }
+                    if let Some(bg_warning) = &diag.background_warning {
+                        ui.label(RichText::new(bg_warning).size(11.0).color(theme::orange()));
+                    }
+                });
+
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new("橙色框为搜索区域；绿色为已接受目标；黄色为其他高分候选")
-                        .size(12.0)
+                        .size(11.5)
                         .color(theme::tertiary_label()),
                 );
                 ui.add_space(6.0);

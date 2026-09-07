@@ -251,3 +251,25 @@ pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
     .corner_radius(CornerRadius::same(12))
     .min_size(egui::vec2(160.0, 40.0))
 }
+
+pub fn secondary_button(text: impl Into<String>) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text.into()).color(label()))
+        .fill(surface_muted())
+        .stroke(Stroke::new(1.0, separator()))
+        .corner_radius(CornerRadius::same(10))
+}
+
+pub fn small_danger_button(text: impl Into<String>) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text.into()).color(red()).size(12.0))
+        .fill(red().gamma_multiply(0.08))
+        .stroke(Stroke::new(1.0, red().gamma_multiply(0.30)))
+        .corner_radius(CornerRadius::same(8))
+}
+
+pub fn section_card() -> egui::Frame {
+    egui::Frame::new()
+        .fill(surface_muted())
+        .stroke(Stroke::new(1.0, separator()))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+}
