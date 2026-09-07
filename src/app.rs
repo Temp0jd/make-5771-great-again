@@ -2463,7 +2463,9 @@ impl Make5771App {
                             .ctx()
                             .input(|input| input.viewport().inner_rect.map(|rect| rect.height()))
                             .unwrap_or(800.0);
-                        let list_height = (window_height - 350.0).clamp(320.0, 720.0);
+                        // Keep the sequence visible through most of the viewport; the outer page
+                        // already provides scrolling for the editor on shorter windows.
+                        let list_height = (window_height - 235.0).clamp(420.0, 920.0);
                         egui::ScrollArea::vertical()
                             .id_salt("workflow-step-list")
                             .scroll_bar_visibility(
