@@ -603,13 +603,6 @@ pub enum SearchStrategy {
 }
 
 impl SearchStrategy {
-    pub const ALL: [Self; 4] = [
-        Self::Inherit,
-        Self::FullFrame,
-        Self::FixedRoi,
-        Self::RoiThenFullFrame,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Inherit => "继承默认",

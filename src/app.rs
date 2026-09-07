@@ -10,7 +10,7 @@ use crate::model::{
     VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_hotkeys, parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
-use crate::runner::{RunnerEvent, RunnerHandle};
+use crate::runner::{self, RunnerEvent, RunnerHandle};
 use crate::storage;
 use crate::template_editor::{
     EditorAction, PixelSelection, RoiDraft, RoiEditorAction, TemplateDraft, TemplateTestView,
@@ -115,6 +115,11 @@ impl TemplateThumbs {
 
 /// Result of a template recognition test produced on a worker thread; the
 /// frame rides along so the preview texture can be built on the main thread.
+struct WorkflowPreflight {
+    blocker: Option<String>,
+    warnings: Vec<String>,
+}
+
 struct TemplateTestOutcome {
     template_name: String,
     frame: image::RgbaImage,
@@ -196,6 +201,7 @@ pub struct Make5771App {
     import_confirm_open: bool,
     pending_import_path: Option<std::path::PathBuf>,
     pending_delete_template: Option<u64>,
+    pending_shared_template_replace: Option<u64>,
     current_profile_path: std::path::PathBuf,
     profiles_cache: Vec<std::path::PathBuf>,
     selected_profile: Option<std::path::PathBuf>,
@@ -305,6 +311,7 @@ impl Make5771App {
             import_confirm_open: false,
             pending_import_path: None,
             pending_delete_template: None,
+            pending_shared_template_replace: None,
             current_profile_path: storage::default_profile_path(),
             profiles_cache: storage::list_profiles(),
             selected_profile: Some(storage::default_profile_path()),
@@ -927,6 +934,99 @@ impl Make5771App {
         );
     }
 
+    fn execution_profile(&self) -> MacroProfile {
+        let mut profile = self.profile.clone();
+        if profile.shared_templates {
+            profile.templates = self.shared_templates.clone();
+        }
+        profile
+    }
+
+    fn workflow_preflight(&self, check_files: bool) -> WorkflowPreflight {
+        let profile = self.execution_profile();
+        let mut blocker = runner::validate_executable_profile(&profile).err();
+        if blocker.is_none() && self.target_window.is_none() {
+            blocker = Some("尚未连接游戏窗口".to_owned());
+        }
+        if blocker.is_none() && check_files {
+            let referenced = referenced_template_paths(&profile);
+            if let Some(template) = profile.templates.iter().find(|template| {
+                referenced.contains(&template.path)
+                    && !std::path::Path::new(&template.path).is_file()
+            }) {
+                blocker = Some(format!("模板“{}”的图片文件不存在", template.name));
+            }
+        }
+        let mut warnings = Vec::new();
+        if let Some(target) = &self.target_window
+            && (target.client_width != profile.expected_client_width
+                || target.client_height != profile.expected_client_height)
+        {
+            warnings.push(format!(
+                "窗口 {}×{} 与流程基准 {}×{} 不同，将自动缩放模板",
+                target.client_width,
+                target.client_height,
+                profile.expected_client_width,
+                profile.expected_client_height
+            ));
+        }
+        for step in profile.steps.iter().filter(|step| step.enabled) {
+            if matches!(
+                step.kind,
+                StepKind::WaitAndClick | StepKind::WaitAny | StepKind::VisualCondition
+            ) {
+                let scan_secs = step
+                    .scan_interval_secs
+                    .or(profile.idle_scan_secs)
+                    .unwrap_or(1);
+                if step.timeout_secs <= u32::from(scan_secs) {
+                    warnings.push(format!(
+                        "步骤“{}”的超时不大于扫描间隔，可能来不及重试",
+                        step.name
+                    ));
+                }
+            }
+            match step.kind {
+                StepKind::WaitAndClick => {
+                    push_threshold_warning(
+                        &mut warnings,
+                        &format!("步骤“{}”", step.name),
+                        step.threshold,
+                    );
+                }
+                StepKind::WaitAny => {
+                    for branch in &step.branches {
+                        push_threshold_warning(
+                            &mut warnings,
+                            &format!("分支“{}”", branch.name),
+                            branch.threshold,
+                        );
+                        for action in &branch.actions {
+                            if action.kind == BranchActionKind::WaitAndClick {
+                                push_threshold_warning(
+                                    &mut warnings,
+                                    &format!("动作“{}”", action.name),
+                                    action.threshold,
+                                );
+                            }
+                        }
+                    }
+                }
+                StepKind::VisualCondition => {
+                    for term in &step.visual_condition.terms {
+                        push_threshold_warning(
+                            &mut warnings,
+                            &format!("条件“{}”", term.name),
+                            term.threshold,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        WorkflowPreflight { blocker, warnings }
+    }
+
     fn toggle_runner(&mut self) {
         if self.workflow_runner.is_some() {
             if let Some(runner) = &self.workflow_runner {
@@ -938,14 +1038,20 @@ impl Make5771App {
             return;
         }
 
-        let Some(target) = self.target_window.clone() else {
-            self.toast = Some("请先连接游戏窗口".to_owned());
+        let preflight = self.workflow_preflight(true);
+        if let Some(error) = preflight.blocker {
+            self.toast = Some(format!("运行检查未通过：{error}"));
+            self.push_log(LogLevel::Warning, format!("运行检查未通过：{error}"));
             return;
-        };
-        let mut profile = self.profile.clone();
-        if profile.shared_templates {
-            profile.templates = self.shared_templates.clone();
         }
+        for warning in preflight.warnings {
+            self.push_log(LogLevel::Warning, format!("运行检查：{warning}"));
+        }
+        let target = self
+            .target_window
+            .clone()
+            .expect("运行检查已确认目标窗口存在");
+        let profile = self.execution_profile();
         match RunnerHandle::start(profile, target.clone()) {
             Ok(runner) => {
                 if let Err(error) = platform::focus_target(&target) {
@@ -2131,6 +2237,62 @@ impl Make5771App {
             }
         });
 
+        let preflight =
+            (self.runner_status == RunnerStatus::Ready).then(|| self.workflow_preflight(false));
+        let start_blocked = preflight
+            .as_ref()
+            .and_then(|report| report.blocker.as_ref())
+            .is_some();
+        if let Some(report) = &preflight {
+            ui.add_space(8.0);
+            theme::card().show(ui, |ui| {
+                match &report.blocker {
+                    Some(error) => {
+                        ui.label(RichText::new("运行检查未通过").strong().color(theme::red()));
+                        ui.label(RichText::new(error).color(theme::secondary_label()));
+                    }
+                    None if report.warnings.is_empty() => {
+                        ui.label(RichText::new("运行检查通过").strong().color(theme::green()));
+                        ui.label(
+                            RichText::new("模板、步骤和运行条件均已就绪")
+                                .size(11.0)
+                                .color(theme::tertiary_label()),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("可以运行，但建议确认")
+                                .strong()
+                                .color(theme::orange()),
+                        );
+                    }
+                }
+                for warning in report.warnings.iter().take(3) {
+                    ui.label(
+                        RichText::new(format!("• {warning}"))
+                            .size(11.0)
+                            .color(theme::orange()),
+                    );
+                }
+                if report.warnings.len() > 3 {
+                    ui.label(
+                        RichText::new(format!("另有 {} 项提示", report.warnings.len() - 3))
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                    );
+                }
+                if report.blocker.is_some() {
+                    if self.target_window.is_none() {
+                        if ui.small_button("连接游戏窗口").clicked() {
+                            self.open_window_picker();
+                        }
+                    } else if ui.small_button("前往流程编辑").clicked() {
+                        self.active_tab = AppTab::Flow;
+                    }
+                }
+            });
+        }
+
         ui.add_space(12.0);
         ui.vertical_centered(|ui| {
             if self.runner_status == RunnerStatus::Ready
@@ -2162,7 +2324,7 @@ impl Make5771App {
             .stroke(Stroke::NONE)
             .corner_radius(CornerRadius::same(16))
             .min_size(Vec2::new(260.0, 64.0));
-            if ui.add(button).clicked() {
+            if ui.add_enabled(!start_blocked, button).clicked() {
                 if self.runner_status == RunnerStatus::Finishing {
                     self.force_stop_confirm = true;
                 } else {
@@ -2461,7 +2623,7 @@ impl Make5771App {
             });
 
             theme::card().show(&mut columns[1], |ui| {
-                ui.label(RichText::new("步骤属性").size(18.0).strong());
+                ui.label(RichText::new("所选步骤").size(18.0).strong());
                 ui.separator();
                 let Some(selected_id) = self.selected_step else {
                     ui.label("请选择一个步骤");
@@ -2477,221 +2639,241 @@ impl Make5771App {
                     return;
                 };
 
+                ui.label(RichText::new(&step.name).size(16.0).strong());
                 ui.label(
-                    RichText::new("名称")
-                        .size(12.0)
+                    RichText::new(step_summary(step, &template_options))
+                        .size(11.0)
                         .color(theme::secondary_label()),
                 );
-                ui.text_edit_singleline(&mut step.name);
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("类型")
-                        .size(12.0)
-                        .color(theme::secondary_label()),
-                );
-                egui::ComboBox::from_id_salt("step-kind")
-                    .selected_text(step.kind.label())
-                    .show_ui(ui, |ui| {
-                        for (kind, label) in [
-                            (StepKind::WaitAndClick, "等待并点击"),
-                            (StepKind::WaitAny, "等待任一目标"),
-                            (StepKind::VisualCondition, "视觉条件"),
-                            (StepKind::Delay, "固定等待"),
-                            (StepKind::SendKeys, "键盘输入"),
-                            (StepKind::RoundEnd, "本局结束"),
-                        ] {
-                            ui.selectable_value(&mut step.kind, kind, label);
-                        }
-                    });
-                ui.add_space(6.0);
-                match step.kind {
-                    StepKind::WaitAndClick => {
-                        workflow_action = template_use_editor(
-                            ui,
-                            ("step-template", step.id),
-                            TemplateUseLocator::Step(step.id),
-                            "图片模板",
-                            &mut step.template,
-                            step.threshold,
-                            &mut step.search,
-                            reference_size,
-                            &template_options,
-                            &mut self.thumbs,
-                        )
-                        .or(workflow_action);
-                        timeout_editor(ui, &mut step.timeout_secs);
+                egui::CollapsingHeader::new("编辑详细设置")
+                    .id_salt(("step-details", step.id))
+                    .default_open(false)
+                    .show(ui, |ui| {
                         ui.label(
-                            RichText::new("超过该时间未识别到目标，则本步骤失败")
-                                .size(11.0)
-                                .color(theme::tertiary_label()),
+                            RichText::new("名称")
+                                .size(12.0)
+                                .color(theme::secondary_label()),
                         );
-                        delay_editor(ui, "识别后等待", &mut step.delay_ms);
-                        click_point_picker(
-                            ui,
-                            step.template.as_ref(),
-                            &template_options,
-                            &mut self.thumbs,
-                            &mut step.click_anchor,
-                            &mut step.click_offset_x,
-                            &mut step.click_offset_y,
+                        ui.text_edit_singleline(&mut step.name);
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("类型")
+                                .size(12.0)
+                                .color(theme::secondary_label()),
                         );
-                        egui::CollapsingHeader::new("高级设置")
-                            .id_salt(("step-advanced", step.id))
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                threshold_editor(ui, &mut step.threshold);
-                                scan_interval_editor(
+                        egui::ComboBox::from_id_salt("step-kind")
+                            .selected_text(step.kind.label())
+                            .show_ui(ui, |ui| {
+                                for (kind, label) in [
+                                    (StepKind::WaitAndClick, "等待并点击"),
+                                    (StepKind::WaitAny, "等待任一目标"),
+                                    (StepKind::VisualCondition, "视觉条件"),
+                                    (StepKind::Delay, "固定等待"),
+                                    (StepKind::SendKeys, "键盘输入"),
+                                    (StepKind::RoundEnd, "本局结束"),
+                                ] {
+                                    ui.selectable_value(&mut step.kind, kind, label);
+                                }
+                            });
+                        ui.add_space(6.0);
+                        match step.kind {
+                            StepKind::WaitAndClick => {
+                                workflow_action = template_use_editor(
                                     ui,
-                                    &mut step.scan_interval_secs,
-                                    profile_scan_interval,
+                                    ("step-template", step.id),
+                                    TemplateUseLocator::Step(step.id),
+                                    "图片模板",
+                                    &mut step.template,
+                                    step.threshold,
+                                    &mut step.search,
+                                    reference_size,
+                                    &template_options,
+                                    &mut self.thumbs,
+                                )
+                                .or(workflow_action);
+                                timeout_editor(ui, &mut step.timeout_secs);
+                                ui.label(
+                                    RichText::new("超过该时间未识别到目标，则本步骤失败")
+                                        .size(11.0)
+                                        .color(theme::tertiary_label()),
                                 );
-                                click_anchor_offset_editors(
+                                delay_editor(ui, "识别后等待", &mut step.delay_ms);
+                                click_point_picker(
                                     ui,
-                                    ("step-click", step.id),
+                                    step.template.as_ref(),
+                                    &template_options,
+                                    &mut self.thumbs,
                                     &mut step.click_anchor,
                                     &mut step.click_offset_x,
                                     &mut step.click_offset_y,
                                 );
-                                click_repeat_editor(
-                                    ui,
-                                    &mut step.click_count,
-                                    &mut step.click_interval_ms,
-                                );
-                            });
-                    }
-                    StepKind::WaitAny => wait_any_editor(
-                        ui,
-                        step,
-                        reference_size,
-                        profile_scan_interval,
-                        &template_options,
-                        &mut self.thumbs,
-                        &mut workflow_action,
-                    ),
-                    StepKind::VisualCondition => visual_condition_editor(
-                        ui,
-                        step,
-                        reference_size,
-                        profile_scan_interval,
-                        &template_options,
-                        &mut self.thumbs,
-                        &mut workflow_action,
-                    ),
-                    StepKind::Delay => delay_editor(ui, "等待时间", &mut step.delay_ms),
-                    StepKind::SendKeys => {
-                        ui.label(
-                            RichText::new("输入模式")
-                                .size(11.0)
-                                .color(theme::secondary_label()),
-                        );
-                        egui::ComboBox::from_id_salt(("key-mode", step.id))
-                            .selected_text(step.key_mode.label())
-                            .show_ui(ui, |ui| {
-                                for mode in KeyInputMode::ALL {
-                                    ui.selectable_value(&mut step.key_mode, mode, mode.label());
-                                }
-                            });
-                        match step.key_mode {
-                            KeyInputMode::Text => {
+                                egui::CollapsingHeader::new("高级设置")
+                                    .id_salt(("step-advanced", step.id))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        threshold_editor(ui, &mut step.threshold);
+                                        scan_interval_editor(
+                                            ui,
+                                            &mut step.scan_interval_secs,
+                                            profile_scan_interval,
+                                        );
+                                        click_anchor_offset_editors(
+                                            ui,
+                                            ("step-click", step.id),
+                                            &mut step.click_anchor,
+                                            &mut step.click_offset_x,
+                                            &mut step.click_offset_y,
+                                        );
+                                        click_repeat_editor(
+                                            ui,
+                                            &mut step.click_count,
+                                            &mut step.click_interval_ms,
+                                        );
+                                    });
+                            }
+                            StepKind::WaitAny => wait_any_editor(
+                                ui,
+                                step,
+                                reference_size,
+                                profile_scan_interval,
+                                &template_options,
+                                &mut self.thumbs,
+                                &mut workflow_action,
+                            ),
+                            StepKind::VisualCondition => visual_condition_editor(
+                                ui,
+                                step,
+                                reference_size,
+                                profile_scan_interval,
+                                &template_options,
+                                &mut self.thumbs,
+                                &mut workflow_action,
+                            ),
+                            StepKind::Delay => delay_editor(ui, "等待时间", &mut step.delay_ms),
+                            StepKind::SendKeys => {
                                 ui.label(
-                                    RichText::new("输入文本")
+                                    RichText::new("输入模式")
                                         .size(11.0)
                                         .color(theme::secondary_label()),
                                 );
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut step.key_text)
-                                        .desired_rows(2)
-                                        .desired_width(f32::INFINITY),
-                                );
-                                ui.horizontal(|ui| {
-                                    ui.label("输入速率");
-                                    ui.add(
-                                        egui::Slider::new(&mut step.key_interval_ms, 10..=500)
-                                            .suffix(" ms"),
-                                    );
-                                });
+                                egui::ComboBox::from_id_salt(("key-mode", step.id))
+                                    .selected_text(step.key_mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for mode in KeyInputMode::ALL {
+                                            ui.selectable_value(
+                                                &mut step.key_mode,
+                                                mode,
+                                                mode.label(),
+                                            );
+                                        }
+                                    });
+                                match step.key_mode {
+                                    KeyInputMode::Text => {
+                                        ui.label(
+                                            RichText::new("输入文本")
+                                                .size(11.0)
+                                                .color(theme::secondary_label()),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut step.key_text)
+                                                .desired_rows(2)
+                                                .desired_width(f32::INFINITY),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.label("输入速率");
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut step.key_interval_ms,
+                                                    10..=500,
+                                                )
+                                                .suffix(" ms"),
+                                            );
+                                        });
+                                        ui.label(
+                                            RichText::new("支持中文；间隔越小打得越快")
+                                                .size(11.0)
+                                                .color(theme::tertiary_label()),
+                                        );
+                                    }
+                                    KeyInputMode::Combo => {
+                                        ui.label(
+                                            RichText::new("按键组合")
+                                                .size(11.0)
+                                                .color(theme::secondary_label()),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut step.key_combo)
+                                                .hint_text("如 enter、ctrl+c、alt+f4"),
+                                        );
+                                        if !step.key_combo.trim().is_empty() {
+                                            match parse_key_combo(&step.key_combo) {
+                                                Ok(combo) => {
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "将按下：{}",
+                                                            combo.describe()
+                                                        ))
+                                                        .size(11.0)
+                                                        .color(theme::green()),
+                                                    );
+                                                }
+                                                Err(error) => {
+                                                    ui.label(
+                                                        RichText::new(error)
+                                                            .size(11.0)
+                                                            .color(Color32::from_rgb(255, 59, 48)),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                delay_editor(ui, "输入前等待", &mut step.delay_ms);
                                 ui.label(
-                                    RichText::new("支持中文；间隔越小打得越快")
+                                    RichText::new("键盘输入前会自动激活游戏窗口（仅前台有效）")
                                         .size(11.0)
                                         .color(theme::tertiary_label()),
                                 );
                             }
-                            KeyInputMode::Combo => {
+                            StepKind::RoundEnd => {
                                 ui.label(
-                                    RichText::new("按键组合")
+                                    RichText::new("将当前局计入已完成局数，然后开始下一轮。")
                                         .size(11.0)
                                         .color(theme::secondary_label()),
                                 );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut step.key_combo)
-                                        .hint_text("如 enter、ctrl+c、alt+f4"),
-                                );
-                                if !step.key_combo.trim().is_empty() {
-                                    match parse_key_combo(&step.key_combo) {
-                                        Ok(combo) => {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "将按下：{}",
-                                                    combo.describe()
-                                                ))
-                                                .size(11.0)
-                                                .color(theme::green()),
-                                            );
-                                        }
-                                        Err(error) => {
-                                            ui.label(
-                                                RichText::new(error)
-                                                    .size(11.0)
-                                                    .color(Color32::from_rgb(255, 59, 48)),
-                                            );
-                                        }
-                                    }
-                                }
                             }
-                        }
-                        delay_editor(ui, "输入前等待", &mut step.delay_ms);
-                        ui.label(
-                            RichText::new("键盘输入前会自动激活游戏窗口（仅前台有效）")
-                                .size(11.0)
-                                .color(theme::tertiary_label()),
-                        );
-                    }
-                    StepKind::RoundEnd => {
-                        ui.label(
-                            RichText::new("将当前局计入已完成局数，然后开始下一轮。")
-                                .size(11.0)
-                                .color(theme::secondary_label()),
-                        );
-                    }
-                    StepKind::Branch => {
-                        ui.label(
+                            StepKind::Branch => {
+                                ui.label(
                             RichText::new(
                                 "通用 If/Else 条件节点尚未开放；请先使用可执行的“等待任一目标”。",
                             )
                             .size(11.0)
                             .color(theme::orange()),
                         );
-                    }
-                }
-                if template_options.is_empty()
-                    && matches!(
-                        step.kind,
-                        StepKind::WaitAndClick | StepKind::WaitAny | StepKind::VisualCondition
-                    )
-                {
-                    ui.label(
-                        RichText::new("请先在模板库中创建图片模板")
-                            .size(11.0)
-                            .color(theme::orange()),
-                    );
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("启用此步骤");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.toggle_value(&mut step.enabled, "开启");
+                            }
+                        }
+                        if template_options.is_empty()
+                            && matches!(
+                                step.kind,
+                                StepKind::WaitAndClick
+                                    | StepKind::WaitAny
+                                    | StepKind::VisualCondition
+                            )
+                        {
+                            ui.label(
+                                RichText::new("请先在模板库中创建图片模板")
+                                    .size(11.0)
+                                    .color(theme::orange()),
+                            );
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("启用此步骤");
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.toggle_value(&mut step.enabled, "开启");
+                            });
+                        });
                     });
-                });
             });
         });
         if let Some(action) = workflow_action {
@@ -2703,10 +2885,7 @@ impl Make5771App {
                     );
                 }
                 WorkflowTemplateAction::Replace(template_id) => {
-                    self.begin_countdown_capture(
-                        ui.ctx(),
-                        CapturePurpose::ReplaceTemplate(template_id),
-                    );
+                    self.pending_shared_template_replace = Some(template_id);
                 }
                 WorkflowTemplateAction::Test {
                     template_id,
@@ -3709,6 +3888,73 @@ impl Make5771App {
             }
         }
 
+        if let Some(template_id) = self.pending_shared_template_replace {
+            let template = self
+                .effective_templates()
+                .iter()
+                .find(|template| template.id == template_id)
+                .cloned();
+            if let Some(template) = template {
+                let current_references = count_template_references(&self.profile, &template.path);
+                let other_profiles = if self.profile.shared_templates {
+                    profiles_referencing_template(&template.path, &self.current_profile_path)
+                } else {
+                    Vec::new()
+                };
+                let mut open = true;
+                let mut confirm = false;
+                let mut cancel = false;
+                egui::Window::new("更新共享模板")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(500.0)
+                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.label(RichText::new(&template.name).size(18.0).strong());
+                        ui.label(
+                            RichText::new(format!(
+                                "当前流程有 {current_references} 处引用；另有 {} 个已保存流程可能受影响。",
+                                other_profiles.len()
+                            ))
+                            .color(theme::orange()),
+                        );
+                        if !other_profiles.is_empty() {
+                            ui.label(
+                                RichText::new(other_profiles.join("、"))
+                                    .size(11.0)
+                                    .color(theme::secondary_label()),
+                            );
+                        }
+                        ui.label(
+                            RichText::new(
+                                "如果只想修改当前步骤，请取消并使用“截图替换此处”。",
+                            )
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                        );
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.add(theme::primary_button("更新所有引用")).clicked() {
+                                confirm = true;
+                            }
+                            if ui.button("取消").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if cancel || !open {
+                    self.pending_shared_template_replace = None;
+                }
+                if confirm {
+                    self.pending_shared_template_replace = None;
+                    self.begin_countdown_capture(ctx, CapturePurpose::ReplaceTemplate(template_id));
+                }
+            } else {
+                self.pending_shared_template_replace = None;
+            }
+        }
+
         if let Some(template_id) = self.pending_delete_template {
             let template = self
                 .effective_templates()
@@ -4567,6 +4813,14 @@ fn edit_workflow_branch(
 }
 
 /// Short colored tag shown before each step name in the flow list.
+fn push_threshold_warning(warnings: &mut Vec<String>, owner: &str, threshold: f32) {
+    if !(0.75..=0.98).contains(&threshold) {
+        warnings.push(format!(
+            "{owner}的阈值 {threshold:.2} 较极端，建议先测试识别"
+        ));
+    }
+}
+
 fn step_kind_chip(kind: StepKind) -> (&'static str, Color32) {
     match kind {
         StepKind::WaitAndClick => ("点击", theme::blue()),
@@ -4749,12 +5003,21 @@ fn template_use_editor(
     });
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
-        if ui.button("截图新建").clicked() {
+        let local_label = if selected_id.is_some() {
+            "截图替换此处"
+        } else {
+            "截图设置此处"
+        };
+        if ui
+            .button(local_label)
+            .on_hover_text("创建独立模板并只绑定当前步骤，不影响其他引用")
+            .clicked()
+        {
             action = Some(WorkflowTemplateAction::CaptureNew(locator));
         }
         if ui
-            .add_enabled(selected_id.is_some(), egui::Button::new("截图替换"))
-            .on_hover_text("替换图片但保留路径，所有引用会一起更新")
+            .add_enabled(selected_id.is_some(), egui::Button::new("更新共享原图"))
+            .on_hover_text("保留模板路径并更新所有引用它的步骤，请谨慎使用")
             .clicked()
         {
             action = selected_id.map(WorkflowTemplateAction::Replace);
@@ -4770,20 +5033,43 @@ fn template_use_editor(
                 threshold,
             });
         }
-        if ui.button("截图框选范围").clicked() {
-            action = Some(WorkflowTemplateAction::EditRoi(locator));
-        }
     });
-    ui.horizontal(|ui| {
-        ui.label("搜索方式");
-        egui::ComboBox::from_id_salt(("search-strategy", id.clone()))
-            .selected_text(search.strategy.label())
-            .show_ui(ui, |ui| {
-                for strategy in SearchStrategy::ALL {
-                    ui.selectable_value(&mut search.strategy, strategy, strategy.label());
-                }
-            });
+    ui.label(
+        RichText::new("搜索范围")
+            .size(11.0)
+            .color(theme::secondary_label()),
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.selectable_value(&mut search.strategy, SearchStrategy::FullFrame, "全屏寻找");
+        ui.selectable_value(
+            &mut search.strategy,
+            SearchStrategy::RoiThenFullFrame,
+            "优先附近",
+        );
+        ui.selectable_value(&mut search.strategy, SearchStrategy::FixedRoi, "限定区域");
     });
+    if search.strategy == SearchStrategy::Inherit {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("当前沿用旧流程的默认范围")
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
+            if ui.small_button("改为全屏").clicked() {
+                search.strategy = SearchStrategy::FullFrame;
+            }
+        });
+    }
+    egui::CollapsingHeader::new("兼容设置")
+        .id_salt(("search-compat", id.clone()))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.selectable_value(
+                &mut search.strategy,
+                SearchStrategy::Inherit,
+                "继承流程/模板旧版范围",
+            );
+        });
     if matches!(
         search.strategy,
         SearchStrategy::FixedRoi | SearchStrategy::RoiThenFullFrame
@@ -4800,8 +5086,27 @@ fn template_use_editor(
             width: search.reference_width,
             height: search.reference_height,
         });
-        search_region_fields(ui, region, search.reference_width, search.reference_height);
+        if ui.button("在游戏画面中框选范围").clicked() {
+            action = Some(WorkflowTemplateAction::EditRoi(locator));
+        }
+        egui::CollapsingHeader::new("精确调整坐标")
+            .id_salt(("search-coordinates", id.clone()))
+            .default_open(false)
+            .show(ui, |ui| {
+                search_region_fields(ui, region, search.reference_width, search.reference_height);
+            });
         *region = clamp_search_region(*region, search.reference_width, search.reference_height);
+        if region.x == 0
+            && region.y == 0
+            && region.width == search.reference_width
+            && region.height == search.reference_height
+        {
+            ui.label(
+                RichText::new("尚未缩小范围，当前效果等同全屏寻找")
+                    .size(11.0)
+                    .color(theme::orange()),
+            );
+        }
         ui.label(
             RichText::new(if search.strategy == SearchStrategy::FixedRoi {
                 "严格区域：绝不会点击区域外目标"
@@ -6104,6 +6409,16 @@ mod tests {
                 height: 400,
             }
         );
+    }
+
+    #[test]
+    fn preflight_threshold_warning_only_flags_extremes() {
+        let mut warnings = Vec::new();
+        push_threshold_warning(&mut warnings, "普通目标", 0.90);
+        assert!(warnings.is_empty());
+        push_threshold_warning(&mut warnings, "危险目标", 0.60);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("危险目标"));
     }
 
     #[test]

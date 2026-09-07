@@ -78,7 +78,7 @@ impl RunnerHandle {
     }
 }
 
-fn validate_executable_profile(profile: &MacroProfile) -> Result<(), String> {
+pub fn validate_executable_profile(profile: &MacroProfile) -> Result<(), String> {
     profile.validate().map_err(|issues| issues.join("；"))?;
     if !profile
         .steps
