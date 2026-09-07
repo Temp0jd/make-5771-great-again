@@ -9,8 +9,9 @@ use image::{GrayImage, RgbaImage};
 
 use crate::model::{
     BranchAction, BranchActionKind, BranchOutcome, ClickAnchor, ClickMethod, ConditionExpectation,
-    ConditionMatchMode, ConditionOutcome, KeyInputMode, LoopMode, MacroProfile, StepKind,
-    TemplateAsset, VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_key_combo,
+    ConditionMatchMode, ConditionOutcome, KeyInputMode, LoopMode, MacroProfile, SearchStrategy,
+    StepKind, TemplateAsset, TemplateScaleMode, TemplateUseSearch, VisualConditionTerm,
+    WorkflowBranch, WorkflowStep, parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
 use crate::vision::{self, MatchAlgorithm, SearchRegion};
@@ -246,6 +247,7 @@ fn run_workflow(
         stop: &stop,
         events: &events,
         jitter: Jitter::new(),
+        accelerated_until: Cell::new(None),
     };
 
     'rounds: loop {
@@ -380,6 +382,26 @@ fn load_templates(
                 )
             };
         let weights = vision::TemplateWeights::analyze(&image_rgb);
+        let prepared_scales = if profile.match_algorithm == MatchAlgorithm::Hybrid {
+            [90_u32, 95, 100, 105, 110]
+                .into_iter()
+                .map(|percent| {
+                    let scaled = if percent == 100 {
+                        image_rgb.clone()
+                    } else {
+                        image::imageops::resize(
+                            &image_rgb,
+                            (image_rgb.width() * percent / 100).max(1),
+                            (image_rgb.height() * percent / 100).max(1),
+                            image::imageops::FilterType::Triangle,
+                        )
+                    };
+                    vision::PreparedTemplate::new(&scaled)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if weights.is_mostly_background() {
             warnings.push(format!(
                 "模板“{}”背景占比过高，建议截紧到文字/图标区域",
@@ -393,6 +415,7 @@ fn load_templates(
                 image,
                 image_rgb,
                 weights,
+                prepared_scales,
                 last_match: Cell::new(None),
                 recovery_misses: Cell::new(0),
             },
@@ -402,10 +425,12 @@ fn load_templates(
 }
 
 struct LoadedTemplate {
+    /// Live-frame-scaled compatibility metadata.
     asset: TemplateAsset,
     image: GrayImage,
     image_rgb: RgbaImage,
     weights: vision::TemplateWeights,
+    prepared_scales: Vec<vision::PreparedTemplate>,
     /// Last match position in client coordinates; used to try a small
     /// neighborhood before paying for a full-region scan.
     last_match: Cell<Option<(u32, u32)>>,
@@ -475,6 +500,9 @@ struct StepContext<'a> {
     stop: &'a AtomicBool,
     events: &'a mpsc::Sender<RunnerEvent>,
     jitter: Jitter,
+    /// After an input, temporarily use the fast cadence while the next screen
+    /// settles; ordinary idle cadence resumes automatically.
+    accelerated_until: Cell<Option<Instant>>,
 }
 
 impl StepContext<'_> {
@@ -485,13 +513,23 @@ impl StepContext<'_> {
         }
     }
 
-    fn recognition_wait(&self, candidate_near: bool) -> Result<(), String> {
-        let millis = if candidate_near {
-            180
-        } else {
-            self.profile.recognition_performance.poll_interval_ms()
-        };
-        interruptible_wait(Duration::from_millis(millis), self.stop)
+    fn recognition_wait(
+        &self,
+        candidate_near: bool,
+        step_interval_secs: Option<u8>,
+    ) -> Result<(), String> {
+        let accelerated = self
+            .accelerated_until
+            .get()
+            .is_some_and(|until| Instant::now() < until);
+        interruptible_wait(
+            recognition_delay(
+                self.profile,
+                candidate_near || accelerated,
+                step_interval_secs,
+            ),
+            self.stop,
+        )
     }
 
     /// Clicks client coordinates, applying optional humanization and the
@@ -575,6 +613,44 @@ impl StepContext<'_> {
     }
 }
 
+fn recognition_delay(
+    profile: &MacroProfile,
+    candidate_near: bool,
+    step_interval_secs: Option<u8>,
+) -> Duration {
+    if candidate_near {
+        // Candidate confirmation deliberately remains fast even in Eco or
+        // five-second idle mode.
+        Duration::from_millis(180)
+    } else if let Some(seconds) = step_interval_secs.or(profile.idle_scan_secs) {
+        Duration::from_secs(u64::from(seconds))
+    } else {
+        // Imported profiles that omit the v0.4 cadence retain their exact
+        // historical behavior.
+        Duration::from_millis(profile.recognition_performance.poll_interval_ms())
+    }
+}
+
+/// One capture and its lazily relevant representations. WaitAny and visual
+/// conditions share this object across every template in the poll.
+struct FrameSnapshot {
+    rgba: RgbaImage,
+    gray: Option<GrayImage>,
+    hybrid: Option<vision::PreparedFrame>,
+}
+
+impl FrameSnapshot {
+    fn capture(ctx: &StepContext<'_>) -> Result<Self, String> {
+        let rgba = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
+        ensure_expected_size(&rgba, ctx)?;
+        let algorithm = ctx.profile.match_algorithm;
+        let gray = needs_gray_frame(algorithm).then(|| image::imageops::grayscale(&rgba));
+        let hybrid =
+            (algorithm == MatchAlgorithm::Hybrid).then(|| vision::PreparedFrame::new(&rgba));
+        Ok(Self { rgba, gray, hybrid })
+    }
+}
+
 fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), String> {
     let path = step
         .template
@@ -603,22 +679,23 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
             break;
         }
 
-        let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
-        ensure_expected_size(&frame, ctx)?;
+        let frame = FrameSnapshot::capture(ctx)?;
         let algorithm = ctx.profile.match_algorithm;
-        let frame_gray = needs_gray_frame(algorithm).then(|| image::imageops::grayscale(&frame));
 
         let report = find_loaded_template(
-            &frame,
-            frame_gray.as_ref(),
-            frame.width(),
-            frame.height(),
+            &frame.rgba,
+            frame.gray.as_ref(),
+            frame.hybrid.as_ref(),
+            frame.rgba.width(),
+            frame.rgba.height(),
+            ctx.profile.template_scale_mode,
             template,
             step.threshold,
             algorithm,
             ctx.profile.recognition_performance.max_threads(),
             ctx.profile.recognition_performance.roi_recovery_checks(),
             ctx.profile.adaptive_roi,
+            &step.search,
             false,
         );
         best_seen = best_seen.max(report.best_score);
@@ -627,7 +704,7 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
                 let position = (found.x, found.y);
                 if !pending_confirm.is_some_and(|pending| same_target(pending, position)) {
                     pending_confirm = Some(position);
-                    ctx.recognition_wait(true)?;
+                    ctx.recognition_wait(true, step.scan_interval_secs)?;
                     continue;
                 }
             }
@@ -647,7 +724,7 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
             return ctx.wait(step.delay_ms);
         }
         pending_confirm = None;
-        ctx.recognition_wait(false)?;
+        ctx.recognition_wait(false, step.scan_interval_secs)?;
     }
     Err(format!(
         "步骤“{}”在 {} 秒内未找到目标（最佳相似度 {:.2}，阈值 {:.2}）",
@@ -689,6 +766,8 @@ fn click_match_repeated(
     // A successful click may change the entire screen. Carrying a location
     // hint across that transition can make a previous false positive sticky.
     ctx.clear_match_cache();
+    ctx.accelerated_until
+        .set(Some(Instant::now() + Duration::from_secs(3)));
     Ok(())
 }
 
@@ -740,6 +819,9 @@ fn send_keys(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), Strin
             platform::press_key_combo(&ctx.target, &combo).map_err(|error| error.to_string())?;
         }
     }
+    ctx.clear_match_cache();
+    ctx.accelerated_until
+        .set(Some(Instant::now() + Duration::from_secs(3)));
     Ok(())
 }
 
@@ -809,10 +891,8 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
             ));
         }
 
-        let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
-        ensure_expected_size(&frame, ctx)?;
+        let frame = FrameSnapshot::capture(ctx)?;
         let algorithm = ctx.profile.match_algorithm;
-        let frame_gray = needs_gray_frame(algorithm).then(|| image::imageops::grayscale(&frame));
 
         // Discovery scans are staggered in Eco/Balanced mode so several absent
         // templates do not all consume a full-screen scan on the same frame.
@@ -840,16 +920,19 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
                 continue;
             }
             let report = find_loaded_template(
-                &frame,
-                frame_gray.as_ref(),
-                frame.width(),
-                frame.height(),
+                &frame.rgba,
+                frame.gray.as_ref(),
+                frame.hybrid.as_ref(),
+                frame.rgba.width(),
+                frame.rgba.height(),
+                ctx.profile.template_scale_mode,
                 template,
                 branch.threshold,
                 algorithm,
                 ctx.profile.recognition_performance.max_threads(),
                 ctx.profile.recognition_performance.roi_recovery_checks(),
                 ctx.profile.adaptive_roi,
+                &branch.search,
                 true,
             );
             if report.best_score > best_seen.0 {
@@ -892,7 +975,7 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
         if ambiguous || candidates.is_empty() || candidates[0].2 {
             let candidate_near = !candidates.is_empty();
             pending_confirm = None;
-            ctx.recognition_wait(candidate_near)?;
+            ctx.recognition_wait(candidate_near, step.scan_interval_secs)?;
             continue;
         }
         let (branch, found, _, _) = candidates[0];
@@ -903,7 +986,7 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
         // is disabled, because ranking a partial branch set is unsafe.
         if !exhaustive {
             pending_confirm = Some(position);
-            ctx.recognition_wait(true)?;
+            ctx.recognition_wait(true, step.scan_interval_secs)?;
             continue;
         }
 
@@ -915,7 +998,7 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
             });
             if !confirmed {
                 pending_confirm = Some(position);
-                ctx.recognition_wait(true)?;
+                ctx.recognition_wait(true, step.scan_interval_secs)?;
                 continue;
             }
         }
@@ -986,10 +1069,8 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
             ));
         }
 
-        let frame = platform::capture_client(&ctx.target).map_err(|error| error.to_string())?;
-        ensure_expected_size(&frame, ctx)?;
+        let frame = FrameSnapshot::capture(ctx)?;
         let algorithm = ctx.profile.match_algorithm;
-        let frame_gray = needs_gray_frame(algorithm).then(|| image::imageops::grayscale(&frame));
 
         let mut satisfied = 0_usize;
         let mut matched: Option<(&VisualConditionTerm, vision::TemplateMatch)> = None;
@@ -1003,16 +1084,19 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
                 .get(path)
                 .ok_or_else(|| format!("视觉条件“{}”的图片模板未加载", term.name))?;
             let report = find_loaded_template(
-                &frame,
-                frame_gray.as_ref(),
-                frame.width(),
-                frame.height(),
+                &frame.rgba,
+                frame.gray.as_ref(),
+                frame.hybrid.as_ref(),
+                frame.rgba.width(),
+                frame.rgba.height(),
+                ctx.profile.template_scale_mode,
                 template,
                 term.threshold,
                 algorithm,
                 ctx.profile.recognition_performance.max_threads(),
                 ctx.profile.recognition_performance.roi_recovery_checks(),
                 ctx.profile.adaptive_roi,
+                &term.search,
                 true,
             );
             if report.best_score > best_seen.0 {
@@ -1020,7 +1104,12 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
             }
             let term_met = match term.expectation {
                 ConditionExpectation::Present => report.matched.is_some(),
-                ConditionExpectation::Absent => report.matched.is_none(),
+                // A deferred recovery scan or ambiguity is not proof of
+                // absence. Only a complete permitted-area search with no
+                // above-threshold candidate may satisfy an Absent term.
+                ConditionExpectation::Absent => {
+                    report.search_complete && !report.ambiguous && report.matched.is_none()
+                }
             };
             if term_met {
                 satisfied += 1;
@@ -1044,7 +1133,7 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
             stable_hits = 0;
         }
         if stable_hits < spec.stable_checks {
-            ctx.recognition_wait(stable_hits > 0)?;
+            ctx.recognition_wait(stable_hits > 0, step.scan_interval_secs)?;
             continue;
         }
 
@@ -1052,7 +1141,7 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
             // An `Absent` term can satisfy an OR condition, but it cannot
             // provide a safe click location. Wait for a Present term instead.
             stable_hits = 0;
-            ctx.recognition_wait(false)?;
+            ctx.recognition_wait(false, step.scan_interval_secs)?;
             continue;
         }
         let _ = ctx.events.send(RunnerEvent::ConditionMatched {
@@ -1130,6 +1219,8 @@ fn wait_and_click_action(ctx: &mut StepContext<'_>, action: &BranchAction) -> Re
         click_offset_y: action.click_offset_y,
         click_count: action.click_count,
         click_interval_ms: action.click_interval_ms,
+        search: action.search,
+        scan_interval_secs: action.scan_interval_secs,
         ..WorkflowStep::new(action.id, action.name.clone(), StepKind::WaitAndClick, 0)
     };
     wait_and_click(ctx, &step)
@@ -1149,6 +1240,29 @@ fn ensure_expected_size(frame: &image::RgbaImage, ctx: &StepContext<'_>) -> Resu
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RecognitionReport {
+    matched: Option<vision::TemplateMatch>,
+    best_score: f32,
+    /// True only when the complete search area permitted by the per-use
+    /// policy was examined during this observation.
+    search_complete: bool,
+    /// One or more above-threshold candidates existed, but no unique click
+    /// location could be selected safely.
+    ambiguous: bool,
+}
+
+impl RecognitionReport {
+    fn complete(report: vision::MatchReport) -> Self {
+        Self {
+            matched: report.matched,
+            best_score: report.best_score,
+            search_complete: true,
+            ambiguous: false,
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the matcher needs both frame representations plus scan context"
@@ -1156,68 +1270,112 @@ fn ensure_expected_size(frame: &image::RgbaImage, ctx: &StepContext<'_>) -> Resu
 fn find_loaded_template(
     frame: &RgbaImage,
     frame_gray: Option<&GrayImage>,
+    prepared_frame: Option<&vision::PreparedFrame>,
     frame_width: u32,
     frame_height: u32,
+    scale_mode: TemplateScaleMode,
     template: &LoadedTemplate,
     threshold: f32,
     algorithm: MatchAlgorithm,
     max_threads: usize,
     recovery_checks: u8,
-    adaptive_roi: bool,
+    profile_adaptive_roi: bool,
+    search: &TemplateUseSearch,
     force_thorough: bool,
-) -> vision::MatchReport {
+) -> RecognitionReport {
     let full_region = SearchRegion::full(frame);
-    let configured_region = template
-        .asset
-        .search_region
-        .filter(|_| {
-            template.asset.reference_width == frame_width
-                && template.asset.reference_height == frame_height
-        })
-        .map(|region| SearchRegion {
-            x: region.x,
-            y: region.y,
-            width: region.width,
-            height: region.height,
-        });
+    let (configured_region, adaptive_roi) = match search.strategy {
+        SearchStrategy::Inherit => (
+            template.asset.search_region.map(|region| SearchRegion {
+                x: region.x,
+                y: region.y,
+                width: region.width,
+                height: region.height,
+            }),
+            profile_adaptive_roi,
+        ),
+        SearchStrategy::FullFrame => (None, false),
+        SearchStrategy::FixedRoi | SearchStrategy::RoiThenFullFrame => {
+            let from_width = search.reference_width.max(1);
+            let from_height = search.reference_height.max(1);
+            let region = search.region.map(|region| {
+                scale_mode.search_region(region, from_width, from_height, frame_width, frame_height)
+            });
+            (
+                region.map(|region| SearchRegion {
+                    x: region.x,
+                    y: region.y,
+                    width: region.width.min(frame_width.saturating_sub(region.x)),
+                    height: region.height.min(frame_height.saturating_sub(region.y)),
+                }),
+                search.strategy == SearchStrategy::RoiThenFullFrame,
+            )
+        }
+    };
     let base_region = configured_region.unwrap_or(full_region);
 
     let effective_threshold = vision::effective_threshold(algorithm, threshold);
-    let run_match = |region: SearchRegion, thorough: bool| -> vision::MatchReport {
+    let run_match = |region: SearchRegion, _thorough: bool| -> RecognitionReport {
         match algorithm {
-            MatchAlgorithm::Hybrid if !thorough => {
-                vision::find_template_report_rgb_hybrid_fast_with_bands(
+            MatchAlgorithm::Hybrid => {
+                let prepared_frame = prepared_frame.expect("Hybrid 路径必须提供帧金字塔");
+                let options = vision::MatchOptions {
+                    candidate_cap: match max_threads {
+                        0..=2 => 32,
+                        3..=4 => 48,
+                        _ => 64,
+                    },
+                    max_threads,
+                    ..vision::MatchOptions::default()
+                };
+                let result = vision::match_template_multiscale(
+                    prepared_frame,
+                    &template.prepared_scales,
+                    region,
+                    effective_threshold,
+                    options,
+                );
+                let ambiguous = result.matches.len() > 1
+                    && result.matches[0].score - result.matches[1].score < BRANCH_AMBIGUITY_MARGIN;
+                RecognitionReport {
+                    // Multiple equally convincing locations are unsafe for an
+                    // implicit click. A strict per-use ROI lets the user make
+                    // the intended instance unique.
+                    matched: (!ambiguous)
+                        .then(|| result.matches.first().copied())
+                        .flatten(),
+                    best_score: result.best_score,
+                    search_complete: true,
+                    ambiguous,
+                }
+            }
+            MatchAlgorithm::Precise => {
+                RecognitionReport::complete(vision::find_template_report_rgb_weighted_with_bands(
                     frame,
                     &template.image_rgb,
                     &template.weights,
                     region,
                     effective_threshold,
                     max_threads,
-                )
+                ))
             }
-            MatchAlgorithm::Hybrid => vision::find_template_report_rgb_hybrid_with_bands(
-                frame,
-                &template.image_rgb,
-                &template.weights,
-                region,
-                effective_threshold,
-                max_threads,
-            ),
-            MatchAlgorithm::Precise => vision::find_template_report_rgb_weighted_with_bands(
-                frame,
-                &template.image_rgb,
-                &template.weights,
-                region,
-                effective_threshold,
-                max_threads,
-            ),
-            gray_algorithm => vision::find_template_report(
+            MatchAlgorithm::Fast => {
+                RecognitionReport::complete(vision::find_template_report_with_bands(
+                    frame_gray.expect("灰度匹配路径必须提供灰度图"),
+                    &template.image,
+                    region,
+                    effective_threshold,
+                    MatchAlgorithm::Fast,
+                    max_threads,
+                ))
+            }
+            gray_algorithm => RecognitionReport::complete(vision::find_template_report(
                 frame_gray.expect("灰度匹配路径必须提供灰度图"),
                 &template.image,
                 region,
                 effective_threshold,
                 gray_algorithm,
-            ),
+            )),
         }
     };
 
@@ -1269,10 +1427,14 @@ fn find_loaded_template(
         && template.last_match.get().is_some()
         && misses < recovery_checks
     {
-        return local_report.unwrap_or(vision::MatchReport {
+        let mut report = local_report.unwrap_or(RecognitionReport {
             matched: None,
             best_score: 0.0,
+            search_complete: false,
+            ambiguous: false,
         });
+        report.search_complete = false;
+        return report;
     }
 
     let thorough = force_thorough || configured_region.is_some() || misses >= recovery_checks;
@@ -1291,8 +1453,13 @@ fn find_loaded_template(
 
     // Legacy workflows keep ROI as a hard spatial safety boundary. New
     // profiles may explicitly opt into bounded full-screen recovery.
-    if !adaptive_roi || misses < recovery_checks {
+    if !adaptive_roi {
         return base_report;
+    }
+    if misses < recovery_checks {
+        let mut deferred = base_report;
+        deferred.search_complete = false;
+        return deferred;
     }
     let report = better_match_report(base_report, run_match(full_region, true));
     template
@@ -1302,18 +1469,17 @@ fn find_loaded_template(
     report
 }
 
-fn better_match_report(
-    left: vision::MatchReport,
-    right: vision::MatchReport,
-) -> vision::MatchReport {
+fn better_match_report(left: RecognitionReport, right: RecognitionReport) -> RecognitionReport {
     let matched = match (left.matched, right.matched) {
         (Some(left), Some(right)) if right.score > left.score => Some(right),
         (Some(left), _) => Some(left),
         (None, right) => right,
     };
-    vision::MatchReport {
+    RecognitionReport {
         matched,
         best_score: left.best_score.max(right.best_score),
+        search_complete: left.search_complete || right.search_complete,
+        ambiguous: left.ambiguous || right.ambiguous,
     }
 }
 
@@ -1668,7 +1834,29 @@ mod tests {
     }
 
     #[test]
-    fn forced_thorough_discovery_recognizes_low_variance_template() {
+    fn recognition_cadence_keeps_immediate_candidate_confirmation_fast() {
+        let mut profile = MacroProfile::default();
+        assert_eq!(
+            recognition_delay(&profile, false, None),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            recognition_delay(&profile, false, Some(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            recognition_delay(&profile, true, Some(5)),
+            Duration::from_millis(180)
+        );
+        profile.idle_scan_secs = None;
+        assert_eq!(
+            recognition_delay(&profile, false, None),
+            Duration::from_millis(350)
+        );
+    }
+
+    #[test]
+    fn pyramid_discovery_recognizes_low_variance_template_without_thorough_retry() {
         let template_rgb = image::RgbaImage::from_pixel(12, 8, image::Rgba([80, 120, 180, 255]));
         let mut frame = image::RgbaImage::from_pixel(40, 20, image::Rgba([10, 20, 30, 255]));
         image::imageops::replace(&mut frame, &template_rgb, 17, 6);
@@ -1685,41 +1873,62 @@ mod tests {
             },
             image: image::imageops::grayscale(&template_rgb),
             weights: vision::TemplateWeights::analyze(&template_rgb),
+            prepared_scales: vec![vision::PreparedTemplate::new(&template_rgb)],
             image_rgb: template_rgb,
             last_match: Cell::new(None),
             recovery_misses: Cell::new(0),
         };
 
-        let fast = find_loaded_template(
+        let prepared_frame = vision::PreparedFrame::new(&frame);
+        let found = find_loaded_template(
             &frame,
             None,
+            Some(&prepared_frame),
             40,
             20,
+            TemplateScaleMode::Stretch,
             &loaded,
             0.90,
             MatchAlgorithm::Hybrid,
             2,
             3,
             false,
+            &TemplateUseSearch::default(),
             false,
-        );
-        assert!(fast.matched.is_none());
-        let thorough = find_loaded_template(
-            &frame,
-            None,
-            40,
-            20,
-            &loaded,
-            0.90,
-            MatchAlgorithm::Hybrid,
-            2,
-            3,
-            false,
-            true,
         )
         .matched
-        .expect("WaitAny's forced thorough discovery must accept RGB-only templates");
-        assert_eq!((thorough.x, thorough.y), (17, 6));
+        .expect("pyramid discovery must retain flat-template compatibility");
+        assert_eq!((found.x, found.y), (17, 6));
+
+        image::imageops::replace(&mut frame, &loaded.image_rgb, 1, 1);
+        loaded.last_match.set(None);
+        loaded.recovery_misses.set(0);
+        let ambiguous_frame = vision::PreparedFrame::new(&frame);
+        let ambiguous = find_loaded_template(
+            &frame,
+            None,
+            Some(&ambiguous_frame),
+            40,
+            20,
+            TemplateScaleMode::Stretch,
+            &loaded,
+            0.90,
+            MatchAlgorithm::Hybrid,
+            2,
+            3,
+            false,
+            &TemplateUseSearch::default(),
+            true,
+        );
+        assert!(
+            ambiguous.matched.is_none(),
+            "equally convincing spatial instances must not be clicked implicitly"
+        );
+        assert!(ambiguous.search_complete);
+        assert!(
+            ambiguous.ambiguous,
+            "duplicate visible targets must not be interpreted as absence"
+        );
     }
 
     #[test]
@@ -1748,59 +1957,95 @@ mod tests {
             },
             image: image::imageops::grayscale(&template_rgb),
             weights: vision::TemplateWeights::analyze(&template_rgb),
+            prepared_scales: vec![vision::PreparedTemplate::new(&template_rgb)],
             image_rgb: template_rgb,
             last_match: Cell::new(None),
             recovery_misses: Cell::new(0),
         };
 
+        let prepared_frame = vision::PreparedFrame::new(&frame);
         let first = find_loaded_template(
             &frame,
             None,
+            Some(&prepared_frame),
             80,
             40,
+            TemplateScaleMode::Stretch,
             &loaded,
             0.90,
             MatchAlgorithm::Hybrid,
             2,
             2,
             true,
+            &TemplateUseSearch::default(),
             false,
         );
         assert!(first.matched.is_none(), "first poll should stay inside ROI");
+        assert!(
+            !first.search_complete,
+            "deferred full-screen recovery must not prove absence"
+        );
         let recovered = find_loaded_template(
             &frame,
             None,
+            Some(&prepared_frame),
             80,
             40,
+            TemplateScaleMode::Stretch,
             &loaded,
             0.90,
             MatchAlgorithm::Hybrid,
             2,
             2,
             true,
+            &TemplateUseSearch::default(),
             false,
-        )
-        .matched
-        .expect("second miss should recover on the full screen");
-        assert_eq!((recovered.x, recovered.y), (60, 20));
+        );
+        assert!(recovered.search_complete);
+        let recovered_match = recovered
+            .matched
+            .expect("second miss should recover on the full screen");
+        assert_eq!((recovered_match.x, recovered_match.y), (60, 20));
 
         loaded.last_match.set(None);
         loaded.recovery_misses.set(0);
+        let strict_search = TemplateUseSearch {
+            strategy: SearchStrategy::FixedRoi,
+            region: Some(crate::model::SearchRegionSpec {
+                x: 0,
+                y: 0,
+                width: 30,
+                height: 40,
+            }),
+            reference_width: 80,
+            reference_height: 40,
+        };
         for _ in 0..3 {
             let hard_roi = find_loaded_template(
                 &frame,
                 None,
+                Some(&prepared_frame),
                 80,
                 40,
+                TemplateScaleMode::Stretch,
                 &loaded,
                 0.90,
                 MatchAlgorithm::Hybrid,
                 2,
                 2,
-                false,
+                true,
+                &strict_search,
                 false,
             );
-            assert!(hard_roi.matched.is_none());
+            assert!(
+                hard_roi.matched.is_none(),
+                "per-use strict ROI must override profile recovery"
+            );
+            assert!(
+                hard_roi.search_complete,
+                "a strict ROI search is complete for its permitted area"
+            );
+            assert!(!hard_roi.ambiguous);
         }
     }
 

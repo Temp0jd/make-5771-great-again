@@ -71,17 +71,17 @@ impl RecognitionPerformance {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Eco => "低占用（2 线程）",
-            Self::Balanced => "均衡（4 线程，推荐）",
-            Self::Responsive => "极速（最多 8 线程）",
+            Self::Eco => "省电计算（2 线程）",
+            Self::Balanced => "标准计算（4 线程，推荐）",
+            Self::Responsive => "快速计算（最多 8 线程）",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Eco => "降低 CPU 峰值；无目标时约每 550 ms 检查一次",
-            Self::Balanced => "兼顾响应与占用；无目标时约每 350 ms 检查一次",
-            Self::Responsive => "响应最快，但会明显提高 CPU 瞬时占用",
+            Self::Eco => "降低单次识别的 CPU 峰值",
+            Self::Balanced => "兼顾识别速度与 CPU 峰值",
+            Self::Responsive => "提高单次识别并行度，但会增加 CPU 瞬时占用",
         }
     }
 
@@ -591,6 +591,49 @@ impl ConditionMatchMode {
     }
 }
 
+/// Search boundary for one template use. `Inherit` preserves the pre-v0.4
+/// asset ROI -> workflow ROI -> full-frame behavior on imported packages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SearchStrategy {
+    #[default]
+    Inherit,
+    FullFrame,
+    FixedRoi,
+    RoiThenFullFrame,
+}
+
+impl SearchStrategy {
+    pub const ALL: [Self; 4] = [
+        Self::Inherit,
+        Self::FullFrame,
+        Self::FixedRoi,
+        Self::RoiThenFullFrame,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inherit => "继承默认",
+            Self::FullFrame => "全屏",
+            Self::FixedRoi => "严格区域",
+            Self::RoiThenFullFrame => "区域优先，再全屏",
+        }
+    }
+}
+
+/// Per-use search policy. ROI coordinates are stored together with their
+/// capture-space dimensions so cross-resolution mapping is unambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TemplateUseSearch {
+    #[serde(default)]
+    pub strategy: SearchStrategy,
+    #[serde(default)]
+    pub region: Option<SearchRegionSpec>,
+    #[serde(default)]
+    pub reference_width: u32,
+    #[serde(default)]
+    pub reference_height: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConditionExpectation {
     Present,
@@ -641,6 +684,8 @@ pub struct VisualConditionTerm {
     pub template: Option<String>,
     pub expectation: ConditionExpectation,
     pub threshold: f32,
+    #[serde(default)]
+    pub search: TemplateUseSearch,
 }
 
 impl VisualConditionTerm {
@@ -651,6 +696,7 @@ impl VisualConditionTerm {
             template: None,
             expectation,
             threshold: 0.90,
+            search: TemplateUseSearch::default(),
         }
     }
 }
@@ -750,6 +796,12 @@ pub struct BranchAction {
     /// failing the whole branch (for screens that only appear sometimes).
     #[serde(default)]
     pub optional: bool,
+    #[serde(default)]
+    pub search: TemplateUseSearch,
+    /// Optional idle cadence for this action. Omitted legacy values retain the
+    /// profile/recognition-preset cadence.
+    #[serde(default)]
+    pub scan_interval_secs: Option<u8>,
 }
 
 impl BranchAction {
@@ -768,6 +820,8 @@ impl BranchAction {
             click_count: default_click_count(),
             click_interval_ms: default_click_interval_ms(),
             optional: false,
+            search: TemplateUseSearch::default(),
+            scan_interval_secs: None,
         }
     }
 }
@@ -793,6 +847,8 @@ pub struct WorkflowBranch {
     pub click_interval_ms: u32,
     #[serde(default)]
     pub actions: Vec<BranchAction>,
+    #[serde(default)]
+    pub search: TemplateUseSearch,
 }
 
 impl WorkflowBranch {
@@ -811,6 +867,7 @@ impl WorkflowBranch {
             click_count: default_click_count(),
             click_interval_ms: default_click_interval_ms(),
             actions: Vec::new(),
+            search: TemplateUseSearch::default(),
         }
     }
 }
@@ -863,6 +920,11 @@ pub struct WorkflowStep {
     pub branches: Vec<WorkflowBranch>,
     #[serde(default)]
     pub visual_condition: VisualConditionSpec,
+    #[serde(default)]
+    pub search: TemplateUseSearch,
+    /// `1`, `3`, or `5` seconds. `None` preserves imported-package cadence.
+    #[serde(default)]
+    pub scan_interval_secs: Option<u8>,
 }
 
 impl WorkflowStep {
@@ -888,6 +950,8 @@ impl WorkflowStep {
             key_interval_ms: default_key_interval_ms(),
             branches: Vec::new(),
             visual_condition: VisualConditionSpec::default(),
+            search: TemplateUseSearch::default(),
+            scan_interval_secs: None,
         }
     }
 }
@@ -982,6 +1046,10 @@ pub struct MacroProfile {
     pub match_algorithm: MatchAlgorithm,
     #[serde(default)]
     pub recognition_performance: RecognitionPerformance,
+    /// Idle scan cadence for new profiles. `None` keeps the exact legacy
+    /// sub-second cadence when importing an older package.
+    #[serde(default)]
+    pub idle_scan_secs: Option<u8>,
     /// Missing legacy fields retain the old independent width/height stretch;
     /// newly created profiles preserve template aspect ratio.
     #[serde(default)]
@@ -1048,6 +1116,7 @@ impl Default for MacroProfile {
             shared_templates: false,
             match_algorithm: MatchAlgorithm::Hybrid,
             recognition_performance: RecognitionPerformance::default(),
+            idle_scan_secs: Some(3),
             template_scale_mode: TemplateScaleMode::UniformFit,
             default_search_region: None,
             adaptive_roi: true,
@@ -1085,6 +1154,12 @@ impl MacroProfile {
         if self.steps.len() > 1000 {
             issues.push("流程步骤数不能超过 1000".to_owned());
         }
+        if self
+            .idle_scan_secs
+            .is_some_and(|value| !matches!(value, 1 | 3 | 5))
+        {
+            issues.push("普通扫描间隔只能为 1、3 或 5 秒".to_owned());
+        }
         if let Some(region) = self.default_search_region
             && !valid_search_region(
                 region,
@@ -1119,6 +1194,15 @@ impl MacroProfile {
             }
             if step.timeout_secs == 0 {
                 issues.push(format!("步骤“{}”的超时必须大于零", step.name));
+            }
+            if step
+                .scan_interval_secs
+                .is_some_and(|value| !matches!(value, 1 | 3 | 5))
+            {
+                issues.push(format!("步骤“{}”的扫描间隔只能为 1、3 或 5 秒", step.name));
+            }
+            if !valid_template_use_search(step.search) {
+                issues.push(format!("步骤“{}”的识别区域无效", step.name));
             }
             if !(1..=20).contains(&step.click_count) {
                 issues.push(format!("步骤“{}”的点击次数必须为 1-20", step.name));
@@ -1158,6 +1242,9 @@ impl MacroProfile {
                 if !(0.0..=1.0).contains(&term.threshold) {
                     issues.push(format!("视觉条件“{}”的相似度不合法", term.name));
                 }
+                if !valid_template_use_search(term.search) {
+                    issues.push(format!("视觉条件“{}”的识别区域无效", term.name));
+                }
             }
             let mut branch_ids = std::collections::HashSet::new();
             for branch in &step.branches {
@@ -1169,6 +1256,9 @@ impl MacroProfile {
                 }
                 if !(0.0..=1.0).contains(&branch.threshold) {
                     issues.push(format!("分支“{}”的相似度不合法", branch.name));
+                }
+                if !valid_template_use_search(branch.search) {
+                    issues.push(format!("分支“{}”的识别区域无效", branch.name));
                 }
                 if !(1..=20).contains(&branch.click_count) {
                     issues.push(format!("分支“{}”的点击次数必须为 1-20", branch.name));
@@ -1191,8 +1281,20 @@ impl MacroProfile {
                     if !(0.0..=1.0).contains(&action.threshold) {
                         issues.push(format!("动作“{}”的相似度不合法", action.name));
                     }
+                    if !valid_template_use_search(action.search) {
+                        issues.push(format!("动作“{}”的识别区域无效", action.name));
+                    }
                     if action.timeout_secs == 0 {
                         issues.push(format!("动作“{}”的超时必须大于零", action.name));
+                    }
+                    if action
+                        .scan_interval_secs
+                        .is_some_and(|value| !matches!(value, 1 | 3 | 5))
+                    {
+                        issues.push(format!(
+                            "动作“{}”的扫描间隔只能为 1、3 或 5 秒",
+                            action.name
+                        ));
                     }
                     if !(1..=20).contains(&action.click_count) {
                         issues.push(format!("动作“{}”的点击次数必须为 1-20", action.name));
@@ -1235,6 +1337,19 @@ impl MacroProfile {
             Ok(())
         } else {
             Err(issues)
+        }
+    }
+}
+
+fn valid_template_use_search(search: TemplateUseSearch) -> bool {
+    match search.strategy {
+        SearchStrategy::Inherit | SearchStrategy::FullFrame => true,
+        SearchStrategy::FixedRoi | SearchStrategy::RoiThenFullFrame => {
+            search.reference_width > 0
+                && search.reference_height > 0
+                && search.region.is_some_and(|region| {
+                    valid_search_region(region, search.reference_width, search.reference_height)
+                })
         }
     }
 }
@@ -1637,6 +1752,9 @@ mod tests {
         assert_eq!(action.click_count, 1);
         assert_eq!(action.click_interval_ms, 100);
         assert!(!action.optional);
+        assert_eq!(action.search, TemplateUseSearch::default());
+        assert_eq!(action.scan_interval_secs, None);
+        assert_eq!(branch.search, TemplateUseSearch::default());
 
         let spec: VisualConditionSpec = serde_json::from_str(
             r#"{"mode": "All", "stable_checks": 2, "outcome": "ClickTemplate"}"#,
@@ -1655,6 +1773,7 @@ mod tests {
         object.remove("shared_templates");
         object.remove("match_algorithm");
         object.remove("recognition_performance");
+        object.remove("idle_scan_secs");
         object.remove("template_scale_mode");
         object.remove("default_search_region");
         object.remove("adaptive_roi");
@@ -1668,10 +1787,39 @@ mod tests {
             profile.recognition_performance,
             RecognitionPerformance::Balanced
         );
+        assert_eq!(profile.idle_scan_secs, None);
         assert_eq!(profile.template_scale_mode, TemplateScaleMode::Stretch);
         assert_eq!(profile.default_search_region, None);
         assert!(!profile.adaptive_roi);
         assert!(profile.stable_confirm);
+    }
+
+    #[test]
+    fn scan_cadence_and_per_use_search_validate_with_legacy_defaults() {
+        let mut profile = MacroProfile::default();
+        assert_eq!(profile.idle_scan_secs, Some(3));
+        profile.idle_scan_secs = Some(5);
+        profile.steps[0].scan_interval_secs = Some(1);
+        profile.steps[0].search = TemplateUseSearch {
+            strategy: SearchStrategy::FixedRoi,
+            region: Some(SearchRegionSpec {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 80,
+            }),
+            reference_width: 1280,
+            reference_height: 720,
+        };
+        assert!(profile.validate().is_ok());
+        profile.idle_scan_secs = Some(2);
+        assert!(
+            profile
+                .validate()
+                .unwrap_err()
+                .iter()
+                .any(|issue| issue.contains("扫描间隔"))
+        );
     }
 
     #[test]

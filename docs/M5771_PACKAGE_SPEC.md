@@ -17,7 +17,7 @@
 {
   "format": "make5771.workflow-package",
   "format_version": 1,
-  "app_version": "0.3.13",
+  "app_version": "0.4.0",
   "created_at": "RFC 3339 timestamp",
   "profile": {},
   "assets": [
@@ -34,11 +34,15 @@
 
 `profile.recognition_performance` 可取 `Eco`、`Balanced` 或 `Responsive`，分别限制为 2、4 或最多 8 个识别线程。缺少该字段的旧包默认使用 `Balanced`，识别判定规则不变。
 
+`profile.idle_scan_secs` 可取 `1`、`3`、`5` 或 `null`。新建流程默认 `3` 秒；视觉步骤上的 `scan_interval_secs` 可覆盖流程值。首次进入步骤会立即扫描，只有未发现候选时才等待该间隔，候选/点击后的稳定确认仍使用约 180 ms。缺少字段的旧包反序列化为 `null`，继续使用 v0.3 的性能档位轮询间隔。
+
 `profile.template_scale_mode` 可取 `UniformFit` 或 `Stretch`。`UniformFit` 按客户区可容纳的统一比例缩放宽高，并将 ROI 映射到居中的内容区，适合跨 16:9、16:10 和超宽屏分享；`Stretch` 沿用旧版宽高分别缩放。新建流程默认 `UniformFit`，缺少该字段的旧包默认 `Stretch`，避免静默改变既有流程。
 
 `profile.default_search_region` 是流程基准客户区坐标中的默认 ROI。值为 `null` 时全屏搜索；没有 `search_region` 覆盖的模板会继承它。模板自身的 `search_region` 始终优先，并以该模板的参考尺寸为坐标基准；运行时会按 `template_scale_mode` 正确映射两种坐标。缺少该字段的旧包默认全屏。
 
-`profile.adaptive_roi` 控制配置区域连续未命中后是否允许全屏恢复。新建流程默认启用；缺少该字段的旧包反序列化为 `false`，继续把 ROI 作为严格空间边界，避免兼容升级后发生区域外点击。
+`profile.adaptive_roi` 控制旧版继承区域连续未命中后是否允许全屏恢复。新建流程默认启用；缺少该字段的旧包反序列化为 `false`，继续把 ROI 作为严格空间边界，避免兼容升级后发生区域外点击。
+
+每个模板使用位置（步骤 `search`、WaitAny 分支 `search`、分支动作 `search`、视觉条件项 `search`）可独立指定 `strategy`：`Inherit`、`FullFrame`、`FixedRoi`、`RoiThenFullFrame`。流程编辑器可直接截取当前游戏画面并可视化框选步骤级 ROI。`region` 使用同一对象内 `reference_width` × `reference_height` 的坐标空间。`FixedRoi` 是严格安全边界；`RoiThenFullFrame` 才允许恢复全屏。所有字段都带 serde 默认值，旧包缺少 `search` 时等同 `Inherit`。
 
 点击类步骤、WaitAny 分支触发器和分支点击动作可分别携带 `click_count` 与 `click_interval_ms`。次数范围为 1–20，间隔范围为 0–5000 ms；旧包缺少字段时默认单击一次、间隔 100 ms。
 

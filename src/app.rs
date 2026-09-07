@@ -6,20 +6,58 @@ use crate::model::{
     AppTab, BranchAction, BranchActionKind, BranchOutcome, ClickAnchor, ClickMethod,
     ConditionExpectation, ConditionMatchMode, ConditionOutcome, KeyCombo, KeyInputMode, LogEntry,
     LogLevel, LoopMode, MacroProfile, RecognitionPerformance, RunnerStatus, SearchRegionSpec,
-    StepKind, TemplateAsset, TemplateScaleMode, VisualConditionTerm, WorkflowBranch, WorkflowStep,
-    parse_hotkeys, parse_key_combo,
+    SearchStrategy, StepKind, TemplateAsset, TemplateScaleMode, TemplateUseSearch,
+    VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_hotkeys, parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
 use crate::runner::{RunnerEvent, RunnerHandle};
 use crate::storage;
-use crate::template_editor::{EditorAction, PixelSelection, TemplateDraft, TemplateTestView};
+use crate::template_editor::{
+    EditorAction, PixelSelection, RoiDraft, RoiEditorAction, TemplateDraft, TemplateTestView,
+};
 use crate::theme;
 use crate::vision::{self, MatchAlgorithm, SearchRegion};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
+enum TemplateUseLocator {
+    Step(u64),
+    Branch {
+        step_id: u64,
+        branch_id: u64,
+    },
+    Action {
+        step_id: u64,
+        branch_id: u64,
+        action_id: u64,
+    },
+    Condition {
+        step_id: u64,
+        term_id: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
 enum CapturePurpose {
-    NewTemplate,
-    TestTemplate(u64),
+    NewTemplate(Option<TemplateUseLocator>),
+    ReplaceTemplate(u64),
+    TestUse {
+        template_id: u64,
+        search: TemplateUseSearch,
+        threshold: f32,
+    },
+    EditUseRoi(TemplateUseLocator),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorkflowTemplateAction {
+    CaptureNew(TemplateUseLocator),
+    Replace(u64),
+    Test {
+        template_id: u64,
+        search: TemplateUseSearch,
+        threshold: f32,
+    },
+    EditRoi(TemplateUseLocator),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +121,10 @@ struct TemplateTestOutcome {
     search_region: SearchRegion,
     threshold: f32,
     mostly_background: bool,
+    candidates: Vec<vision::TemplateMatch>,
+    search_strategy: SearchStrategy,
+    used_recovery: bool,
+    recovery_checks: u8,
     result: Result<vision::MatchReport, String>,
 }
 
@@ -92,6 +134,8 @@ struct TemplateTestConfig {
     scale_mode: TemplateScaleMode,
     reference_fallback: (u32, u32),
     default_search_region: Option<SearchRegionSpec>,
+    adaptive_roi: bool,
+    recovery_checks: u8,
     max_threads: usize,
 }
 
@@ -115,6 +159,8 @@ pub struct Make5771App {
     force_stop_confirm: bool,
     target_window: Option<TargetWindow>,
     template_draft: Option<TemplateDraft>,
+    roi_draft: Option<RoiDraft>,
+    roi_bind_target: Option<TemplateUseLocator>,
     hotkey_receiver: Option<std::sync::mpsc::Receiver<platform::GlobalHotkey>>,
     _hotkey_guard: Option<platform::HotkeyGuard>,
     /// The combos currently registered with the OS; used to skip no-op
@@ -134,7 +180,9 @@ pub struct Make5771App {
     template_roi_draft: Option<TemplateRoiDraft>,
     pending_capture: Option<image::RgbaImage>,
     capture_purpose: CapturePurpose,
-    pending_test_capture: Option<(u64, image::RgbaImage)>,
+    draft_replacement_id: Option<u64>,
+    draft_bind_target: Option<TemplateUseLocator>,
+    pending_test_capture: Option<(u64, image::RgbaImage, f32, TemplateUseSearch)>,
     template_test_pending: Option<std::sync::mpsc::Receiver<TemplateTestOutcome>>,
     template_test_view: Option<TemplateTestView>,
     template_test_threshold: f32,
@@ -223,6 +271,8 @@ impl Make5771App {
             force_stop_confirm: false,
             target_window,
             template_draft: None,
+            roi_draft: None,
+            roi_bind_target: None,
             hotkey_receiver,
             _hotkey_guard: hotkey_guard,
             active_hotkeys,
@@ -238,7 +288,9 @@ impl Make5771App {
             template_rename: None,
             template_roi_draft: None,
             pending_capture: None,
-            capture_purpose: CapturePurpose::NewTemplate,
+            capture_purpose: CapturePurpose::NewTemplate(None),
+            draft_replacement_id: None,
+            draft_bind_target: None,
             pending_test_capture: None,
             template_test_pending: None,
             template_test_view: None,
@@ -297,6 +349,169 @@ impl Make5771App {
             &mut self.shared_templates
         } else {
             &mut self.profile.templates
+        }
+    }
+
+    fn bind_template_path(&mut self, locator: TemplateUseLocator, path: String) {
+        match locator {
+            TemplateUseLocator::Step(step_id) => {
+                if let Some(step) = self
+                    .profile
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == step_id)
+                {
+                    step.template = Some(path);
+                }
+            }
+            TemplateUseLocator::Branch { step_id, branch_id } => {
+                if let Some(branch) = self
+                    .profile
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == step_id)
+                    .and_then(|step| {
+                        step.branches
+                            .iter_mut()
+                            .find(|branch| branch.id == branch_id)
+                    })
+                {
+                    branch.trigger_template = Some(path);
+                }
+            }
+            TemplateUseLocator::Action {
+                step_id,
+                branch_id,
+                action_id,
+            } => {
+                if let Some(action) = self
+                    .profile
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == step_id)
+                    .and_then(|step| {
+                        step.branches
+                            .iter_mut()
+                            .find(|branch| branch.id == branch_id)
+                    })
+                    .and_then(|branch| {
+                        branch
+                            .actions
+                            .iter_mut()
+                            .find(|action| action.id == action_id)
+                    })
+                {
+                    action.template = Some(path);
+                }
+            }
+            TemplateUseLocator::Condition { step_id, term_id } => {
+                if let Some(term) = self
+                    .profile
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == step_id)
+                    .and_then(|step| {
+                        step.visual_condition
+                            .terms
+                            .iter_mut()
+                            .find(|term| term.id == term_id)
+                    })
+                {
+                    term.template = Some(path);
+                }
+            }
+        }
+    }
+
+    fn apply_visual_roi(
+        &mut self,
+        locator: TemplateUseLocator,
+        selection: PixelSelection,
+        reference_size: (u32, u32),
+    ) {
+        let update = |search: &mut TemplateUseSearch| {
+            if !matches!(
+                search.strategy,
+                SearchStrategy::FixedRoi | SearchStrategy::RoiThenFullFrame
+            ) {
+                search.strategy = SearchStrategy::FixedRoi;
+            }
+            search.region = Some(SearchRegionSpec {
+                x: selection.x,
+                y: selection.y,
+                width: selection.width,
+                height: selection.height,
+            });
+            search.reference_width = reference_size.0.max(1);
+            search.reference_height = reference_size.1.max(1);
+        };
+        match locator {
+            TemplateUseLocator::Step(step_id) => {
+                if let Some(step) = self
+                    .profile
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == step_id)
+                {
+                    update(&mut step.search);
+                }
+            }
+            TemplateUseLocator::Branch { step_id, branch_id } => {
+                if let Some(branch) = self
+                    .profile
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == step_id)
+                    .and_then(|step| {
+                        step.branches
+                            .iter_mut()
+                            .find(|branch| branch.id == branch_id)
+                    })
+                {
+                    update(&mut branch.search);
+                }
+            }
+            TemplateUseLocator::Action {
+                step_id,
+                branch_id,
+                action_id,
+            } => {
+                if let Some(action) = self
+                    .profile
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == step_id)
+                    .and_then(|step| {
+                        step.branches
+                            .iter_mut()
+                            .find(|branch| branch.id == branch_id)
+                    })
+                    .and_then(|branch| {
+                        branch
+                            .actions
+                            .iter_mut()
+                            .find(|action| action.id == action_id)
+                    })
+                {
+                    update(&mut action.search);
+                }
+            }
+            TemplateUseLocator::Condition { step_id, term_id } => {
+                if let Some(term) = self
+                    .profile
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == step_id)
+                    .and_then(|step| {
+                        step.visual_condition
+                            .terms
+                            .iter_mut()
+                            .find(|term| term.id == term_id)
+                    })
+                {
+                    update(&mut term.search);
+                }
+            }
         }
     }
 
@@ -519,12 +734,30 @@ impl Make5771App {
             match platform::capture_client(target) {
                 Ok(image) => {
                     match self.capture_purpose {
-                        CapturePurpose::NewTemplate => self.pending_capture = Some(image),
-                        CapturePurpose::TestTemplate(template_id) => {
-                            self.pending_test_capture = Some((template_id, image));
+                        CapturePurpose::NewTemplate(bind_target) => {
+                            self.draft_replacement_id = None;
+                            self.draft_bind_target = bind_target;
+                            self.pending_capture = Some(image);
+                        }
+                        CapturePurpose::ReplaceTemplate(template_id) => {
+                            self.draft_replacement_id = Some(template_id);
+                            self.draft_bind_target = None;
+                            self.pending_capture = Some(image);
+                        }
+                        CapturePurpose::TestUse {
+                            template_id,
+                            search,
+                            threshold,
+                        } => {
+                            self.pending_test_capture =
+                                Some((template_id, image, threshold, search));
+                        }
+                        CapturePurpose::EditUseRoi(locator) => {
+                            self.roi_bind_target = Some(locator);
+                            self.roi_draft = Some(RoiDraft::from_image(ctx, image));
                         }
                     }
-                    self.capture_purpose = CapturePurpose::NewTemplate;
+                    self.capture_purpose = CapturePurpose::NewTemplate(None);
                     self.push_log(LogLevel::Success, format!("已通过 {source} 截取游戏画面"));
                 }
                 Err(error) => {
@@ -547,7 +780,7 @@ impl Make5771App {
         for event in events {
             match event {
                 platform::GlobalHotkey::CaptureTemplate => {
-                    self.capture_purpose = CapturePurpose::NewTemplate;
+                    self.capture_purpose = CapturePurpose::NewTemplate(None);
                     let label = hotkey_label(&self.profile.capture_hotkey);
                     self.capture_game_frame(ctx, &label);
                 }
@@ -738,6 +971,8 @@ impl Make5771App {
         ctx: &egui::Context,
         template_id: u64,
         frame: image::RgbaImage,
+        threshold: f32,
+        search: TemplateUseSearch,
     ) {
         let Some(template_asset) = self
             .effective_templates()
@@ -751,7 +986,6 @@ impl Make5771App {
         // The scan can take a moment on full-resolution frames, so the heavy
         // part runs on a worker thread and reports back through a channel.
         let (sender, receiver) = std::sync::mpsc::channel();
-        let threshold = self.template_test_threshold;
         let config = TemplateTestConfig {
             algorithm: self.profile.match_algorithm,
             scale_mode: self.profile.template_scale_mode,
@@ -760,6 +994,8 @@ impl Make5771App {
                 self.profile.expected_client_height,
             ),
             default_search_region: self.profile.default_search_region,
+            adaptive_roi: self.profile.adaptive_roi,
+            recovery_checks: self.profile.recognition_performance.roi_recovery_checks(),
             max_threads: self.profile.recognition_performance.max_threads(),
         };
         self.template_test_pending = Some(receiver);
@@ -768,7 +1004,7 @@ impl Make5771App {
             format!("正在识别模板“{}”…", template_asset.name),
         );
         std::thread::spawn(move || {
-            let outcome = run_template_test_work(template_asset, frame, threshold, config);
+            let outcome = run_template_test_work(template_asset, frame, threshold, search, config);
             let _ = sender.send(outcome);
         });
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -817,7 +1053,18 @@ impl Make5771App {
             outcome.template_name,
             outcome.search_region,
             result,
+            report.best_score,
+            outcome.candidates,
             outcome.threshold,
+            if outcome.used_recovery {
+                format!(
+                    "{} · 模拟 {} 次区域未命中后回退全屏",
+                    outcome.search_strategy.label(),
+                    outcome.recovery_checks
+                )
+            } else {
+                outcome.search_strategy.label().to_owned()
+            },
             self.mascots.ramona_pro.clone(),
         ));
     }
@@ -841,6 +1088,101 @@ impl Make5771App {
         };
         let reference_width = draft.image.width();
         let reference_height = draft.image.height();
+        let cropped = image::imageops::crop_imm(
+            &draft.image,
+            selection.x,
+            selection.y,
+            selection.width,
+            selection.height,
+        )
+        .to_image();
+
+        if let Some(replacement_id) = self.draft_replacement_id.take() {
+            let Some(old_asset) = self
+                .effective_templates()
+                .iter()
+                .find(|asset| asset.id == replacement_id)
+                .cloned()
+            else {
+                self.toast = Some("待替换模板不存在".to_owned());
+                return;
+            };
+            let replacement_roi = remap_template_roi_for_replacement(
+                &old_asset,
+                self.profile.template_scale_mode,
+                (
+                    self.profile.expected_client_width,
+                    self.profile.expected_client_height,
+                ),
+                (reference_width, reference_height),
+            );
+            let path = std::path::PathBuf::from(&old_asset.path);
+            let temporary = path.with_extension("replacement.png");
+            let backup = std::fs::read(&path).ok();
+            let result = (|| -> Result<(), String> {
+                cropped
+                    .save(&temporary)
+                    .map_err(|error| format!("无法写入替换图片：{error}"))?;
+                if path.exists() {
+                    std::fs::remove_file(&path)
+                        .map_err(|error| format!("无法更新原模板：{error}"))?;
+                }
+                std::fs::rename(&temporary, &path)
+                    .map_err(|error| format!("无法启用替换图片：{error}"))?;
+                if let Some(asset) = self
+                    .effective_templates_mut()
+                    .iter_mut()
+                    .find(|asset| asset.id == replacement_id)
+                {
+                    asset.name = name.clone();
+                    asset.width = selection.width;
+                    asset.height = selection.height;
+                    asset.reference_width = reference_width;
+                    asset.reference_height = reference_height;
+                    asset.search_region = replacement_roi;
+                }
+                let persisted = if self.profile.shared_templates {
+                    storage::save_shared_templates(&self.shared_templates)
+                        .map_err(|error| error.to_string())
+                } else {
+                    storage::save_profile(&self.current_profile_path, &self.profile)
+                        .map_err(|error| error.to_string())
+                };
+                if let Err(error) = persisted {
+                    if let Some(asset) = self
+                        .effective_templates_mut()
+                        .iter_mut()
+                        .find(|asset| asset.id == replacement_id)
+                    {
+                        *asset = old_asset.clone();
+                    }
+                    if let Some(bytes) = &backup {
+                        let _ = std::fs::write(&path, bytes);
+                    }
+                    return Err(format!("模板元数据保存失败：{error}"));
+                }
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&temporary);
+            match result {
+                Ok(()) => {
+                    self.thumbs.cache.remove(&old_asset.path);
+                    self.toast = Some(format!("模板“{name}”已替换，所有引用自动生效"));
+                    self.push_log(LogLevel::Success, format!("已替换模板：{name}"));
+                }
+                Err(error) => {
+                    if !path.exists()
+                        && let Some(bytes) = backup
+                    {
+                        let _ = std::fs::write(&path, bytes);
+                    }
+                    self.toast = Some(error.clone());
+                    self.push_log(LogLevel::Warning, error);
+                }
+            }
+            return;
+        }
+
         let id = self
             .effective_templates()
             .iter()
@@ -853,14 +1195,6 @@ impl Make5771App {
         let result = (|| -> Result<(), String> {
             std::fs::create_dir_all("templates")
                 .map_err(|error| format!("无法创建模板目录：{error}"))?;
-            let cropped = image::imageops::crop_imm(
-                &draft.image,
-                selection.x,
-                selection.y,
-                selection.width,
-                selection.height,
-            )
-            .to_image();
             cropped
                 .save(&path)
                 .map_err(|error| format!("无法保存模板图片：{error}"))?;
@@ -881,29 +1215,44 @@ impl Make5771App {
                         suggest_search_region(selection, reference_width, reference_height)
                     }),
                 };
+                let asset_path = asset.path.clone();
+                let old_profile = self.profile.clone();
+                let old_shared = self.shared_templates.clone();
                 if self.profile.shared_templates {
                     self.shared_templates.push(asset);
-                    if let Err(error) = storage::save_shared_templates(&self.shared_templates) {
-                        self.push_log(
-                            LogLevel::Warning,
-                            format!("模板已保存，但公共模板库更新失败：{error}"),
-                        );
-                    }
                 } else {
                     self.profile.templates.push(asset);
-                    if let Err(error) =
-                        storage::save_profile(&self.current_profile_path, &self.profile)
-                    {
-                        self.push_log(
-                            LogLevel::Warning,
-                            format!("模板已保存，但流程更新失败：{error}"),
-                        );
+                }
+                if let Some(locator) = self.draft_bind_target.take() {
+                    self.bind_template_path(locator, asset_path);
+                }
+                let persisted = (|| -> Result<(), String> {
+                    if self.profile.shared_templates {
+                        storage::save_shared_templates(&self.shared_templates)
+                            .map_err(|error| format!("公共模板库更新失败：{error}"))?;
+                    }
+                    storage::save_profile(&self.current_profile_path, &self.profile)
+                        .map_err(|error| format!("流程更新失败：{error}"))
+                })();
+                match persisted {
+                    Ok(()) => {
+                        self.toast = Some(format!("模板“{name}”已保存"));
+                        self.push_log(LogLevel::Success, format!("已保存模板：{name}"));
+                    }
+                    Err(error) => {
+                        self.profile = old_profile;
+                        if self.profile.shared_templates {
+                            self.shared_templates = old_shared;
+                            let _ = storage::save_shared_templates(&self.shared_templates);
+                        }
+                        let _ = std::fs::remove_file(&path);
+                        self.toast = Some(error.clone());
+                        self.push_log(LogLevel::Warning, error);
                     }
                 }
-                self.toast = Some(format!("模板“{name}”已保存"));
-                self.push_log(LogLevel::Success, format!("已保存模板：{name}"));
             }
             Err(error) => {
+                self.draft_bind_target = None;
                 self.toast = Some(error.clone());
                 self.push_log(LogLevel::Warning, error);
             }
@@ -1175,7 +1524,15 @@ impl Make5771App {
         };
         match storage::import_workflow_package(&path) {
             Ok((mut profile, summary)) => {
-                let (merge_stats, path_remap) = self.merge_shared_templates(&profile.templates);
+                let (merge_stats, path_remap) =
+                    match self.merge_shared_templates(&profile.templates) {
+                        Ok(merged) => merged,
+                        Err(error) => {
+                            self.toast = Some(error.clone());
+                            self.push_log(LogLevel::Warning, error);
+                            return;
+                        }
+                    };
                 remap_profile_template_paths(&mut profile, &path_remap);
                 profile.shared_templates = true;
                 let save_path = storage::unique_profile_path(&profile.name);
@@ -1276,10 +1633,14 @@ impl Make5771App {
     fn merge_shared_templates(
         &mut self,
         templates: &[TemplateAsset],
-    ) -> (
-        TemplateMergeStats,
-        std::collections::HashMap<String, String>,
-    ) {
+    ) -> Result<
+        (
+            TemplateMergeStats,
+            std::collections::HashMap<String, String>,
+        ),
+        String,
+    > {
+        let original = self.shared_templates.clone();
         let mut stats = TemplateMergeStats::default();
         let mut remap = std::collections::HashMap::new();
         let mut next_id = self
@@ -1323,10 +1684,10 @@ impl Make5771App {
         if stats.added > 0
             && let Err(error) = storage::save_shared_templates(&self.shared_templates)
         {
-            self.toast = Some(format!("公共模板库保存失败：{error}"));
-            self.push_log(LogLevel::Warning, format!("公共模板库保存失败：{error}"));
+            self.shared_templates = original;
+            return Err(format!("公共模板库保存失败，导入已取消：{error}"));
         }
-        (stats, remap)
+        Ok((stats, remap))
     }
 
     fn export_flow_package(&mut self) {
@@ -1910,7 +2271,12 @@ impl Make5771App {
         ui.add_space(10.0);
 
         let list_width = (ui.available_width() * 0.43).clamp(320.0, 440.0);
-        let mut step_test_request: Option<u64> = None;
+        let reference_size = (
+            self.profile.expected_client_width,
+            self.profile.expected_client_height,
+        );
+        let profile_scan_interval = self.profile.idle_scan_secs;
+        let mut workflow_action: Option<WorkflowTemplateAction> = None;
         ui.columns(2, |columns| {
             columns[0].set_width(list_width);
             theme::card().show(&mut columns[0], |ui| {
@@ -2140,14 +2506,19 @@ impl Make5771App {
                 ui.add_space(6.0);
                 match step.kind {
                     StepKind::WaitAndClick => {
-                        template_picker(
+                        workflow_action = template_use_editor(
                             ui,
                             ("step-template", step.id),
+                            TemplateUseLocator::Step(step.id),
                             "图片模板",
                             &mut step.template,
+                            step.threshold,
+                            &mut step.search,
+                            reference_size,
                             &template_options,
                             &mut self.thumbs,
-                        );
+                        )
+                        .or(workflow_action);
                         timeout_editor(ui, &mut step.timeout_secs);
                         ui.label(
                             RichText::new("超过该时间未识别到目标，则本步骤失败")
@@ -2164,33 +2535,16 @@ impl Make5771App {
                             &mut step.click_offset_x,
                             &mut step.click_offset_y,
                         );
-                        let test_template_id = step.template.as_ref().and_then(|path| {
-                            template_options
-                                .iter()
-                                .find(|(_, _, candidate)| candidate == path)
-                                .map(|(id, _, _)| *id)
-                        });
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    test_template_id.is_some(),
-                                    egui::Button::new("测试识别"),
-                                )
-                                .clicked()
-                            {
-                                step_test_request = test_template_id;
-                            }
-                            ui.label(
-                                RichText::new("倒计时 3 秒切回游戏画面，测试当前模板能否识别")
-                                    .size(11.0)
-                                    .color(theme::tertiary_label()),
-                            );
-                        });
                         egui::CollapsingHeader::new("高级设置")
                             .id_salt(("step-advanced", step.id))
                             .default_open(false)
                             .show(ui, |ui| {
                                 threshold_editor(ui, &mut step.threshold);
+                                scan_interval_editor(
+                                    ui,
+                                    &mut step.scan_interval_secs,
+                                    profile_scan_interval,
+                                );
                                 click_anchor_offset_editors(
                                     ui,
                                     ("step-click", step.id),
@@ -2205,12 +2559,24 @@ impl Make5771App {
                                 );
                             });
                     }
-                    StepKind::WaitAny => {
-                        wait_any_editor(ui, step, &template_options, &mut self.thumbs)
-                    }
-                    StepKind::VisualCondition => {
-                        visual_condition_editor(ui, step, &template_options, &mut self.thumbs)
-                    }
+                    StepKind::WaitAny => wait_any_editor(
+                        ui,
+                        step,
+                        reference_size,
+                        profile_scan_interval,
+                        &template_options,
+                        &mut self.thumbs,
+                        &mut workflow_action,
+                    ),
+                    StepKind::VisualCondition => visual_condition_editor(
+                        ui,
+                        step,
+                        reference_size,
+                        profile_scan_interval,
+                        &template_options,
+                        &mut self.thumbs,
+                        &mut workflow_action,
+                    ),
                     StepKind::Delay => delay_editor(ui, "等待时间", &mut step.delay_ms),
                     StepKind::SendKeys => {
                         ui.label(
@@ -2328,8 +2694,38 @@ impl Make5771App {
                 });
             });
         });
-        if let Some(template_id) = step_test_request {
-            self.begin_countdown_capture(ui.ctx(), CapturePurpose::TestTemplate(template_id));
+        if let Some(action) = workflow_action {
+            match action {
+                WorkflowTemplateAction::CaptureNew(locator) => {
+                    self.begin_countdown_capture(
+                        ui.ctx(),
+                        CapturePurpose::NewTemplate(Some(locator)),
+                    );
+                }
+                WorkflowTemplateAction::Replace(template_id) => {
+                    self.begin_countdown_capture(
+                        ui.ctx(),
+                        CapturePurpose::ReplaceTemplate(template_id),
+                    );
+                }
+                WorkflowTemplateAction::Test {
+                    template_id,
+                    search,
+                    threshold,
+                } => {
+                    self.begin_countdown_capture(
+                        ui.ctx(),
+                        CapturePurpose::TestUse {
+                            template_id,
+                            search,
+                            threshold,
+                        },
+                    );
+                }
+                WorkflowTemplateAction::EditRoi(locator) => {
+                    self.begin_countdown_capture(ui.ctx(), CapturePurpose::EditUseRoi(locator));
+                }
+            }
         }
     }
 
@@ -2346,7 +2742,7 @@ impl Make5771App {
                     self.import_screenshot(ui.ctx());
                 }
                 if ui.button("3 秒截图").clicked() {
-                    self.begin_countdown_capture(ui.ctx(), CapturePurpose::NewTemplate);
+                    self.begin_countdown_capture(ui.ctx(), CapturePurpose::NewTemplate(None));
                 }
             });
         });
@@ -2519,7 +2915,14 @@ impl Make5771App {
             }
         });
         if let Some(template_id) = requested_test {
-            self.begin_countdown_capture(ui.ctx(), CapturePurpose::TestTemplate(template_id));
+            self.begin_countdown_capture(
+                ui.ctx(),
+                CapturePurpose::TestUse {
+                    template_id,
+                    search: TemplateUseSearch::default(),
+                    threshold: self.template_test_threshold,
+                },
+            );
         }
         if let Some(template_id) = requested_delete {
             self.pending_delete_template = Some(template_id);
@@ -2838,7 +3241,7 @@ impl Make5771App {
                 ui.label("识别模式");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let selected = match self.profile.match_algorithm {
-                        MatchAlgorithm::Hybrid => "混合结构识别（推荐）",
+                        MatchAlgorithm::Hybrid => "金字塔模板识别（推荐）",
                         MatchAlgorithm::Precise => "兼容 RGB 识别",
                         MatchAlgorithm::Fast => "兼容快速灰度",
                         MatchAlgorithm::Classic => "兼容经典灰度",
@@ -2849,7 +3252,7 @@ impl Make5771App {
                             ui.selectable_value(
                                 &mut self.profile.match_algorithm,
                                 MatchAlgorithm::Hybrid,
-                                "混合结构识别（推荐）",
+                                "金字塔模板识别（推荐）",
                             );
                             ui.selectable_value(
                                 &mut self.profile.match_algorithm,
@@ -2861,7 +3264,7 @@ impl Make5771App {
             });
             ui.label(
                 RichText::new(
-                    "旧流程保留原 RGB 分数语义；切换混合模式后请逐个测试模板并重新校准阈值",
+                    "旧流程保留原 RGB 分数语义；切换金字塔模式后请测试关键模板并校准阈值",
                 )
                 .size(11.0)
                 .color(theme::tertiary_label()),
@@ -2884,6 +3287,32 @@ impl Make5771App {
             });
             ui.label(
                 RichText::new(self.profile.recognition_performance.description())
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
+            ui.horizontal(|ui| {
+                ui.label("普通等待扫描频率");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let selected = self
+                        .profile
+                        .idle_scan_secs
+                        .map(|seconds| format!("每 {seconds} 秒"))
+                        .unwrap_or_else(|| "旧版兼容频率".to_owned());
+                    egui::ComboBox::from_id_salt("idle_scan_secs")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            for seconds in [1_u8, 3, 5] {
+                                ui.selectable_value(
+                                    &mut self.profile.idle_scan_secs,
+                                    Some(seconds),
+                                    format!("每 {seconds} 秒"),
+                                );
+                            }
+                        });
+                });
+            });
+            ui.label(
+                RichText::new("首次立即扫描；候选确认保持高速。普通推荐 3 秒，长时间战斗推荐 5 秒")
                     .size(11.0)
                     .color(theme::tertiary_label()),
             );
@@ -3746,10 +4175,14 @@ enum ActionListCommand {
 fn wait_any_editor(
     ui: &mut egui::Ui,
     step: &mut WorkflowStep,
+    reference_size: (u32, u32),
+    profile_scan_interval: Option<u8>,
     template_options: &[(u64, String, String)],
     thumbs: &mut TemplateThumbs,
+    workflow_action: &mut Option<WorkflowTemplateAction>,
 ) {
     timeout_editor(ui, &mut step.timeout_secs);
+    scan_interval_editor(ui, &mut step.scan_interval_secs, profile_scan_interval);
     ui.label(
         RichText::new("每次只执行第一个匹配的分支，从上到下代表优先级。")
             .size(11.0)
@@ -3786,8 +4219,11 @@ fn wait_any_editor(
                     ui,
                     step.id,
                     &mut step.branches[index],
+                    reference_size,
+                    profile_scan_interval,
                     template_options,
                     thumbs,
+                    workflow_action,
                 );
             });
         ui.separator();
@@ -3817,10 +4253,14 @@ fn wait_any_editor(
 fn visual_condition_editor(
     ui: &mut egui::Ui,
     step: &mut WorkflowStep,
+    reference_size: (u32, u32),
+    profile_scan_interval: Option<u8>,
     template_options: &[(u64, String, String)],
     thumbs: &mut TemplateThumbs,
+    workflow_action: &mut Option<WorkflowTemplateAction>,
 ) {
     timeout_editor(ui, &mut step.timeout_secs);
+    scan_interval_editor(ui, &mut step.scan_interval_secs, profile_scan_interval);
     ui.horizontal(|ui| {
         ui.label("匹配方式");
         egui::ComboBox::from_id_salt(("visual-condition-mode", step.id))
@@ -3889,14 +4329,22 @@ fn visual_condition_editor(
                 });
             });
             ui.text_edit_singleline(&mut term.name);
-            template_picker(
+            *workflow_action = template_use_editor(
                 ui,
                 ("visual-condition-template", step.id, term.id),
+                TemplateUseLocator::Condition {
+                    step_id: step.id,
+                    term_id: term.id,
+                },
                 "检查画面",
                 &mut term.template,
+                term.threshold,
+                &mut term.search,
+                reference_size,
                 template_options,
                 thumbs,
-            );
+            )
+            .or(*workflow_action);
             ui.horizontal(|ui| {
                 ui.label("期望");
                 egui::ComboBox::from_id_salt(("visual-condition-expectation", step.id, term.id))
@@ -3935,12 +4383,19 @@ fn visual_condition_editor(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "nested editor shares workflow UI state"
+)]
 fn edit_workflow_branch(
     ui: &mut egui::Ui,
     step_id: u64,
     branch: &mut WorkflowBranch,
+    reference_size: (u32, u32),
+    profile_scan_interval: Option<u8>,
     template_options: &[(u64, String, String)],
     thumbs: &mut TemplateThumbs,
+    workflow_action: &mut Option<WorkflowTemplateAction>,
 ) {
     ui.label(
         RichText::new("分支名称")
@@ -3948,14 +4403,22 @@ fn edit_workflow_branch(
             .color(theme::secondary_label()),
     );
     ui.text_edit_singleline(&mut branch.name);
-    template_picker(
+    *workflow_action = template_use_editor(
         ui,
         ("branch-trigger", step_id, branch.id),
+        TemplateUseLocator::Branch {
+            step_id,
+            branch_id: branch.id,
+        },
         "触发画面",
         &mut branch.trigger_template,
+        branch.threshold,
+        &mut branch.search,
+        reference_size,
         template_options,
         thumbs,
-    );
+    )
+    .or(*workflow_action);
     threshold_editor(ui, &mut branch.threshold);
     ui.horizontal(|ui| {
         ui.label("命中后点击触发目标");
@@ -4031,16 +4494,26 @@ fn edit_workflow_branch(
                 });
             match action.kind {
                 BranchActionKind::WaitAndClick => {
-                    template_picker(
+                    *workflow_action = template_use_editor(
                         ui,
                         ("branch-action-template", step_id, branch.id, action.id),
+                        TemplateUseLocator::Action {
+                            step_id,
+                            branch_id: branch.id,
+                            action_id: action.id,
+                        },
                         "目标画面",
                         &mut action.template,
+                        action.threshold,
+                        &mut action.search,
+                        reference_size,
                         template_options,
                         thumbs,
-                    );
+                    )
+                    .or(*workflow_action);
                     threshold_editor(ui, &mut action.threshold);
                     timeout_editor(ui, &mut action.timeout_secs);
+                    scan_interval_editor(ui, &mut action.scan_interval_secs, profile_scan_interval);
                     click_point_editor(
                         ui,
                         ("action-click", step_id, branch.id, action.id),
@@ -4244,12 +4717,142 @@ fn template_picker(
     });
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared workflow template-use editor"
+)]
+fn template_use_editor(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug + Clone,
+    locator: TemplateUseLocator,
+    label: &str,
+    selected: &mut Option<String>,
+    threshold: f32,
+    search: &mut TemplateUseSearch,
+    reference_size: (u32, u32),
+    template_options: &[(u64, String, String)],
+    thumbs: &mut TemplateThumbs,
+) -> Option<WorkflowTemplateAction> {
+    template_picker(
+        ui,
+        ("template-picker", id.clone()),
+        label,
+        selected,
+        template_options,
+        thumbs,
+    );
+    let selected_id = selected.as_ref().and_then(|path| {
+        template_options
+            .iter()
+            .find(|(_, _, candidate)| candidate == path)
+            .map(|(id, _, _)| *id)
+    });
+    let mut action = None;
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("截图新建").clicked() {
+            action = Some(WorkflowTemplateAction::CaptureNew(locator));
+        }
+        if ui
+            .add_enabled(selected_id.is_some(), egui::Button::new("截图替换"))
+            .on_hover_text("替换图片但保留路径，所有引用会一起更新")
+            .clicked()
+        {
+            action = selected_id.map(WorkflowTemplateAction::Replace);
+        }
+        if ui
+            .add_enabled(selected_id.is_some(), egui::Button::new("测试识别"))
+            .clicked()
+            && let Some(template_id) = selected_id
+        {
+            action = Some(WorkflowTemplateAction::Test {
+                template_id,
+                search: *search,
+                threshold,
+            });
+        }
+        if ui.button("截图框选范围").clicked() {
+            action = Some(WorkflowTemplateAction::EditRoi(locator));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("搜索方式");
+        egui::ComboBox::from_id_salt(("search-strategy", id.clone()))
+            .selected_text(search.strategy.label())
+            .show_ui(ui, |ui| {
+                for strategy in SearchStrategy::ALL {
+                    ui.selectable_value(&mut search.strategy, strategy, strategy.label());
+                }
+            });
+    });
+    if matches!(
+        search.strategy,
+        SearchStrategy::FixedRoi | SearchStrategy::RoiThenFullFrame
+    ) {
+        if search.reference_width == 0 {
+            search.reference_width = reference_size.0.max(1);
+        }
+        if search.reference_height == 0 {
+            search.reference_height = reference_size.1.max(1);
+        }
+        let region = search.region.get_or_insert(SearchRegionSpec {
+            x: 0,
+            y: 0,
+            width: search.reference_width,
+            height: search.reference_height,
+        });
+        search_region_fields(ui, region, search.reference_width, search.reference_height);
+        *region = clamp_search_region(*region, search.reference_width, search.reference_height);
+        ui.label(
+            RichText::new(if search.strategy == SearchStrategy::FixedRoi {
+                "严格区域：绝不会点击区域外目标"
+            } else {
+                "区域优先：未找到时自动回退全屏"
+            })
+            .size(11.0)
+            .color(theme::secondary_label()),
+        );
+    } else if search.strategy == SearchStrategy::FullFrame {
+        ui.label(
+            RichText::new("全屏粗定位 + 原分辨率确认，不要求预先框选")
+                .size(11.0)
+                .color(theme::secondary_label()),
+        );
+    }
+    action
+}
+
+fn scan_interval_editor(ui: &mut egui::Ui, value: &mut Option<u8>, profile_default: Option<u8>) {
+    ui.horizontal(|ui| {
+        ui.label("未找到时扫描");
+        let selected = value
+            .map(|seconds| format!("{seconds} 秒"))
+            .unwrap_or_else(|| match profile_default {
+                Some(seconds) => format!("继承（{seconds} 秒）"),
+                None => "继承旧版频率".to_owned(),
+            });
+        egui::ComboBox::from_id_salt(ui.next_auto_id())
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(value, None, "继承流程设置");
+                for seconds in [1_u8, 3, 5] {
+                    ui.selectable_value(value, Some(seconds), format!("{seconds} 秒"));
+                }
+            });
+    });
+    ui.label(
+        RichText::new("首次立即扫描；发现候选或点击后仍以约 180 ms 快速确认")
+            .size(11.0)
+            .color(theme::tertiary_label()),
+    );
+}
+
 /// Worker half of template testing: loads and scales the template, then scans
 /// the frame. Runs off the UI thread; the frame is returned for the preview.
 fn run_template_test_work(
     template_asset: TemplateAsset,
     frame: image::RgbaImage,
     threshold: f32,
+    search: TemplateUseSearch,
     config: TemplateTestConfig,
 ) -> TemplateTestOutcome {
     let TemplateTestConfig {
@@ -4257,6 +4860,8 @@ fn run_template_test_work(
         scale_mode,
         reference_fallback,
         default_search_region,
+        adaptive_roi,
+        recovery_checks,
         max_threads,
     } = config;
     let threshold = vision::effective_threshold(algorithm, threshold);
@@ -4270,6 +4875,10 @@ fn run_template_test_work(
                 search_region: full_region,
                 threshold,
                 mostly_background: false,
+                candidates: Vec::new(),
+                search_strategy: search.strategy,
+                used_recovery: false,
+                recovery_checks,
                 result: Err(format!("无法读取模板图片：{error}")),
             };
         }
@@ -4278,13 +4887,43 @@ fn run_template_test_work(
     // matching what the runner does at run time.
     let (reference_width, reference_height) =
         template_asset.reference_size(reference_fallback.0, reference_fallback.1);
-    let scaled_region = scale_mode.effective_search_region(
-        template_asset.search_region,
-        default_search_region,
-        (reference_width, reference_height),
-        reference_fallback,
-        (frame.width(), frame.height()),
-    );
+    let (scaled_region, recover_full_frame) = match search.strategy {
+        SearchStrategy::Inherit => (
+            scale_mode.effective_search_region(
+                template_asset.search_region,
+                default_search_region,
+                (reference_width, reference_height),
+                reference_fallback,
+                (frame.width(), frame.height()),
+            ),
+            adaptive_roi,
+        ),
+        SearchStrategy::FullFrame => (None, false),
+        SearchStrategy::FixedRoi | SearchStrategy::RoiThenFullFrame => {
+            let source_width = if search.reference_width > 0 {
+                search.reference_width
+            } else {
+                reference_width
+            };
+            let source_height = if search.reference_height > 0 {
+                search.reference_height
+            } else {
+                reference_height
+            };
+            (
+                search.region.map(|region| {
+                    scale_mode.search_region(
+                        region,
+                        source_width,
+                        source_height,
+                        frame.width(),
+                        frame.height(),
+                    )
+                }),
+                search.strategy == SearchStrategy::RoiThenFullFrame,
+            )
+        }
+    };
     if reference_width != frame.width() || reference_height != frame.height() {
         let (width, height) = scale_mode.template_size(
             template_asset.width,
@@ -4309,51 +4948,132 @@ fn run_template_test_work(
             height: region.height,
         })
         .unwrap_or(full_region);
-    let mut mostly_background = false;
-    let report = match algorithm {
-        vision::MatchAlgorithm::Hybrid => {
-            let weights = vision::TemplateWeights::analyze(&template_rgb);
-            mostly_background = weights.is_mostly_background();
-            vision::find_template_report_rgb_hybrid_with_bands(
-                &frame,
-                &template_rgb,
-                &weights,
-                search_region,
-                threshold,
-                max_threads,
-            )
-        }
-        vision::MatchAlgorithm::Precise => {
-            let weights = vision::TemplateWeights::analyze(&template_rgb);
-            mostly_background = weights.is_mostly_background();
-            vision::find_template_report_rgb_weighted_with_bands(
-                &frame,
-                &template_rgb,
-                &weights,
-                search_region,
-                threshold,
-                max_threads,
-            )
-        }
-        gray_algorithm => {
-            let frame_gray = image::imageops::grayscale(&frame);
-            let template = image::imageops::grayscale(&template_rgb);
-            vision::find_template_report(
-                &frame_gray,
-                &template,
-                search_region,
-                threshold,
-                gray_algorithm,
-            )
+    let weights = vision::TemplateWeights::analyze(&template_rgb);
+    let mostly_background = weights.is_mostly_background();
+    let frame_gray = needs_gray_test_frame(algorithm).then(|| image::imageops::grayscale(&frame));
+    let template_gray =
+        needs_gray_test_frame(algorithm).then(|| image::imageops::grayscale(&template_rgb));
+    let prepared_frame =
+        (algorithm == vision::MatchAlgorithm::Hybrid).then(|| vision::PreparedFrame::new(&frame));
+    let prepared_templates = (algorithm == vision::MatchAlgorithm::Hybrid).then(|| {
+        [90_u32, 95, 100, 105, 110]
+            .into_iter()
+            .map(|percent| {
+                let scaled = if percent == 100 {
+                    template_rgb.clone()
+                } else {
+                    image::imageops::resize(
+                        &template_rgb,
+                        (template_rgb.width() * percent / 100).max(1),
+                        (template_rgb.height() * percent / 100).max(1),
+                        image::imageops::FilterType::Triangle,
+                    )
+                };
+                vision::PreparedTemplate::new(&scaled)
+            })
+            .collect::<Vec<_>>()
+    });
+    let run = |region: SearchRegion| -> (vision::MatchReport, Vec<vision::TemplateMatch>) {
+        match algorithm {
+            vision::MatchAlgorithm::Hybrid => {
+                let result = vision::match_template_multiscale(
+                    prepared_frame.as_ref().expect("Hybrid 帧已准备"),
+                    prepared_templates.as_ref().expect("Hybrid 模板已准备"),
+                    region,
+                    threshold,
+                    vision::MatchOptions {
+                        candidate_cap: match max_threads {
+                            0..=2 => 32,
+                            3..=4 => 48,
+                            _ => 64,
+                        },
+                        max_threads,
+                        ..vision::MatchOptions::default()
+                    },
+                );
+                let ambiguous = result.matches.len() > 1
+                    && result.matches[0].score - result.matches[1].score < 0.03;
+                let matched = (!ambiguous)
+                    .then(|| result.matches.first().copied())
+                    .flatten();
+                let candidates = if result.matches.is_empty() {
+                    result.best_candidate.into_iter().collect()
+                } else {
+                    result.matches
+                };
+                (
+                    vision::MatchReport {
+                        matched,
+                        best_score: result.best_score,
+                    },
+                    candidates,
+                )
+            }
+            vision::MatchAlgorithm::Precise => {
+                let report = vision::find_template_report_rgb_weighted_with_bands(
+                    &frame,
+                    &template_rgb,
+                    &weights,
+                    region,
+                    threshold,
+                    max_threads,
+                );
+                (report, report.matched.into_iter().collect())
+            }
+            gray_algorithm => {
+                let report = vision::find_template_report_with_bands(
+                    frame_gray.as_ref().expect("灰度帧已准备"),
+                    template_gray.as_ref().expect("灰度模板已准备"),
+                    region,
+                    threshold,
+                    gray_algorithm,
+                    max_threads,
+                );
+                (report, report.matched.into_iter().collect())
+            }
         }
     };
+    let (mut report, mut candidates) = run(search_region);
+    let mut used_recovery = false;
+    if report.matched.is_none() && recover_full_frame && search_region != full_region {
+        let (recovery, recovery_candidates) = run(full_region);
+        report = better_test_report(report, recovery);
+        candidates = recovery_candidates;
+        used_recovery = true;
+    }
     TemplateTestOutcome {
         template_name: template_asset.name,
         frame,
         search_region,
         threshold,
         mostly_background,
+        candidates,
+        search_strategy: search.strategy,
+        used_recovery,
+        recovery_checks,
         result: Ok(report),
+    }
+}
+
+fn needs_gray_test_frame(algorithm: vision::MatchAlgorithm) -> bool {
+    matches!(
+        algorithm,
+        vision::MatchAlgorithm::Fast | vision::MatchAlgorithm::Classic
+    )
+}
+
+fn better_test_report(
+    left: vision::MatchReport,
+    right: vision::MatchReport,
+) -> vision::MatchReport {
+    let matched = match (left.matched, right.matched) {
+        (Some(left), Some(right)) if right.score > left.score => Some(right),
+        (Some(left), _) => Some(left),
+        (None, right) => right,
+    };
+    vision::MatchReport {
+        matched,
+        best_score: left.best_score.max(right.best_score),
     }
 }
 
@@ -4860,6 +5580,25 @@ fn clamp_search_region(
     region
 }
 
+fn remap_template_roi_for_replacement(
+    asset: &TemplateAsset,
+    scale_mode: TemplateScaleMode,
+    profile_reference: (u32, u32),
+    replacement_reference: (u32, u32),
+) -> Option<SearchRegionSpec> {
+    let (source_width, source_height) =
+        asset.reference_size(profile_reference.0, profile_reference.1);
+    asset.search_region.map(|region| {
+        scale_mode.search_region(
+            region,
+            source_width,
+            source_height,
+            replacement_reference.0.max(1),
+            replacement_reference.1.max(1),
+        )
+    })
+}
+
 fn suggest_search_region(
     selection: PixelSelection,
     image_width: u32,
@@ -5082,13 +5821,30 @@ impl eframe::App for Make5771App {
         let ctx = ui.ctx().clone();
 
         if let Some(image) = self.pending_capture.take() {
-            self.active_tab = AppTab::Templates;
-            self.template_draft =
-                Some(TemplateDraft::from_image(&ctx, image, "游戏截图", "新模板"));
+            self.active_tab = AppTab::Flow;
+            let suggested_name = self
+                .draft_replacement_id
+                .and_then(|id| {
+                    self.effective_templates()
+                        .iter()
+                        .find(|template| template.id == id)
+                        .map(|template| template.name.clone())
+                })
+                .unwrap_or_else(|| "新模板".to_owned());
+            let source_label = if self.draft_replacement_id.is_some() {
+                "替换模板 · 保存后所有引用会同步更新"
+            } else {
+                "游戏截图"
+            };
+            self.template_draft = Some(TemplateDraft::from_image(
+                &ctx,
+                image,
+                source_label,
+                suggested_name,
+            ));
         }
-        if let Some((template_id, frame)) = self.pending_test_capture.take() {
-            self.active_tab = AppTab::Templates;
-            self.run_template_test(&ctx, template_id, frame);
+        if let Some((template_id, frame, threshold, search)) = self.pending_test_capture.take() {
+            self.run_template_test(&ctx, template_id, frame, threshold, search);
         }
         if let Some(receiver) = &self.template_test_pending {
             match receiver.try_recv() {
@@ -5232,6 +5988,42 @@ impl eframe::App for Make5771App {
             }
         }
 
+        let roi_action = self
+            .roi_draft
+            .as_mut()
+            .map(|draft| draft.show(&ctx))
+            .unwrap_or(RoiEditorAction::None);
+        match roi_action {
+            RoiEditorAction::None => {}
+            RoiEditorAction::Cancel => {
+                self.roi_draft = None;
+                self.roi_bind_target = None;
+            }
+            RoiEditorAction::Apply(selection) => {
+                let reference_size = self
+                    .roi_draft
+                    .as_ref()
+                    .map(|draft| (draft.image.width(), draft.image.height()))
+                    .unwrap_or((1, 1));
+                if let Some(locator) = self.roi_bind_target.take() {
+                    let old_profile = self.profile.clone();
+                    self.apply_visual_roi(locator, selection, reference_size);
+                    match storage::save_profile(&self.current_profile_path, &self.profile) {
+                        Ok(()) => {
+                            self.toast = Some("已应用此步骤的严格识别范围".to_owned());
+                            self.push_log(LogLevel::Success, "已更新步骤级 ROI");
+                        }
+                        Err(error) => {
+                            self.profile = old_profile;
+                            self.toast = Some(format!("识别范围保存失败：{error}"));
+                            self.push_log(LogLevel::Warning, format!("识别范围保存失败：{error}"));
+                        }
+                    }
+                }
+                self.roi_draft = None;
+            }
+        }
+
         let editor_action = self
             .template_draft
             .as_mut()
@@ -5239,7 +6031,11 @@ impl eframe::App for Make5771App {
             .unwrap_or(EditorAction::None);
         match editor_action {
             EditorAction::None => {}
-            EditorAction::Cancel => self.template_draft = None,
+            EditorAction::Cancel => {
+                self.template_draft = None;
+                self.draft_replacement_id = None;
+                self.draft_bind_target = None;
+            }
             EditorAction::Save { name, selection } => {
                 self.save_template_from_draft(name, selection);
             }
@@ -5279,6 +6075,35 @@ mod tests {
         let existing = vec![asset(1, "确认", "a.png"), asset(2, "确认 (2)", "b.png")];
         assert_eq!(unique_template_name(&existing, "新图"), "新图");
         assert_eq!(unique_template_name(&existing, "确认"), "确认 (3)");
+    }
+
+    #[test]
+    fn template_replacement_remaps_roi_to_new_capture_space() {
+        let mut source = asset(1, "目标", "target.png");
+        source.reference_width = 1000;
+        source.reference_height = 500;
+        source.search_region = Some(SearchRegionSpec {
+            x: 500,
+            y: 100,
+            width: 250,
+            height: 200,
+        });
+        let mapped = remap_template_roi_for_replacement(
+            &source,
+            TemplateScaleMode::Stretch,
+            (1000, 500),
+            (2000, 1000),
+        )
+        .expect("ROI should remain configured");
+        assert_eq!(
+            mapped,
+            SearchRegionSpec {
+                x: 1000,
+                y: 200,
+                width: 500,
+                height: 400,
+            }
+        );
     }
 
     #[test]

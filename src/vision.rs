@@ -186,6 +186,10 @@ impl TemplateWeights {
 /// but have different text or icon shapes. Brightness and contrast shifts are
 /// normalized away. `None` means either image geometry is invalid or one side
 /// has too little variance for correlation to be meaningful.
+#[allow(
+    dead_code,
+    reason = "scalar ZNCC reference oracle for regression tests"
+)]
 pub fn structural_similarity_at(
     frame: &RgbaImage,
     template: &RgbaImage,
@@ -243,6 +247,7 @@ pub fn structural_similarity_at(
 }
 
 #[inline]
+#[allow(dead_code, reason = "used by the scalar ZNCC reference oracle")]
 fn rgb_luma(rgb: &[u8]) -> f64 {
     // ITU-R BT.601 integer weights; conversion precision is ample for ZNCC.
     f64::from(77_u32 * u32::from(rgb[0]) + 150_u32 * u32::from(rgb[1]) + 29_u32 * u32::from(rgb[2]))
@@ -259,10 +264,28 @@ pub fn find_template_report(
     threshold: f32,
     algorithm: MatchAlgorithm,
 ) -> MatchReport {
+    let bands = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(MAX_FAST_BANDS);
+    find_template_report_with_bands(frame, template, region, threshold, algorithm, bands)
+}
+
+/// Grayscale matcher with an explicit worker cap. Runtime performance modes
+/// use this entry so even legacy `Fast` profiles obey their 2/4/8-thread
+/// contract instead of silently consuming every available worker.
+pub fn find_template_report_with_bands(
+    frame: &GrayImage,
+    template: &GrayImage,
+    region: SearchRegion,
+    threshold: f32,
+    algorithm: MatchAlgorithm,
+    max_bands: usize,
+) -> MatchReport {
     match algorithm {
         MatchAlgorithm::Classic => find_classic(frame, template, region, threshold),
         MatchAlgorithm::Fast | MatchAlgorithm::Precise | MatchAlgorithm::Hybrid => {
-            find_fast(frame, template, region, threshold)
+            find_fast_impl(frame, template, region, threshold, max_bands.max(1))
         }
     }
 }
@@ -495,19 +518,6 @@ const MAX_FAST_BANDS: usize = 8;
 /// Determinism: a band-local winner is the lexicographically smallest
 /// (diff, y, x); merging bands with the same rule is order-independent, so
 /// the multi-threaded result equals the single-threaded one exactly.
-fn find_fast(
-    frame: &GrayImage,
-    template: &GrayImage,
-    region: SearchRegion,
-    threshold: f32,
-) -> MatchReport {
-    let bands = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .min(MAX_FAST_BANDS);
-    find_fast_impl(frame, template, region, threshold, bands)
-}
-
 fn find_fast_impl(
     frame: &GrayImage,
     template: &GrayImage,
@@ -840,9 +850,9 @@ pub fn effective_threshold(algorithm: MatchAlgorithm, threshold: f32) -> f32 {
     }
 }
 
-const HYBRID_CANDIDATE_MARGIN: f32 = 0.04;
+#[cfg(test)]
 const HYBRID_STRUCTURE_WEIGHT: f32 = 0.65;
-const HYBRID_CANDIDATE_LIMIT: usize = 4;
+#[cfg(test)]
 const HYBRID_FAST_PATH_STRUCTURE: f32 = 0.985;
 
 #[cfg(test)]
@@ -853,6 +863,7 @@ fn available_scan_threads() -> usize {
         .min(MAX_FAST_BANDS)
 }
 
+#[cfg(test)]
 fn score_hybrid_candidate(
     frame: &RgbaImage,
     template: &RgbaImage,
@@ -867,27 +878,8 @@ fn score_hybrid_candidate(
     (found, structural_score)
 }
 
-fn best_hybrid_candidate(
-    frame: &RgbaImage,
-    template: &RgbaImage,
-    weights: &TemplateWeights,
-    candidates: Vec<TemplateMatch>,
-) -> Option<TemplateMatch> {
-    candidates
-        .into_iter()
-        .map(|found| score_hybrid_candidate(frame, template, weights, found).0)
-        .max_by(|left, right| {
-            left.score.total_cmp(&right.score).then_with(|| {
-                // Reverse coordinates so max_by keeps the top-left candidate
-                // when scores tie.
-                (right.y, right.x).cmp(&(left.y, left.x))
-            })
-        })
-}
-
-/// Thorough lightweight matcher used for verification and template testing.
-/// It ranks up to four RGB SAD candidates and verifies their structure without
-/// FFT, model runtimes, native libraries or per-candidate allocations.
+/// Compatibility wrapper over the v0.4 coarse-to-fine matcher. New runtime
+/// code prepares frames/templates once and calls `match_template_all` directly.
 #[cfg(test)]
 pub fn find_template_report_rgb_hybrid(
     frame: &RgbaImage,
@@ -906,40 +898,41 @@ pub fn find_template_report_rgb_hybrid(
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "public compatibility wrapper for pre-v0.4 callers"
+)]
 pub fn find_template_report_rgb_hybrid_with_bands(
     frame: &RgbaImage,
     template: &RgbaImage,
-    weights: &TemplateWeights,
+    _weights: &TemplateWeights,
     region: SearchRegion,
     threshold: f32,
     max_bands: usize,
 ) -> MatchReport {
-    let effective_threshold = effective_threshold(MatchAlgorithm::Hybrid, threshold);
-    let candidate_threshold = (effective_threshold - HYBRID_CANDIDATE_MARGIN).max(0.65);
-    let max_bands = max_bands.clamp(1, MAX_FAST_BANDS);
-
-    // The thorough path performs one Top-4 scan. The runner invokes it only
-    // for small tracked/ROI regions, periodic recovery, visual conditions or
-    // exhaustive branch confirmation, avoiding a duplicate full-screen pass.
-    let (candidates, scan_best) = find_precise_weighted_candidates_impl(
-        frame,
-        template,
-        weights,
+    let threshold = effective_threshold(MatchAlgorithm::Hybrid, threshold);
+    let prepared_frame = PreparedFrame::new(frame);
+    let prepared_template = PreparedTemplate::new(template);
+    let result = match_template_all(
+        &prepared_frame,
+        &prepared_template,
         region,
-        candidate_threshold,
-        max_bands,
-        HYBRID_CANDIDATE_LIMIT,
+        threshold,
+        MatchOptions {
+            max_threads: max_bands,
+            ..MatchOptions::default()
+        },
     );
-    let best = best_hybrid_candidate(frame, template, weights, candidates);
     MatchReport {
-        matched: best.filter(|found| found.score >= effective_threshold),
-        best_score: best.map_or(scan_best, |found| found.score),
+        matched: result.matches.first().copied(),
+        best_score: result.best_score,
     }
 }
 
 /// Cheap discovery pass for large regions. It only returns a match when the
 /// best RGB candidate also has near-exact structure; uncertain screens are
 /// deliberately deferred to the periodic thorough pass.
+#[cfg(test)]
 pub fn find_template_report_rgb_hybrid_fast_with_bands(
     frame: &RgbaImage,
     template: &RgbaImage,
@@ -958,6 +951,7 @@ pub fn find_template_report_rgb_hybrid_fast_with_bands(
     )
 }
 
+#[cfg(test)]
 fn hybrid_fast_pass(
     frame: &RgbaImage,
     template: &RgbaImage,
@@ -1054,6 +1048,7 @@ fn find_precise_weighted_impl(
     find_banded(&scan, region, threshold, max_bands)
 }
 
+#[cfg(test)]
 fn find_precise_weighted_candidates_impl(
     frame: &RgbaImage,
     template: &RgbaImage,
@@ -1432,6 +1427,639 @@ impl FastState {
         let score = 1.0 - difference as f32 / (pixel_count as f32 * scan.channel_scale());
         self.best_score = self.best_score.max(score);
         self.insert((difference, y, x));
+    }
+}
+
+/// Immutable frame pyramid shared by every Hybrid template in one captured
+/// poll. Keeping this poll-local avoids stale pixels after a click while
+/// eliminating repeated grayscale/chroma conversion for WaitAny conditions.
+#[derive(Debug, Clone)]
+pub struct PreparedFrame {
+    levels: Vec<PreparedFrameLevel>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedFrameLevel {
+    width: u32,
+    height: u32,
+    luma: Vec<f32>,
+    chroma_r: Vec<f32>,
+    chroma_b: Vec<f32>,
+}
+
+/// Immutable alpha-aware template pyramid. It is prepared when templates are
+/// loaded/rescaled and reused for all subsequent frames.
+#[derive(Debug, Clone)]
+pub struct PreparedTemplate {
+    levels: Vec<PreparedTemplateLevel>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedTemplateLevel {
+    width: u32,
+    height: u32,
+    luma: Vec<f32>,
+    chroma_r: Vec<f32>,
+    chroma_b: Vec<f32>,
+    alpha: Vec<f32>,
+    active: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MatchOptions {
+    pub candidate_cap: usize,
+    pub nms_iou: f32,
+    pub coarse_margin: f32,
+    pub max_threads: usize,
+}
+
+impl Default for MatchOptions {
+    fn default() -> Self {
+        Self {
+            candidate_cap: 64,
+            nms_iou: 0.30,
+            coarse_margin: 0.15,
+            max_threads: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchCandidates {
+    pub matches: Vec<TemplateMatch>,
+    /// Highest-scoring refined box even when it is below the threshold. This
+    /// powers faithful near-miss diagnostics without changing acceptance.
+    pub best_candidate: Option<TemplateMatch>,
+    pub best_score: f32,
+}
+
+impl PreparedFrame {
+    pub fn new(frame: &RgbaImage) -> Self {
+        let mut current = frame_to_level(frame);
+        let mut levels = vec![current.clone()];
+        while levels.len() < 4 && current.width.min(current.height) >= 32 {
+            current = downsample_frame_level(&current);
+            levels.push(current.clone());
+        }
+        Self { levels }
+    }
+}
+
+impl PreparedTemplate {
+    pub fn new(template: &RgbaImage) -> Self {
+        let mut current = template_to_level(template);
+        let mut levels = vec![current.clone()];
+        while levels.len() < 4 && current.width.min(current.height) >= 16 {
+            current = downsample_template_level(&current);
+            levels.push(current.clone());
+        }
+        Self {
+            levels,
+            width: template.width(),
+            height: template.height(),
+        }
+    }
+}
+
+fn frame_to_level(frame: &RgbaImage) -> PreparedFrameLevel {
+    let mut luma = Vec::with_capacity((frame.width() * frame.height()) as usize);
+    let mut chroma_r = Vec::with_capacity(luma.capacity());
+    let mut chroma_b = Vec::with_capacity(luma.capacity());
+    for pixel in frame.as_raw().as_chunks::<4>().0 {
+        let r = f32::from(pixel[0]) / 255.0;
+        let g = f32::from(pixel[1]) / 255.0;
+        let b = f32::from(pixel[2]) / 255.0;
+        let y = 0.299 * r + 0.587 * g + 0.114 * b;
+        luma.push(y);
+        chroma_r.push(r - y);
+        chroma_b.push(b - y);
+    }
+    PreparedFrameLevel {
+        width: frame.width(),
+        height: frame.height(),
+        luma,
+        chroma_r,
+        chroma_b,
+    }
+}
+
+fn template_to_level(template: &RgbaImage) -> PreparedTemplateLevel {
+    let frame = frame_to_level(template);
+    let alpha: Vec<f32> = template
+        .as_raw()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|pixel| {
+            if pixel[3] < 16 {
+                0.0
+            } else {
+                f32::from(pixel[3]) / 255.0
+            }
+        })
+        .collect();
+    let active = alpha
+        .iter()
+        .enumerate()
+        .filter_map(|(index, weight)| (*weight > 0.0).then_some(index))
+        .collect();
+    PreparedTemplateLevel {
+        width: frame.width,
+        height: frame.height,
+        luma: frame.luma,
+        chroma_r: frame.chroma_r,
+        chroma_b: frame.chroma_b,
+        alpha,
+        active,
+    }
+}
+
+fn downsample_plane(source: &[f32], width: u32, height: u32) -> (u32, u32, Vec<f32>) {
+    let target_width = width.div_ceil(2).max(1);
+    let target_height = height.div_ceil(2).max(1);
+    let mut target = vec![0.0; (target_width * target_height) as usize];
+    for y in 0..target_height {
+        for x in 0..target_width {
+            let mut sum = 0.0;
+            let mut count = 0.0;
+            for source_y in (y * 2)..(y * 2 + 2).min(height) {
+                for source_x in (x * 2)..(x * 2 + 2).min(width) {
+                    sum += source[(source_y * width + source_x) as usize];
+                    count += 1.0;
+                }
+            }
+            target[(y * target_width + x) as usize] = sum / count;
+        }
+    }
+    (target_width, target_height, target)
+}
+
+fn downsample_frame_level(source: &PreparedFrameLevel) -> PreparedFrameLevel {
+    let (width, height, luma) = downsample_plane(&source.luma, source.width, source.height);
+    let (_, _, chroma_r) = downsample_plane(&source.chroma_r, source.width, source.height);
+    let (_, _, chroma_b) = downsample_plane(&source.chroma_b, source.width, source.height);
+    PreparedFrameLevel {
+        width,
+        height,
+        luma,
+        chroma_r,
+        chroma_b,
+    }
+}
+
+fn downsample_template_level(source: &PreparedTemplateLevel) -> PreparedTemplateLevel {
+    let (width, height, luma) = downsample_plane(&source.luma, source.width, source.height);
+    let (_, _, chroma_r) = downsample_plane(&source.chroma_r, source.width, source.height);
+    let (_, _, chroma_b) = downsample_plane(&source.chroma_b, source.width, source.height);
+    let (_, _, alpha) = downsample_plane(&source.alpha, source.width, source.height);
+    let active = alpha
+        .iter()
+        .enumerate()
+        .filter_map(|(index, weight)| (*weight >= 16.0 / 255.0).then_some(index))
+        .collect();
+    PreparedTemplateLevel {
+        width,
+        height,
+        luma,
+        chroma_r,
+        chroma_b,
+        alpha,
+        active,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PyramidCandidate {
+    x: u32,
+    y: u32,
+    score: f32,
+}
+
+fn weighted_plane_score(
+    frame: &[f32],
+    frame_width: u32,
+    template: &[f32],
+    template_level: &PreparedTemplateLevel,
+    x: u32,
+    y: u32,
+) -> Option<f32> {
+    if template_level.active.is_empty() {
+        return None;
+    }
+    let mut weight_sum = 0.0_f64;
+    let mut frame_sum = 0.0_f64;
+    let mut template_sum = 0.0_f64;
+    for &index in &template_level.active {
+        let tx = index as u32 % template_level.width;
+        let ty = index as u32 / template_level.width;
+        let weight = f64::from(template_level.alpha[index]);
+        weight_sum += weight;
+        frame_sum += weight * f64::from(frame[((y + ty) * frame_width + x + tx) as usize]);
+        template_sum += weight * f64::from(template[index]);
+    }
+    if weight_sum <= f64::EPSILON {
+        return None;
+    }
+    let frame_mean = frame_sum / weight_sum;
+    let template_mean = template_sum / weight_sum;
+    let mut covariance = 0.0_f64;
+    let mut frame_variance = 0.0_f64;
+    let mut template_variance = 0.0_f64;
+    let mut sad = 0.0_f64;
+    for &index in &template_level.active {
+        let tx = index as u32 % template_level.width;
+        let ty = index as u32 / template_level.width;
+        let weight = f64::from(template_level.alpha[index]);
+        let frame_value = f64::from(frame[((y + ty) * frame_width + x + tx) as usize]);
+        let template_value = f64::from(template[index]);
+        let frame_centered = frame_value - frame_mean;
+        let template_centered = template_value - template_mean;
+        covariance += weight * frame_centered * template_centered;
+        frame_variance += weight * frame_centered * frame_centered;
+        template_variance += weight * template_centered * template_centered;
+        sad += weight * (frame_value - template_value).abs();
+    }
+    let denominator = (frame_variance * template_variance).sqrt();
+    if denominator <= 1e-10 {
+        // ZNCC is undefined for flat/near-flat templates. Normalized SAD keeps
+        // solid buttons and alpha silhouettes matchable instead of dropping
+        // them from the recognition vocabulary.
+        return Some((1.0 - sad / weight_sum).clamp(0.0, 1.0) as f32);
+    }
+    let correlation = (covariance / denominator).clamp(-1.0, 1.0);
+    Some(((correlation + 1.0) * 0.5) as f32)
+}
+
+fn score_candidate(
+    frame: &PreparedFrameLevel,
+    template: &PreparedTemplateLevel,
+    x: u32,
+    y: u32,
+    color: bool,
+) -> f32 {
+    let luma = weighted_plane_score(&frame.luma, frame.width, &template.luma, template, x, y)
+        .unwrap_or(0.0);
+    if !color {
+        return luma;
+    }
+    let red = weighted_plane_score(
+        &frame.chroma_r,
+        frame.width,
+        &template.chroma_r,
+        template,
+        x,
+        y,
+    );
+    let blue = weighted_plane_score(
+        &frame.chroma_b,
+        frame.width,
+        &template.chroma_b,
+        template,
+        x,
+        y,
+    );
+    let mut total = luma * 0.8;
+    let mut weight = 0.8;
+    if let Some(score) = red {
+        total += score * 0.1;
+        weight += 0.1;
+    }
+    if let Some(score) = blue {
+        total += score * 0.1;
+        weight += 0.1;
+    }
+    total / weight
+}
+
+fn candidate_iou(left: PyramidCandidate, right: PyramidCandidate, width: u32, height: u32) -> f32 {
+    let overlap_width = (left.x + width)
+        .min(right.x + width)
+        .saturating_sub(left.x.max(right.x));
+    let overlap_height = (left.y + height)
+        .min(right.y + height)
+        .saturating_sub(left.y.max(right.y));
+    let intersection = overlap_width as f32 * overlap_height as f32;
+    let area = width as f32 * height as f32;
+    intersection / (area * 2.0 - intersection).max(1.0)
+}
+
+fn nms_candidates(
+    mut candidates: Vec<PyramidCandidate>,
+    width: u32,
+    height: u32,
+    iou: f32,
+    cap: usize,
+    region: SearchRegion,
+) -> Vec<PyramidCandidate> {
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.y.cmp(&right.y))
+            .then_with(|| left.x.cmp(&right.x))
+    });
+    let cap = cap.max(1);
+    let mut retained = Vec::with_capacity(candidates.len().min(cap));
+
+    // Reserve one candidate for every occupied spatial tile before filling by
+    // global score. This prevents dozens of same-luma controls in one part of
+    // a full-screen frame from consuming the entire refinement budget and
+    // starving a slightly lower-scoring true target elsewhere.
+    let columns = (cap as f64).sqrt().ceil() as usize;
+    let rows = cap.div_ceil(columns);
+    let tile_width = region.width.max(1).div_ceil(columns as u32).max(1);
+    let tile_height = region.height.max(1).div_ceil(rows as u32).max(1);
+    let mut occupied = vec![false; columns * rows];
+    for &candidate in &candidates {
+        let column = (candidate.x.saturating_sub(region.x) / tile_width)
+            .min(columns.saturating_sub(1) as u32) as usize;
+        let row = (candidate.y.saturating_sub(region.y) / tile_height)
+            .min(rows.saturating_sub(1) as u32) as usize;
+        let tile = row * columns + column;
+        if occupied[tile]
+            || retained
+                .iter()
+                .copied()
+                .any(|existing| candidate_iou(candidate, existing, width, height) > iou)
+        {
+            continue;
+        }
+        retained.push(candidate);
+        occupied[tile] = true;
+        if retained.len() >= cap {
+            return retained;
+        }
+    }
+
+    for candidate in candidates {
+        if retained
+            .iter()
+            .copied()
+            .all(|existing| candidate_iou(candidate, existing, width, height) <= iou)
+        {
+            retained.push(candidate);
+            if retained.len() >= cap {
+                break;
+            }
+        }
+    }
+    retained
+}
+
+fn scaled_region(region: SearchRegion, level: usize, bounds: (u32, u32)) -> SearchRegion {
+    let divisor = 1_u32 << level;
+    let x = region.x / divisor;
+    let y = region.y / divisor;
+    let right = (region.x.saturating_add(region.width))
+        .div_ceil(divisor)
+        .min(bounds.0);
+    let bottom = (region.y.saturating_add(region.height))
+        .div_ceil(divisor)
+        .min(bounds.1);
+    SearchRegion {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    }
+}
+
+/// Coarse-to-fine alpha-weighted ZNCC search. Coarse local maxima are retained
+/// across the frame and IoU-suppressed before the bounded refinement stage, so
+/// a cluster of look-alike controls cannot starve a distant true target.
+pub fn match_template_all(
+    frame: &PreparedFrame,
+    template: &PreparedTemplate,
+    region: SearchRegion,
+    threshold: f32,
+    options: MatchOptions,
+) -> MatchCandidates {
+    let empty = MatchCandidates {
+        matches: Vec::new(),
+        best_candidate: None,
+        best_score: 0.0,
+    };
+    if template.width == 0 || template.height == 0 || frame.levels.is_empty() {
+        return empty;
+    }
+    let max_level = (frame.levels.len().min(template.levels.len()) - 1).min(3);
+    let coarse_frame = &frame.levels[max_level];
+    let coarse_template = &template.levels[max_level];
+    let coarse_region = scaled_region(region, max_level, (coarse_frame.width, coarse_frame.height));
+    if coarse_region.width < coarse_template.width || coarse_region.height < coarse_template.height
+    {
+        return empty;
+    }
+    let max_x = coarse_region.x + coarse_region.width - coarse_template.width;
+    let max_y = coarse_region.y + coarse_region.height - coarse_template.height;
+    let coarse_floor = (threshold - options.coarse_margin).clamp(0.50, 0.95);
+    let row_count = (max_y - coarse_region.y + 1) as usize;
+    let band_count = options.max_threads.max(1).min(row_count);
+    let rows_per_band = row_count.div_ceil(band_count);
+    let band_results = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(band_count);
+        for band in 0..band_count {
+            let from_y = coarse_region.y + (band * rows_per_band) as u32;
+            let to_y = (from_y + rows_per_band as u32 - 1).min(max_y);
+            if from_y > max_y {
+                continue;
+            }
+            handles.push(scope.spawn(move || {
+                let mut best: Option<PyramidCandidate> = None;
+                let mut found = Vec::new();
+                for y in from_y..=to_y {
+                    for x in coarse_region.x..=max_x {
+                        let score = score_candidate(coarse_frame, coarse_template, x, y, false);
+                        let candidate = PyramidCandidate { x, y, score };
+                        if best.is_none_or(|current| {
+                            score > current.score
+                                || (score == current.score && (y, x) < (current.y, current.x))
+                        }) {
+                            best = Some(candidate);
+                        }
+                        if score >= coarse_floor {
+                            found.push(candidate);
+                        }
+                    }
+                }
+                (found, best)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("pyramid scan worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let mut coarse_best: Option<PyramidCandidate> = None;
+    let mut candidates = Vec::new();
+    for (mut band_candidates, band_best) in band_results {
+        if let Some(candidate) = band_best
+            && coarse_best.is_none_or(|current| {
+                candidate.score > current.score
+                    || (candidate.score == current.score
+                        && (candidate.y, candidate.x) < (current.y, current.x))
+            })
+        {
+            coarse_best = Some(candidate);
+        }
+        candidates.append(&mut band_candidates);
+    }
+    if candidates.is_empty()
+        && let Some(candidate) = coarse_best
+    {
+        candidates.push(candidate);
+    }
+    let mut best_score = coarse_best.map_or(0.0, |candidate| candidate.score);
+    candidates = nms_candidates(
+        candidates,
+        coarse_template.width,
+        coarse_template.height,
+        options.nms_iou,
+        options.candidate_cap.max(1),
+        coarse_region,
+    );
+
+    for level in (0..max_level).rev() {
+        let level_frame = &frame.levels[level];
+        let level_template = &template.levels[level];
+        let level_region = scaled_region(region, level, (level_frame.width, level_frame.height));
+        if level_region.width < level_template.width || level_region.height < level_template.height
+        {
+            return empty;
+        }
+        let level_max_x = level_region.x + level_region.width - level_template.width;
+        let level_max_y = level_region.y + level_region.height - level_template.height;
+        let mut expanded = Vec::with_capacity(candidates.len() * 25);
+        for parent in &candidates {
+            let center_x = parent.x.saturating_mul(2);
+            let center_y = parent.y.saturating_mul(2);
+            let from_x = center_x.saturating_sub(2).max(level_region.x);
+            let from_y = center_y.saturating_sub(2).max(level_region.y);
+            let to_x = center_x.saturating_add(2).min(level_max_x);
+            let to_y = center_y.saturating_add(2).min(level_max_y);
+            for y in from_y..=to_y {
+                for x in from_x..=to_x {
+                    let score = score_candidate(level_frame, level_template, x, y, level == 0);
+                    best_score = best_score.max(score);
+                    expanded.push(PyramidCandidate { x, y, score });
+                }
+            }
+        }
+        expanded.sort_by(|left, right| {
+            (left.y, left.x)
+                .cmp(&(right.y, right.x))
+                .then_with(|| right.score.total_cmp(&left.score))
+        });
+        expanded.dedup_by_key(|candidate| (candidate.y, candidate.x));
+        candidates = nms_candidates(
+            expanded,
+            level_template.width,
+            level_template.height,
+            options.nms_iou,
+            options.candidate_cap.max(1),
+            level_region,
+        );
+    }
+
+    let mut refined: Vec<_> = candidates
+        .into_iter()
+        .map(|candidate| TemplateMatch {
+            x: candidate.x,
+            y: candidate.y,
+            width: template.width,
+            height: template.height,
+            score: candidate.score,
+        })
+        .collect();
+    refined.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.y.cmp(&right.y))
+            .then_with(|| left.x.cmp(&right.x))
+    });
+    let best_candidate = refined.first().copied();
+    let mut matches: Vec<_> = refined
+        .into_iter()
+        .filter(|candidate| candidate.score >= threshold)
+        .collect();
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.y.cmp(&right.y))
+            .then_with(|| left.x.cmp(&right.x))
+    });
+    MatchCandidates {
+        matches,
+        best_candidate,
+        best_score,
+    }
+}
+
+fn template_match_iou(left: &TemplateMatch, right: &TemplateMatch) -> f32 {
+    let overlap_width = (left.x + left.width)
+        .min(right.x + right.width)
+        .saturating_sub(left.x.max(right.x));
+    let overlap_height = (left.y + left.height)
+        .min(right.y + right.height)
+        .saturating_sub(left.y.max(right.y));
+    let intersection = overlap_width as f32 * overlap_height as f32;
+    let union = (left.width * left.height + right.width * right.height) as f32 - intersection;
+    intersection / union.max(1.0)
+}
+
+/// Runs the exact same prepared Hybrid search across every permitted template
+/// scale and merges overlapping boxes. Runtime and the inline test UI both use
+/// this function so scale tolerance, NMS and ambiguity inputs cannot drift.
+pub fn match_template_multiscale(
+    frame: &PreparedFrame,
+    templates: &[PreparedTemplate],
+    region: SearchRegion,
+    threshold: f32,
+    options: MatchOptions,
+) -> MatchCandidates {
+    let mut best_score = 0.0_f32;
+    let mut best_candidate: Option<TemplateMatch> = None;
+    let mut matches = Vec::new();
+    for template in templates {
+        if region.width < template.width || region.height < template.height {
+            continue;
+        }
+        let result = match_template_all(frame, template, region, threshold, options);
+        best_score = best_score.max(result.best_score);
+        if let Some(candidate) = result.best_candidate
+            && best_candidate.is_none_or(|current| candidate.score > current.score)
+        {
+            best_candidate = Some(candidate);
+        }
+        matches.extend(result.matches);
+    }
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.y.cmp(&right.y))
+            .then_with(|| left.x.cmp(&right.x))
+    });
+    let mut distinct: Vec<TemplateMatch> = Vec::new();
+    for candidate in matches {
+        if distinct
+            .iter()
+            .all(|existing| template_match_iou(&candidate, existing) <= options.nms_iou)
+        {
+            distinct.push(candidate);
+            if distinct.len() >= options.candidate_cap.max(1) {
+                break;
+            }
+        }
+    }
+    MatchCandidates {
+        matches: distinct,
+        best_candidate,
+        best_score,
     }
 }
 
@@ -2925,9 +3553,42 @@ mod tests {
                 4,
             );
             let hybrid_thorough_miss_elapsed = started.elapsed();
+            let prepared_frame = PreparedFrame::new(&real_frame);
+            let prepared_scales: Vec<_> = [90_u32, 95, 100, 105, 110]
+                .into_iter()
+                .map(|percent| {
+                    let resized = image::imageops::resize(
+                        &real_template,
+                        real_template.width() * percent / 100,
+                        real_template.height() * percent / 100,
+                        image::imageops::FilterType::Triangle,
+                    );
+                    PreparedTemplate::new(&resized)
+                })
+                .collect();
+            let started = std::time::Instant::now();
+            let five_scale_best = prepared_scales
+                .iter()
+                .map(|template| {
+                    match_template_all(
+                        &prepared_frame,
+                        template,
+                        region,
+                        0.90,
+                        MatchOptions {
+                            max_threads: 4,
+                            ..MatchOptions::default()
+                        },
+                    )
+                    .best_score
+                })
+                .fold(0.0_f32, f32::max);
+            let five_scale_miss_elapsed = started.elapsed();
             eprintln!(
                 "{width}×{height} no-match scan: hybrid-fast 4-thread \
-                 {hybrid_fast_miss_elapsed:?}, thorough {hybrid_thorough_miss_elapsed:?}"
+                 {hybrid_fast_miss_elapsed:?}, pyramid one-scale \
+                 {hybrid_thorough_miss_elapsed:?}, five-scale {five_scale_miss_elapsed:?} \
+                 (best {five_scale_best:.3})"
             );
             assert!(hybrid_fast_miss.matched.is_none());
             assert!(hybrid_thorough_miss.matched.is_none());
@@ -2969,5 +3630,158 @@ mod tests {
             );
             assert_eq!(weighted_single.matched, weighted_multi.matched);
         }
+    }
+
+    #[test]
+    fn spatial_retention_keeps_a_distant_candidate_below_global_cap() {
+        let mut candidates = Vec::new();
+        for index in 0..20_u32 {
+            candidates.push(PyramidCandidate {
+                x: index * 12,
+                y: 10,
+                score: 0.99 - index as f32 * 0.001,
+            });
+        }
+        let distant = PyramidCandidate {
+            x: 900,
+            y: 400,
+            score: 0.80,
+        };
+        candidates.push(distant);
+        let retained = nms_candidates(
+            candidates,
+            8,
+            8,
+            0.30,
+            4,
+            SearchRegion {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 500,
+            },
+        );
+        assert!(retained.iter().any(|candidate| candidate.x == distant.x));
+    }
+
+    #[test]
+    fn pyramid_returns_spatially_separate_instances_and_nms_collapses_overlap() {
+        let template = RgbaImage::from_fn(16, 12, |x, y| {
+            let value = ((x * 31 + y * 17 + x * y) % 255) as u8;
+            Rgba([value, 255 - value, value / 2, 255])
+        });
+        let mut frame = RgbaImage::from_pixel(120, 70, Rgba([12, 18, 24, 255]));
+        image::imageops::replace(&mut frame, &template, 11, 9);
+        image::imageops::replace(&mut frame, &template, 82, 44);
+        let prepared_frame = PreparedFrame::new(&frame);
+        let prepared_template = PreparedTemplate::new(&template);
+        let result = match_template_all(
+            &prepared_frame,
+            &prepared_template,
+            SearchRegion::full(&frame),
+            0.95,
+            MatchOptions {
+                max_threads: 1,
+                ..MatchOptions::default()
+            },
+        );
+        let parallel = match_template_all(
+            &prepared_frame,
+            &prepared_template,
+            SearchRegion::full(&frame),
+            0.95,
+            MatchOptions {
+                max_threads: 4,
+                ..MatchOptions::default()
+            },
+        );
+        assert_eq!(result, parallel);
+        assert_eq!(result.matches.len(), 2);
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|found| (found.x, found.y) == (11, 9))
+        );
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|found| (found.x, found.y) == (82, 44))
+        );
+    }
+
+    #[test]
+    fn pyramid_respects_strict_edge_roi_and_partial_alpha() {
+        let mut template = RgbaImage::from_pixel(14, 10, Rgba([0, 0, 0, 0]));
+        for y in 1..9 {
+            for x in 2..12 {
+                let alpha = if x < 5 { 96 } else { 255 };
+                template.put_pixel(x, y, Rgba([40 + x as u8 * 8, 90, 210, alpha]));
+            }
+        }
+        let mut frame = RgbaImage::from_pixel(80, 45, Rgba([220, 220, 220, 255]));
+        image::imageops::replace(&mut frame, &template, 63, 34);
+        let prepared_frame = PreparedFrame::new(&frame);
+        let prepared_template = PreparedTemplate::new(&template);
+        let strict = SearchRegion {
+            x: 55,
+            y: 28,
+            width: 25,
+            height: 17,
+        };
+        let result = match_template_all(
+            &prepared_frame,
+            &prepared_template,
+            strict,
+            0.90,
+            MatchOptions::default(),
+        );
+        let found = result
+            .matches
+            .first()
+            .expect("edge ROI target must be found");
+        assert_eq!((found.x, found.y), (63, 34));
+        let excluded = match_template_all(
+            &prepared_frame,
+            &prepared_template,
+            SearchRegion {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 45,
+            },
+            0.90,
+            MatchOptions::default(),
+        );
+        assert!(excluded.matches.is_empty());
+        assert!(
+            excluded.best_candidate.is_some(),
+            "below-threshold diagnostics must retain a real refined box"
+        );
+    }
+
+    #[test]
+    fn prepared_scale_finds_resized_target() {
+        let source = RgbaImage::from_fn(20, 14, |x, y| {
+            let value = ((x * 19 + y * 23) % 240) as u8;
+            Rgba([value, value / 2, 250 - value, 255])
+        });
+        let scaled =
+            image::imageops::resize(&source, 22, 15, image::imageops::FilterType::Triangle);
+        let mut frame = RgbaImage::from_pixel(100, 60, Rgba([8, 9, 10, 255]));
+        image::imageops::replace(&mut frame, &scaled, 51, 27);
+        let result = match_template_all(
+            &PreparedFrame::new(&frame),
+            &PreparedTemplate::new(&scaled),
+            SearchRegion::full(&frame),
+            0.90,
+            MatchOptions::default(),
+        );
+        let found = result.matches.first().expect("+10% scale must be found");
+        assert_eq!(
+            (found.x, found.y, found.width, found.height),
+            (51, 27, 22, 15)
+        );
     }
 }

@@ -23,6 +23,20 @@ pub enum EditorAction {
     },
 }
 
+pub enum RoiEditorAction {
+    None,
+    Cancel,
+    Apply(PixelSelection),
+}
+
+/// Full-frame visual ROI picker used directly by workflow template uses.
+pub struct RoiDraft {
+    pub image: RgbaImage,
+    texture: egui::TextureHandle,
+    selection: Option<PixelSelection>,
+    drag_start: Option<(u32, u32)>,
+}
+
 pub struct TemplateDraft {
     pub image: RgbaImage,
     texture: egui::TextureHandle,
@@ -40,17 +54,27 @@ pub struct TemplateTestView {
     template_name: String,
     search_region: SearchRegion,
     result: Option<TemplateMatch>,
+    best_score: f32,
+    candidates: Vec<TemplateMatch>,
     threshold: f32,
+    search_strategy: String,
 }
 
 impl TemplateTestView {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test diagnostics view model plus texture inputs"
+    )]
     pub fn new(
         ctx: &egui::Context,
         image: &RgbaImage,
         template_name: impl Into<String>,
         search_region: SearchRegion,
         result: Option<TemplateMatch>,
+        best_score: f32,
+        candidates: Vec<TemplateMatch>,
         threshold: f32,
+        search_strategy: impl Into<String>,
         mascot: egui::TextureHandle,
     ) -> Self {
         let size = [image.width() as usize, image.height() as usize];
@@ -67,7 +91,10 @@ impl TemplateTestView {
             template_name: template_name.into(),
             search_region,
             result,
+            best_score,
+            candidates,
             threshold,
+            search_strategy: search_strategy.into(),
         }
     }
 
@@ -90,16 +117,20 @@ impl TemplateTestView {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (label, color) = match self.result {
-                            Some(found) => {
-                                (format!("匹配成功 · {:.3}", found.score), theme::green())
-                            }
-                            None => ("未达到阈值".to_owned(), Color32::from_rgb(255, 59, 48)),
+                            Some(found) => (
+                                format!("匹配成功 · {:.3} · {}", found.score, self.search_strategy),
+                                theme::green(),
+                            ),
+                            None => (
+                                format!("未达到阈值 · 最佳 {:.3}", self.best_score),
+                                Color32::from_rgb(255, 59, 48),
+                            ),
                         };
                         ui.label(RichText::new(label).color(color).strong());
                     });
                 });
                 ui.label(
-                    RichText::new("橙色框为搜索区域，绿色框为最佳匹配位置")
+                    RichText::new("橙色框为搜索区域；绿色为已接受目标；黄色为其他高分候选")
                         .size(12.0)
                         .color(theme::tertiary_label()),
                 );
@@ -132,6 +163,35 @@ impl TemplateTestView {
                     Stroke::new(2.0, theme::orange()),
                     egui::StrokeKind::Inside,
                 );
+                for (index, candidate) in self.candidates.iter().take(5).enumerate() {
+                    if self.result == Some(*candidate) {
+                        continue;
+                    }
+                    let candidate_rect = search_region_to_display(
+                        SearchRegion {
+                            x: candidate.x,
+                            y: candidate.y,
+                            width: candidate.width,
+                            height: candidate.height,
+                        },
+                        response.rect,
+                        self.image_width,
+                        self.image_height,
+                    );
+                    ui.painter().rect_stroke(
+                        candidate_rect,
+                        4.0,
+                        Stroke::new(2.0, Color32::from_rgb(255, 196, 64)),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        candidate_rect.min,
+                        egui::Align2::LEFT_TOP,
+                        format!("{} · {:.3}", index + 1, candidate.score),
+                        egui::FontId::proportional(11.0),
+                        Color32::from_rgb(255, 196, 64),
+                    );
+                }
                 if let Some(found) = self.result {
                     let match_rect = search_region_to_display(
                         SearchRegion {
@@ -153,6 +213,105 @@ impl TemplateTestView {
                 }
             });
         open
+    }
+}
+
+impl RoiDraft {
+    pub fn from_image(ctx: &egui::Context, image: RgbaImage) -> Self {
+        let size = [image.width() as usize, image.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+        Self {
+            texture: ctx.load_texture(
+                "workflow-roi-draft",
+                color_image,
+                egui::TextureOptions::LINEAR,
+            ),
+            image,
+            selection: None,
+            drag_start: None,
+        }
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context) -> RoiEditorAction {
+        let mut action = RoiEditorAction::None;
+        let mut open = true;
+        egui::Window::new("框选此步骤的识别范围")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(820.0)
+            .default_height(600.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("在游戏画面上拖动框选。严格区域可排除同屏相似图标；区域优先允许失败后回退全屏。");
+                ui.add_space(6.0);
+                let available = ui.available_size();
+                let max_size = Vec2::new(available.x.max(240.0), (available.y - 100.0).max(220.0));
+                let scale = (max_size.x / self.image.width() as f32)
+                    .min(max_size.y / self.image.height() as f32)
+                    .min(1.0);
+                let response = ui.add(
+                    egui::Image::new(&self.texture)
+                        .fit_to_exact_size(Vec2::new(
+                            self.image.width() as f32 * scale,
+                            self.image.height() as f32 * scale,
+                        ))
+                        .sense(Sense::click_and_drag()),
+                );
+                if response.drag_started()
+                    && let Some(position) = response.interact_pointer_pos()
+                {
+                    let pixel = display_to_pixel(position, response.rect, &self.image);
+                    self.drag_start = Some(pixel);
+                    self.selection = Some(PixelSelection {
+                        x: pixel.0,
+                        y: pixel.1,
+                        width: 1,
+                        height: 1,
+                    });
+                }
+                if response.dragged()
+                    && let (Some(start), Some(position)) =
+                        (self.drag_start, response.interact_pointer_pos())
+                {
+                    let end = display_to_pixel(position, response.rect, &self.image);
+                    self.selection = selection_between(start, end, &self.image);
+                }
+                if response.drag_stopped() {
+                    self.drag_start = None;
+                }
+                if let Some(selection) = self.selection {
+                    let rect = pixel_to_display(selection, response.rect, &self.image);
+                    ui.painter().rect_stroke(
+                        rect,
+                        5.0,
+                        Stroke::new(3.0, theme::orange()),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        rect.min + Vec2::new(7.0, 5.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("{} × {}", selection.width, selection.height),
+                        egui::FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                }
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(self.selection.is_some(), theme::primary_button("应用范围"))
+                        .clicked()
+                        && let Some(selection) = self.selection
+                    {
+                        action = RoiEditorAction::Apply(selection);
+                    }
+                });
+            });
+        if !open {
+            RoiEditorAction::Cancel
+        } else {
+            action
+        }
     }
 }
 
