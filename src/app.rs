@@ -2466,12 +2466,17 @@ impl Make5771App {
                         // Keep the sequence visible through most of the viewport; the outer page
                         // already provides scrolling for the editor on shorter windows.
                         let list_height = (window_height - 235.0).clamp(420.0, 920.0);
+                        // `max_height` only caps a ScrollArea; it does not make a short list fill
+                        // the panel. Reserve the viewport explicitly so the left panel stays tall
+                        // even when the workflow currently contains only a few steps.
+                        ui.set_min_height(list_height + 72.0);
                         egui::ScrollArea::vertical()
                             .id_salt("workflow-step-list")
                             .scroll_bar_visibility(
                                 egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
                             )
                             .max_height(list_height)
+                            .min_scrolled_height(list_height)
                             .show(ui, |ui| {
                                 for (index, step) in self.profile.steps.iter().enumerate() {
                                     let selected = self.selected_step == Some(step.id);
