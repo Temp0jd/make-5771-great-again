@@ -1,6 +1,8 @@
 use eframe::egui::{self, Color32};
 
-use crate::model::{KeyInputMode, MacroProfile, StepKind, WorkflowStep, parse_key_combo};
+use crate::model::{
+    KeyInputMode, MacroProfile, SearchStrategy, StepKind, WorkflowStep, parse_key_combo,
+};
 use crate::platform::TargetWindow;
 use crate::theme;
 use crate::vision::TemplateMatch;
@@ -73,6 +75,21 @@ pub fn step_kind_chip(kind: StepKind) -> (&'static str, Color32) {
     }
 }
 
+fn scan_summary(step: &WorkflowStep) -> String {
+    step.scan_interval_secs
+        .map(|seconds| format!("每 {seconds} 秒扫描"))
+        .unwrap_or_else(|| "继承扫描频率".to_owned())
+}
+
+fn search_summary(strategy: SearchStrategy) -> &'static str {
+    match strategy {
+        SearchStrategy::Inherit => "继承搜索范围",
+        SearchStrategy::FullFrame => "全屏搜索",
+        SearchStrategy::FixedRoi => "限定区域",
+        SearchStrategy::RoiThenFullFrame => "区域优先",
+    }
+}
+
 pub fn step_summary(step: &WorkflowStep, templates: &[(u64, String, String)]) -> String {
     let template_name = |path: &Option<String>| -> String {
         path.as_ref()
@@ -87,23 +104,27 @@ pub fn step_summary(step: &WorkflowStep, templates: &[(u64, String, String)]) ->
     };
     let mut summary = match step.kind {
         StepKind::WaitAndClick => format!(
-            "{} · 超时 {}s{}",
+            "{}，{}，{}，超时 {}s{}",
             template_name(&step.template),
+            search_summary(step.search.strategy),
+            scan_summary(step),
             step.timeout_secs,
             if step.click_count > 1 {
-                format!(" · 连点 {} 次", step.click_count)
+                format!("，连点 {} 次", step.click_count)
             } else {
                 String::new()
             }
         ),
         StepKind::WaitAny => format!(
-            "{} 个目标分支 · 超时 {}s",
+            "{} 个目标分支，{}，超时 {}s",
             step.branches.len(),
+            scan_summary(step),
             step.timeout_secs
         ),
         StepKind::VisualCondition => format!(
-            "{} 个检查项 · 满足后{}",
+            "{} 个检查项，{}，满足后{}",
             step.visual_condition.terms.len(),
+            scan_summary(step),
             step.visual_condition.outcome.label()
         ),
         StepKind::Delay => format!("等待 {:.1}s", step.delay_ms as f32 / 1000.0),
@@ -131,6 +152,84 @@ pub fn step_summary(step: &WorkflowStep, templates: &[(u64, String, String)]) ->
         summary.push_str(" · 已停用");
     }
     summary
+}
+
+/// Filtering is presentation-only: callers receive matching source indices and
+/// never a reordered or cloned workflow.
+pub fn filtered_step_indices(
+    steps: &[WorkflowStep],
+    templates: &[(u64, String, String)],
+    query: &str,
+) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| {
+            if query.is_empty()
+                || step.name.to_lowercase().contains(&query)
+                || step_summary(step, templates)
+                    .to_lowercase()
+                    .contains(&query)
+            {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepHealth {
+    Ready,
+    Disabled,
+    NeedsAttention(String),
+}
+
+impl StepHealth {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ready => "配置正常",
+            Self::Disabled => "已停用",
+            Self::NeedsAttention(_) => "需要处理",
+        }
+    }
+}
+
+pub fn step_health(
+    step: &WorkflowStep,
+    templates: &[(u64, String, String)],
+    profile_scan_secs: Option<u8>,
+) -> StepHealth {
+    if !step.enabled {
+        StepHealth::Disabled
+    } else if let Some(warning) = step_warning(step, templates, profile_scan_secs) {
+        StepHealth::NeedsAttention(warning)
+    } else {
+        StepHealth::Ready
+    }
+}
+
+pub fn step_test_unavailable_reason(
+    step: &WorkflowStep,
+    templates: &[(u64, String, String)],
+    target_connected: bool,
+) -> Option<&'static str> {
+    if step.kind != StepKind::WaitAndClick {
+        Some("当前步骤不是单目标识别步骤，请在各分支或检查项内测试")
+    } else if step.template.is_none() {
+        Some("尚未选择图片模板")
+    } else if !templates
+        .iter()
+        .any(|(_, _, path)| Some(path) == step.template.as_ref())
+    {
+        Some("引用的图片模板不存在")
+    } else if !target_connected {
+        Some("尚未连接游戏窗口")
+    } else {
+        None
+    }
 }
 
 pub fn step_warning(
@@ -261,6 +360,25 @@ pub enum PreflightSeverity {
     Warning,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightGroup {
+    Blocker,
+    AutoFix,
+    Suggestion,
+}
+
+impl PreflightGroup {
+    pub const ALL: [Self; 3] = [Self::Blocker, Self::AutoFix, Self::Suggestion];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blocker => "阻断问题",
+            Self::AutoFix => "可自动修复",
+            Self::Suggestion => "建议确认",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreflightTarget {
     Window,
@@ -296,6 +414,26 @@ pub struct WorkflowPreflightReport {
 }
 
 impl WorkflowPreflightReport {
+    pub fn group_for(issue: &PreflightIssue) -> PreflightGroup {
+        if issue.severity == PreflightSeverity::Blocker {
+            PreflightGroup::Blocker
+        } else if issue.safe_fix.is_some() {
+            PreflightGroup::AutoFix
+        } else {
+            PreflightGroup::Suggestion
+        }
+    }
+
+    pub fn grouped(&self, group: PreflightGroup) -> impl Iterator<Item = &PreflightIssue> {
+        self.issues
+            .iter()
+            .filter(move |issue| Self::group_for(issue) == group)
+    }
+
+    pub fn group_count(&self, group: PreflightGroup) -> usize {
+        self.grouped(group).count()
+    }
+
     pub fn has_blockers(&self) -> bool {
         self.issues
             .iter()
@@ -750,7 +888,7 @@ mod tests {
         click_step.click_count = 2;
         assert_eq!(
             step_summary(&click_step, &templates),
-            "开始按钮 · 超时 45s · 连点 2 次"
+            "开始按钮，全屏搜索，继承扫描频率，超时 45s，连点 2 次"
         );
 
         // Disabled
@@ -764,7 +902,7 @@ mod tests {
         wait_any.timeout_secs = 30;
         assert_eq!(
             step_summary(&wait_any, &templates),
-            "2 个目标分支 · 超时 30s"
+            "2 个目标分支，继承扫描频率，超时 30s"
         );
 
         // VisualCondition
@@ -780,7 +918,7 @@ mod tests {
         cond_step.visual_condition.outcome = ConditionOutcome::ContinueFlow;
         assert_eq!(
             step_summary(&cond_step, &templates),
-            "1 个检查项 · 满足后继续后续步骤"
+            "1 个检查项，继承扫描频率，满足后继续后续步骤"
         );
 
         // Delay
@@ -807,6 +945,90 @@ mod tests {
         // RoundEnd
         let round_end = WorkflowStep::new(7, "结算", StepKind::RoundEnd, 0);
         assert_eq!(step_summary(&round_end, &templates), "结算本局并开始下一轮");
+    }
+
+    #[test]
+    fn test_filter_matches_name_and_summary_without_reordering() {
+        let templates = vec![(1, "确认按钮".to_owned(), "confirm.png".to_owned())];
+        let mut first = WorkflowStep::new(7, "等待确认", StepKind::WaitAndClick, 0);
+        first.template = Some("confirm.png".to_owned());
+        let second = WorkflowStep::new(3, "暂停", StepKind::Delay, 0);
+        let steps = vec![first, second];
+
+        assert_eq!(
+            filtered_step_indices(&steps, &templates, "确认按钮"),
+            vec![0]
+        );
+        assert_eq!(filtered_step_indices(&steps, &templates, "暂停"), vec![1]);
+        assert_eq!(filtered_step_indices(&steps, &templates, ""), vec![0, 1]);
+        assert_eq!(steps[0].id, 7);
+        assert_eq!(steps[1].id, 3);
+    }
+
+    #[test]
+    fn test_step_health_and_test_availability() {
+        let templates = vec![];
+        let mut step = WorkflowStep::new(1, "识别", StepKind::WaitAndClick, 0);
+        assert!(matches!(
+            step_health(&step, &templates, Some(3)),
+            StepHealth::NeedsAttention(_)
+        ));
+        assert_eq!(
+            step_test_unavailable_reason(&step, &templates, true),
+            Some("尚未选择图片模板")
+        );
+        step.template = Some("missing.png".to_owned());
+        assert_eq!(
+            step_test_unavailable_reason(&step, &templates, true),
+            Some("引用的图片模板不存在")
+        );
+        let templates = vec![(1, "识别模板".to_owned(), "missing.png".to_owned())];
+        assert_eq!(
+            step_test_unavailable_reason(&step, &templates, false),
+            Some("尚未连接游戏窗口")
+        );
+        assert_eq!(step_test_unavailable_reason(&step, &templates, true), None);
+        step.enabled = false;
+        assert_eq!(
+            step_health(&step, &templates, Some(3)),
+            StepHealth::Disabled
+        );
+        assert_eq!(step_test_unavailable_reason(&step, &templates, true), None);
+    }
+
+    #[test]
+    fn test_preflight_grouping_keeps_safe_fix_separate_from_suggestions() {
+        let report = WorkflowPreflightReport {
+            issues: vec![
+                PreflightIssue {
+                    severity: PreflightSeverity::Blocker,
+                    title: "阻断".to_owned(),
+                    detail: String::new(),
+                    target: PreflightTarget::General,
+                    safe_fix: None,
+                },
+                PreflightIssue {
+                    severity: PreflightSeverity::Warning,
+                    title: "超时".to_owned(),
+                    detail: String::new(),
+                    target: PreflightTarget::General,
+                    safe_fix: Some(SafeFix::AdjustTimeout {
+                        step_id: 1,
+                        recommended_secs: 10,
+                    }),
+                },
+                PreflightIssue {
+                    severity: PreflightSeverity::Warning,
+                    title: "阈值".to_owned(),
+                    detail: String::new(),
+                    target: PreflightTarget::General,
+                    safe_fix: None,
+                },
+            ],
+        };
+        assert_eq!(report.group_count(PreflightGroup::Blocker), 1);
+        assert_eq!(report.group_count(PreflightGroup::AutoFix), 1);
+        assert_eq!(report.group_count(PreflightGroup::Suggestion), 1);
     }
 
     #[test]

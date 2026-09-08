@@ -18,7 +18,7 @@ use crate::template_editor::{
 use crate::theme;
 use crate::vision::{self, MatchAlgorithm, SearchRegion};
 use crate::workflow_ui::{
-    self, PreflightSeverity, PreflightTarget, SaveStatus, WorkflowPreflightReport,
+    self, PreflightGroup, PreflightTarget, SaveStatus, StepHealth, WorkflowPreflightReport,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -213,6 +213,7 @@ pub struct Make5771App {
     exit_confirm_open: bool,
     allow_close_once: bool,
     ui_expert_mode: bool,
+    workflow_step_filter: String,
 }
 
 impl Make5771App {
@@ -333,6 +334,7 @@ impl Make5771App {
             exit_confirm_open: false,
             allow_close_once: false,
             ui_expert_mode: false,
+            workflow_step_filter: String::new(),
         };
         if let Some(target) = &app.target_window {
             app.push_log(
@@ -1372,6 +1374,7 @@ impl Make5771App {
             serde_json::to_string(&self.profile.steps).unwrap_or_else(|_| "[]".to_owned());
         self.workflow_undo.clear();
         self.workflow_redo.clear();
+        self.workflow_step_filter.clear();
     }
 
     fn undo_workflow_edit(&mut self) {
@@ -2293,51 +2296,71 @@ impl Make5771App {
                     );
                 }
 
+                ui.label(
+                    RichText::new(format!(
+                        "阻断 {}，可自动修复 {}，建议 {}",
+                        report.group_count(PreflightGroup::Blocker),
+                        report.group_count(PreflightGroup::AutoFix),
+                        report.group_count(PreflightGroup::Suggestion),
+                    ))
+                    .size(11.5)
+                    .color(theme::secondary_label()),
+                );
+
                 let mut applied_fix = None;
-                for issue in &report.issues {
-                    ui.add_space(3.0);
-                    ui.horizontal(|ui| {
-                        let (icon, color) = match issue.severity {
-                            PreflightSeverity::Blocker => ("阻断", theme::red()),
-                            PreflightSeverity::Warning => ("警告", theme::orange()),
-                        };
-                        ui.label(
-                            RichText::new(format!("{icon} {}", issue.title))
-                                .color(color)
-                                .strong(),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if let Some(ref fix) = issue.safe_fix
-                                && ui.small_button("一键安全修复").clicked()
-                            {
-                                applied_fix = Some(fix.clone());
-                            }
-                            match &issue.target {
-                                PreflightTarget::Step { step_id, .. } => {
-                                    if ui.small_button("定位到步骤").clicked() {
-                                        self.active_tab = AppTab::Flow;
-                                        self.selected_step = Some(*step_id);
-                                    }
-                                }
-                                PreflightTarget::Window => {
-                                    if ui.small_button("连接游戏窗口").clicked() {
-                                        self.open_window_picker();
-                                    }
-                                }
-                                PreflightTarget::Template { .. } => {
-                                    if ui.small_button("前往模板库").clicked() {
-                                        self.active_tab = AppTab::Templates;
-                                    }
-                                }
-                                PreflightTarget::General => {}
-                            }
-                        });
-                    });
+                for group in PreflightGroup::ALL {
+                    let count = report.group_count(group);
+                    if count == 0 {
+                        continue;
+                    }
+                    let color = match group {
+                        PreflightGroup::Blocker => theme::red(),
+                        PreflightGroup::AutoFix => theme::orange(),
+                        PreflightGroup::Suggestion => theme::secondary_label(),
+                    };
+                    ui.add_space(7.0);
                     ui.label(
-                        RichText::new(&issue.detail)
-                            .size(11.5)
-                            .color(theme::secondary_label()),
+                        RichText::new(format!("{}（{}）", group.label(), count))
+                            .color(color)
+                            .strong(),
                     );
+                    for issue in report.grouped(group) {
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&issue.title).color(color).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if let Some(ref fix) = issue.safe_fix
+                                    && ui.small_button("安全修复超时").clicked()
+                                {
+                                    applied_fix = Some(fix.clone());
+                                }
+                                match &issue.target {
+                                    PreflightTarget::Step { step_id, .. } => {
+                                        if ui.small_button("定位到步骤").clicked() {
+                                            self.active_tab = AppTab::Flow;
+                                            self.selected_step = Some(*step_id);
+                                        }
+                                    }
+                                    PreflightTarget::Window => {
+                                        if ui.small_button("连接游戏窗口").clicked() {
+                                            self.open_window_picker();
+                                        }
+                                    }
+                                    PreflightTarget::Template { .. } => {
+                                        if ui.small_button("前往模板库").clicked() {
+                                            self.active_tab = AppTab::Templates;
+                                        }
+                                    }
+                                    PreflightTarget::General => {}
+                                }
+                            });
+                        });
+                        ui.label(
+                            RichText::new(&issue.detail)
+                                .size(11.5)
+                                .color(theme::secondary_label()),
+                        );
+                    }
                 }
 
                 if let Some(fix) = applied_fix {
@@ -2404,26 +2427,32 @@ impl Make5771App {
     }
 
     fn flow_page(&mut self, ui: &mut egui::Ui) {
+        let mut toolbar_add_kind = None;
         let template_options: Vec<(u64, String, String)> = self
             .effective_templates()
             .iter()
             .map(|template| (template.id, template.name.clone(), template.path.clone()))
             .collect();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.vertical(|ui| {
-                ui.heading(RichText::new("流程编辑").size(28.0));
+                ui.heading(RichText::new("流程工作台").size(24.0));
                 ui.label(
-                    RichText::new("编排线性步骤、画面分支和分支内动作")
+                    RichText::new(format!("当前流程：{}", self.profile.name))
                         .color(theme::secondary_label()),
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add(
                     egui::Image::new(&self.mascots.dexter_cheers)
-                        .fit_to_exact_size(Vec2::splat(44.0)),
+                        .fit_to_exact_size(Vec2::splat(30.0)),
                 );
                 if ui
-                    .add(theme::primary_button("保存流程"))
+                    .add(
+                        egui::Button::new(RichText::new("保存流程").color(Color32::WHITE).strong())
+                            .fill(theme::blue())
+                            .stroke(Stroke::NONE)
+                            .min_size(Vec2::new(88.0, 36.0)),
+                    )
                     .on_hover_text("保存当前流程（快捷键 Ctrl+S）")
                     .clicked()
                 {
@@ -2443,6 +2472,14 @@ impl Make5771App {
                 {
                     self.undo_workflow_edit();
                 }
+                ui.menu_button("新增步骤", |ui| {
+                    for (kind, hint) in workflow_step_kinds() {
+                        if ui.button(kind.label()).on_hover_text(hint).clicked() {
+                            toolbar_add_kind = Some(kind);
+                            ui.close();
+                        }
+                    }
+                });
                 ui.add_space(8.0);
                 match self.save_tracker.status(&self.profile) {
                     SaveStatus::Saved => {
@@ -2495,7 +2532,13 @@ impl Make5771App {
                 );
             });
         });
-        ui.horizontal(|ui| {
+        if let Some(kind) = toolbar_add_kind {
+            let id = add_workflow_step(&mut self.profile, kind);
+            self.selected_step = Some(id);
+            self.workflow_step_filter.clear();
+        }
+
+        ui.horizontal_wrapped(|ui| {
             ui.label("流程文件");
             let profiles_cache = self.profiles_cache.clone();
             let selected_label = self
@@ -2584,47 +2627,67 @@ impl Make5771App {
             self.profile.expected_client_height,
         );
         let profile_scan_interval = self.profile.idle_scan_secs;
+        let target_connected = self.target_window.is_some();
         let mut workflow_action: Option<WorkflowTemplateAction> = None;
+        let mut request_run_check = false;
         ui.horizontal_top(|ui| {
             let gap = 10.0;
             let total_width = ui.available_width();
-            let list_width = (total_width * 0.34).clamp(285.0, 400.0);
-            let editor_width = (total_width - list_width - gap).max(420.0);
+            // Keep the desktop ratio near 34/66 while allowing both panes to shrink
+            // inside narrow windows instead of creating horizontal overflow.
+            let list_width = (total_width * 0.34)
+                .clamp(170.0, 400.0)
+                .min((total_width - gap).max(0.0) * 0.42);
+            let editor_width = (total_width - list_width - gap).max(0.0);
             ui.allocate_ui_with_layout(
                 Vec2::new(list_width, 0.0),
                 Layout::top_down(Align::Min),
                 |ui| {
                     theme::card().show(ui, |ui| {
                         let mut list_command = None;
-                        ui.label(RichText::new(&self.profile.name).size(18.0).strong());
+                        let filtered_indices = workflow_ui::filtered_step_indices(
+                            &self.profile.steps,
+                            &template_options,
+                            &self.workflow_step_filter,
+                        );
+                        let filter_active = !self.workflow_step_filter.trim().is_empty();
                         ui.horizontal(|ui| {
-                            ui.menu_button("添加步骤", |ui| {
-                                for (kind, hint) in [
-                                    (StepKind::WaitAndClick, "等到目标图片出现后点击它，最常用"),
-                                    (
-                                        StepKind::WaitAny,
-                                        "同时监控多个画面，先出现先处理，适合应对随机弹窗",
-                                    ),
-                                    (
-                                        StepKind::VisualCondition,
-                                        "判断画面条件，决定继续、点击或结束本局",
-                                    ),
-                                    (StepKind::Delay, "原地等待固定时长"),
-                                    (StepKind::SendKeys, "向游戏窗口键入文字或按键，仅前台有效"),
-                                    (StepKind::RoundEnd, "把当前局计入完成数，并开始下一轮"),
-                                ] {
-                                    if ui.button(kind.label()).on_hover_text(hint).clicked() {
-                                        list_command = Some(StepListCommand::Add(kind));
-                                        ui.close();
-                                    }
-                                }
-                            });
-                            ui.label(
-                                RichText::new("拖动步骤卡可排序，也可在“操作”中调整")
+                            ui.label(RichText::new("步骤列表").size(18.0).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "显示 {}/{}",
+                                        filtered_indices.len(),
+                                        self.profile.steps.len()
+                                    ))
                                     .size(11.0)
-                                    .color(theme::tertiary_label()),
-                            );
+                                    .color(theme::secondary_label()),
+                                );
+                            });
                         });
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.workflow_step_filter)
+                                    .hint_text("搜索步骤名称或摘要")
+                                    .desired_width((ui.available_width() - 58.0).max(80.0)),
+                            );
+                            if ui
+                                .add_enabled(filter_active, egui::Button::new("清除"))
+                                .on_disabled_hover_text("当前没有过滤条件")
+                                .clicked()
+                            {
+                                self.workflow_step_filter.clear();
+                            }
+                        });
+                        ui.label(
+                            RichText::new(if filter_active {
+                                "过滤期间仅改变显示，拖动排序已停用；清除过滤后可拖动"
+                            } else {
+                                "拖动步骤卡可排序，也可在操作菜单中调整"
+                            })
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                        );
                         ui.separator();
 
                         let window_height = ui
@@ -2646,139 +2709,88 @@ impl Make5771App {
                             .max_height(list_height)
                             .min_scrolled_height(list_height)
                             .show(ui, |ui| {
-                                for (index, step) in self.profile.steps.iter().enumerate() {
-                                    let selected = self.selected_step == Some(step.id);
-                                    let (_, dropped) = ui.dnd_drop_zone::<usize, _>(
-                                        egui::Frame::NONE,
-                                        |ui| {
-                                            ui.dnd_drag_source(
-                                                egui::Id::new(("workflow-step-drag", step.id)),
+                                if self.profile.steps.is_empty() {
+                                    ui.vertical_centered(|ui| {
+                                        ui.add_space(28.0);
+                                        ui.label(RichText::new("这个流程还没有步骤").strong());
+                                        ui.label(
+                                            RichText::new("从常用步骤开始，之后仍可拖动调整顺序")
+                                                .size(11.0)
+                                                .color(theme::secondary_label()),
+                                        );
+                                        if ui.button("添加第一个识别点击").clicked() {
+                                            list_command =
+                                                Some(StepListCommand::Add(StepKind::WaitAndClick));
+                                        }
+                                        if ui.button("添加等待").clicked() {
+                                            list_command =
+                                                Some(StepListCommand::Add(StepKind::Delay));
+                                        }
+                                        if ui.button("导入流程").clicked() {
+                                            self.request_import_flow(None);
+                                        }
+                                    });
+                                } else if filtered_indices.is_empty() {
+                                    ui.vertical_centered(|ui| {
+                                        ui.add_space(28.0);
+                                        ui.label(RichText::new("没有符合条件的步骤").strong());
+                                        if ui.button("清除过滤").clicked() {
+                                            self.workflow_step_filter.clear();
+                                        }
+                                    });
+                                } else {
+                                    for index in filtered_indices.iter().copied() {
+                                        let step = &self.profile.steps[index];
+                                        let selected = self.selected_step == Some(step.id);
+                                        let mut selected_id = None;
+                                        if filter_active {
+                                            selected_id = render_step_list_row(
+                                                ui,
+                                                step,
                                                 index,
+                                                self.profile.steps.len(),
+                                                selected,
+                                                &template_options,
+                                                profile_scan_interval,
+                                                &mut list_command,
+                                            );
+                                        } else {
+                                            let (_, dropped) = ui.dnd_drop_zone::<usize, _>(
+                                                egui::Frame::NONE,
                                                 |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        let controls_width = 54.0;
-                                                        let button_width = (ui.available_width()
-                                                            - controls_width)
-                                                            .max(160.0);
-                                                        let button = egui::Button::new(
-                                                            workflow_ui::step_row_text(
+                                                    ui.dnd_drag_source(
+                                                        egui::Id::new((
+                                                            "workflow-step-drag",
+                                                            step.id,
+                                                        )),
+                                                        index,
+                                                        |ui| {
+                                                            selected_id = render_step_list_row(
+                                                                ui,
                                                                 step,
                                                                 index,
+                                                                self.profile.steps.len(),
                                                                 selected,
                                                                 &template_options,
                                                                 profile_scan_interval,
-                                                            ),
-                                                        )
-                                                        .fill(if selected {
-                                                            theme::blue().gamma_multiply(0.12)
-                                                        } else {
-                                                            Color32::TRANSPARENT
-                                                        })
-                                                        .stroke(if selected {
-                                                            Stroke::new(1.5, theme::blue())
-                                                        } else {
-                                                            Stroke::NONE
-                                                        })
-                                                        .min_size(Vec2::new(button_width, 46.0));
-                                                        if ui.add(button).clicked() {
-                                                            self.selected_step = Some(step.id);
-                                                        }
-                                                        ui.menu_button(
-                                                            RichText::new("操作").size(11.0),
-                                                            |ui| {
-                                                                if ui
-                                                                    .add_enabled(
-                                                                        index > 0,
-                                                                        egui::Button::new(
-                                                                            "上移一步",
-                                                                        ),
-                                                                    )
-                                                                    .clicked()
-                                                                {
-                                                                    list_command = Some(
-                                                                        StepListCommand::MoveUp(
-                                                                            index,
-                                                                        ),
-                                                                    );
-                                                                    ui.close();
-                                                                }
-                                                                if ui
-                                                                    .add_enabled(
-                                                                        index + 1
-                                                                            < self.profile.steps.len(),
-                                                                        egui::Button::new(
-                                                                            "下移一步",
-                                                                        ),
-                                                                    )
-                                                                    .clicked()
-                                                                {
-                                                                    list_command = Some(
-                                                                        StepListCommand::MoveDown(
-                                                                            index,
-                                                                        ),
-                                                                    );
-                                                                    ui.close();
-                                                                }
-                                                                ui.separator();
-                                                                let toggle_label = if step.enabled {
-                                                                    "停用此步骤"
-                                                                } else {
-                                                                    "启用此步骤"
-                                                                };
-                                                                if ui
-                                                                    .button(toggle_label)
-                                                                    .clicked()
-                                                                {
-                                                                    list_command = Some(
-                                                                        StepListCommand::ToggleEnabled(
-                                                                            index,
-                                                                        ),
-                                                                    );
-                                                                    ui.close();
-                                                                }
-                                                                if ui
-                                                                    .button("复制步骤")
-                                                                    .clicked()
-                                                                {
-                                                                    list_command = Some(
-                                                                        StepListCommand::Duplicate(
-                                                                            index,
-                                                                        ),
-                                                                    );
-                                                                    ui.close();
-                                                                }
-                                                                ui.separator();
-                                                                if ui
-                                                                    .add_enabled(
-                                                                        self.profile.steps.len()
-                                                                            > 1,
-                                                                        egui::Button::new(
-                                                                            "删除步骤",
-                                                                        ),
-                                                                    )
-                                                                    .clicked()
-                                                                {
-                                                                    list_command = Some(
-                                                                        StepListCommand::Delete(
-                                                                            index,
-                                                                        ),
-                                                                    );
-                                                                    ui.close();
-                                                                }
-                                                            },
-                                                        );
-                                                    });
+                                                                &mut list_command,
+                                                            );
+                                                        },
+                                                    );
                                                 },
                                             );
-                                        },
-                                    );
-                                    if let Some(from) = dropped
-                                        && *from != index
-                                    {
-                                        list_command = Some(StepListCommand::Move {
-                                            from: *from,
-                                            to: index,
-                                        });
+                                            if let Some(from) = dropped
+                                                && *from != index
+                                            {
+                                                list_command = Some(StepListCommand::Move {
+                                                    from: *from,
+                                                    to: index,
+                                                });
+                                            }
+                                        }
+                                        if selected_id.is_some() {
+                                            self.selected_step = selected_id;
+                                        }
                                     }
                                 }
                             });
@@ -2787,27 +2799,9 @@ impl Make5771App {
                         // be applied only after the list has rendered.
                         match list_command {
                             Some(StepListCommand::Add(kind)) => {
-                                let id = self
-                                    .profile
-                                    .steps
-                                    .iter()
-                                    .map(|step| step.id)
-                                    .max()
-                                    .unwrap_or(0)
-                                    + 1;
-                                let count = self
-                                    .profile
-                                    .steps
-                                    .iter()
-                                    .filter(|step| step.kind == kind)
-                                    .count();
-                                self.profile.steps.push(WorkflowStep::new(
-                                    id,
-                                    format!("{} {}", kind.label(), count + 1),
-                                    kind,
-                                    0,
-                                ));
+                                let id = add_workflow_step(&mut self.profile, kind);
                                 self.selected_step = Some(id);
+                                self.workflow_step_filter.clear();
                             }
                             Some(StepListCommand::MoveUp(index)) => {
                                 self.profile.steps.swap(index, index - 1);
@@ -2841,8 +2835,12 @@ impl Make5771App {
                             }
                             Some(StepListCommand::Delete(index)) => {
                                 self.profile.steps.remove(index);
-                                let next_index = index.min(self.profile.steps.len() - 1);
-                                self.selected_step = Some(self.profile.steps[next_index].id);
+                                self.selected_step = if self.profile.steps.is_empty() {
+                                    None
+                                } else {
+                                    let next_index = index.min(self.profile.steps.len() - 1);
+                                    Some(self.profile.steps[next_index].id)
+                                };
                             }
                             None => {}
                         }
@@ -2855,21 +2853,70 @@ impl Make5771App {
                 Layout::top_down(Align::Min),
                 |ui| {
                     theme::card().show(ui, |ui| {
-                        ui.label(RichText::new("所选步骤").size(18.0).strong());
-                        ui.separator();
                         let Some(selected_id) = self.selected_step else {
-                            ui.label("请选择一个步骤");
+                            ui.label(RichText::new("步骤编辑器").size(18.0).strong());
+                            ui.label(
+                                RichText::new("请在左侧选择步骤，或先添加第一个步骤")
+                                    .color(theme::secondary_label()),
+                            );
                             return;
                         };
-                        let Some(step) = self
+                        let Some(selected_index) = self
                             .profile
                             .steps
-                            .iter_mut()
-                            .find(|step| step.id == selected_id)
+                            .iter()
+                            .position(|step| step.id == selected_id)
                         else {
                             ui.label("步骤不存在");
                             return;
                         };
+                        let health = workflow_ui::step_health(
+                            &self.profile.steps[selected_index],
+                            &template_options,
+                            profile_scan_interval,
+                        );
+                        let health_color = match &health {
+                            StepHealth::Ready => theme::green(),
+                            StepHealth::Disabled => theme::tertiary_label(),
+                            StepHealth::NeedsAttention(_) => theme::orange(),
+                        };
+                        let step = &mut self.profile.steps[selected_index];
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!("步骤 {:02}", selected_index + 1))
+                                    .size(12.0)
+                                    .color(theme::tertiary_label()),
+                            );
+                            ui.label(RichText::new(&step.name).size(18.0).strong());
+                            ui.label(
+                                RichText::new(step.kind.label())
+                                    .size(12.0)
+                                    .color(workflow_ui::step_kind_chip(step.kind).1),
+                            );
+                            ui.label(
+                                RichText::new(if step.enabled {
+                                    "已启用"
+                                } else {
+                                    "已停用"
+                                })
+                                .size(12.0)
+                                .color(if step.enabled {
+                                    theme::green()
+                                } else {
+                                    theme::tertiary_label()
+                                }),
+                            );
+                            ui.label(
+                                RichText::new(health.label())
+                                    .size(12.0)
+                                    .strong()
+                                    .color(health_color),
+                            );
+                        });
+                        if let StepHealth::NeedsAttention(detail) = &health {
+                            ui.label(RichText::new(detail).size(11.0).color(theme::orange()));
+                        }
+                        ui.separator();
 
                         render_step_editor_5stages(
                             ui,
@@ -2881,10 +2928,56 @@ impl Make5771App {
                             &mut workflow_action,
                             self.ui_expert_mode,
                         );
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            let test_reason = workflow_ui::step_test_unavailable_reason(
+                                step,
+                                &template_options,
+                                target_connected,
+                            );
+                            let test_response = ui.add_enabled(
+                                test_reason.is_none(),
+                                egui::Button::new("测试当前识别"),
+                            );
+                            let test_clicked = test_response.clicked();
+                            if let Some(reason) = test_reason {
+                                test_response.on_disabled_hover_text(reason);
+                                ui.label(
+                                    RichText::new(reason)
+                                        .size(10.5)
+                                        .color(theme::tertiary_label()),
+                                );
+                            }
+                            if test_clicked
+                                && let Some(template_id) = step.template.as_ref().and_then(|path| {
+                                    template_options
+                                        .iter()
+                                        .find(|(_, _, candidate)| candidate == path)
+                                        .map(|(id, _, _)| *id)
+                                })
+                            {
+                                workflow_action = Some(WorkflowTemplateAction::Test {
+                                    template_id,
+                                    search: step.search,
+                                    threshold: step.threshold,
+                                });
+                            }
+                            if ui
+                                .add(theme::secondary_button("运行前检查并前往运行"))
+                                .clicked()
+                            {
+                                request_run_check = true;
+                            }
+                        });
                     });
                 },
             );
         });
+        if request_run_check {
+            self.active_tab = AppTab::Run;
+        }
         if let Some(action) = workflow_action {
             match action {
                 WorkflowTemplateAction::CaptureNew(locator) => {
@@ -4465,6 +4558,115 @@ enum StepListCommand {
     Delete(usize),
 }
 
+fn workflow_step_kinds() -> [(StepKind, &'static str); 6] {
+    [
+        (StepKind::WaitAndClick, "等到目标图片出现后点击它，最常用"),
+        (StepKind::WaitAny, "同时监控多个画面并处理先出现的目标"),
+        (StepKind::VisualCondition, "根据一个或多个画面条件决定结果"),
+        (StepKind::Delay, "原地等待固定时长"),
+        (StepKind::SendKeys, "向游戏窗口键入文字或按键，仅前台有效"),
+        (StepKind::RoundEnd, "记录本局完成并开始下一轮"),
+    ]
+}
+
+fn add_workflow_step(profile: &mut MacroProfile, kind: StepKind) -> u64 {
+    let id = profile.steps.iter().map(|step| step.id).max().unwrap_or(0) + 1;
+    let count = profile
+        .steps
+        .iter()
+        .filter(|step| step.kind == kind)
+        .count();
+    profile.steps.push(WorkflowStep::new(
+        id,
+        format!("{} {}", kind.label(), count + 1),
+        kind,
+        0,
+    ));
+    id
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "step row needs list context and summaries"
+)]
+fn render_step_list_row(
+    ui: &mut egui::Ui,
+    step: &WorkflowStep,
+    index: usize,
+    total_steps: usize,
+    selected: bool,
+    template_options: &[(u64, String, String)],
+    profile_scan_interval: Option<u8>,
+    command: &mut Option<StepListCommand>,
+) -> Option<u64> {
+    let mut selected_id = None;
+    ui.horizontal(|ui| {
+        let controls_width = 54.0;
+        let button_width = (ui.available_width() - controls_width).max(80.0);
+        let button = egui::Button::new(workflow_ui::step_row_text(
+            step,
+            index,
+            selected,
+            template_options,
+            profile_scan_interval,
+        ))
+        .fill(if selected {
+            theme::blue().gamma_multiply(0.12)
+        } else {
+            Color32::TRANSPARENT
+        })
+        .stroke(if selected {
+            Stroke::new(1.5, theme::blue())
+        } else {
+            Stroke::NONE
+        })
+        .min_size(Vec2::new(button_width, 52.0));
+        if ui.add(button).clicked() {
+            selected_id = Some(step.id);
+        }
+        ui.menu_button(RichText::new("操作").size(11.0), |ui| {
+            if ui
+                .add_enabled(index > 0, egui::Button::new("上移一步"))
+                .on_disabled_hover_text("已经是第一个步骤")
+                .clicked()
+            {
+                *command = Some(StepListCommand::MoveUp(index));
+                ui.close();
+            }
+            if ui
+                .add_enabled(index + 1 < total_steps, egui::Button::new("下移一步"))
+                .on_disabled_hover_text("已经是最后一个步骤")
+                .clicked()
+            {
+                *command = Some(StepListCommand::MoveDown(index));
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .button(if step.enabled {
+                    "停用此步骤"
+                } else {
+                    "启用此步骤"
+                })
+                .clicked()
+            {
+                *command = Some(StepListCommand::ToggleEnabled(index));
+                ui.close();
+            }
+            if ui.button("复制步骤").clicked() {
+                *command = Some(StepListCommand::Duplicate(index));
+                ui.close();
+            }
+            ui.separator();
+            if ui.add(theme::small_danger_button("删除步骤")).clicked() {
+                *command = Some(StepListCommand::Delete(index));
+                ui.close();
+            }
+        });
+    });
+    selected_id
+}
+
 #[derive(Debug, Clone, Copy)]
 enum BranchListCommand {
     MoveUp(usize),
@@ -4603,14 +4805,19 @@ fn render_step_editor_5stages(
                         ));
                     }
                     if ui
-                        .add_enabled(selected_id.is_some(), egui::Button::new("更新共享原图"))
-                        .on_hover_text("保留模板路径并更新所有引用它的步骤，请谨慎使用")
+                        .add_enabled(
+                            selected_id.is_some(),
+                            theme::small_danger_button("危险：更新共享原图"),
+                        )
+                        .on_hover_text("会更新所有引用此模板的位置；只改当前步骤请使用截图替换此处")
+                        .on_disabled_hover_text("请先选择图片模板")
                         .clicked()
                     {
                         *workflow_action = selected_id.map(WorkflowTemplateAction::Replace);
                     }
                     if ui
                         .add_enabled(selected_id.is_some(), egui::Button::new("测试识别"))
+                        .on_disabled_hover_text("请先选择图片模板")
                         .clicked()
                         && let Some(template_id) = selected_id
                     {
@@ -5216,7 +5423,12 @@ fn visual_condition_editor(
                         ));
                     }
                     if ui
-                        .add_enabled(term_tid.is_some(), egui::Button::new("更新共享原图"))
+                        .add_enabled(
+                            term_tid.is_some(),
+                            theme::small_danger_button("危险：更新共享原图"),
+                        )
+                        .on_hover_text("会影响此模板的所有引用；只改这里请使用截图替换此处")
+                        .on_disabled_hover_text("请先选择图片模板")
                         .clicked()
                     {
                         *workflow_action = term_tid.map(WorkflowTemplateAction::Replace);
@@ -5523,7 +5735,12 @@ fn edit_workflow_branch(
             ));
         }
         if ui
-            .add_enabled(trigger_id.is_some(), egui::Button::new("更新共享原图"))
+            .add_enabled(
+                trigger_id.is_some(),
+                theme::small_danger_button("危险：更新共享原图"),
+            )
+            .on_hover_text("会影响此模板的所有引用；只改这里请使用截图替换此处")
+            .on_disabled_hover_text("请先选择图片模板")
             .clicked()
         {
             *workflow_action = trigger_id.map(WorkflowTemplateAction::Replace);
@@ -5725,7 +5942,12 @@ fn edit_workflow_branch(
                             ));
                         }
                         if ui
-                            .add_enabled(act_tid.is_some(), egui::Button::new("更新共享原图"))
+                            .add_enabled(
+                                act_tid.is_some(),
+                                theme::small_danger_button("危险：更新共享原图"),
+                            )
+                            .on_hover_text("会影响此模板的所有引用；只改这里请使用截图替换此处")
+                            .on_disabled_hover_text("请先选择图片模板")
                             .clicked()
                         {
                             *workflow_action = act_tid.map(WorkflowTemplateAction::Replace);
