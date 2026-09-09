@@ -19,9 +19,9 @@ pub struct Palette {
     pub red: Color32,
 }
 
-// A quiet night-academy palette: teal carries interactive state, while gold
-// is reserved for hierarchy and decorative accents. Both themes keep WCAG-like
-// contrast rather than placing text directly on decorative artwork.
+// A restrained game-themed palette: teal carries interactive state, while
+// gold is reserved for hierarchy and decorative accents. Both themes keep
+// WCAG-like contrast rather than placing text on decorative elements.
 const LIGHT: Palette = Palette {
     background: Color32::from_rgb(239, 238, 233),
     surface: Color32::from_rgb(253, 252, 248),
@@ -114,9 +114,9 @@ pub fn red() -> Color32 {
     palette().red
 }
 
-/// Paints a very low-contrast observatory motif behind opaque content cards.
-/// The geometry is original and intentionally subtle so it never competes
-/// with labels, controls, or recognition previews.
+/// Paints a very low-contrast circular and constellation ornament behind
+/// opaque content cards. It stays subtle so it never competes with labels,
+/// controls, or recognition previews.
 pub fn paint_background(painter: &egui::Painter, rect: egui::Rect) {
     let center = rect.right_top() + egui::vec2(-42.0, 38.0);
     let gold = gold().gamma_multiply(0.055);
@@ -381,7 +381,7 @@ mod tests {
         ctx.fonts_mut(|fonts| {
             assert!(fonts.has_glyphs(
                 &font_id,
-                "流程工作台 识别目标 搜索范围 点击动作 等待策略 运行前检查"
+                "守密人行动终端 准备执行视觉流程 工作台 识别目标 搜索范围 点击动作 等待策略 运行前检查"
             ));
         });
     }

@@ -2,7 +2,7 @@
 
 `.m5771pack` 是 Make 5771 Great Again 的单文件流程分享格式。普通用户应在软件的“流程”或“设置”页使用“导出分享包”，然后直接分享生成的文件。
 
-v0.4.7 仅更新视觉主题与内嵌装饰资源；`format_version` 仍为 1，字段、序列化语义和旧分享包兼容规则均未改变。
+v0.4.8 仅调整视觉主题资源并保留 Windows 中文字体修复；`format_version` 仍为 1，字段、序列化语义和旧分享包兼容规则均未改变。
 
 ## 包含内容
 
@@ -19,7 +19,7 @@ v0.4.7 仅更新视觉主题与内嵌装饰资源；`format_version` 仍为 1，
 {
   "format": "make5771.workflow-package",
   "format_version": 1,
-  "app_version": "0.4.7",
+  "app_version": "0.4.8",
   "created_at": "RFC 3339 timestamp",
   "profile": {},
   "assets": [

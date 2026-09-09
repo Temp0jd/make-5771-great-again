@@ -1972,7 +1972,7 @@ impl Make5771App {
             ui.painter().text(
                 drag_rect.left_bottom() + Vec2::new(42.0, -1.0),
                 egui::Align2::LEFT_BOTTOM,
-                "Night Observatory · Visual Workflow Terminal",
+                "Mythag University · Keeper's Terminal",
                 egui::FontId::proportional(11.0),
                 theme::tertiary_label(),
             );
@@ -2038,66 +2038,38 @@ impl Make5771App {
     }
 
     fn run_hero(&self, ui: &mut egui::Ui) {
-        let size = Vec2::new(ui.available_width(), 156.0);
-        let image_size = self.mascots.banner.size_vec2();
-        let container_ratio = size.x / size.y;
-        let image_ratio = image_size.x / image_size.y;
-        let uv = if container_ratio > image_ratio {
-            let visible_height = (image_ratio / container_ratio).clamp(0.0, 1.0);
-            let top = (1.0 - visible_height) * 0.5;
-            egui::Rect::from_min_max(egui::pos2(0.0, top), egui::pos2(1.0, top + visible_height))
-        } else {
-            let visible_width = (container_ratio / image_ratio).clamp(0.0, 1.0);
-            let left = (1.0 - visible_width) * 0.5;
-            egui::Rect::from_min_max(egui::pos2(left, 0.0), egui::pos2(left + visible_width, 1.0))
-        };
-        let response = ui.add(
-            egui::Image::new(&self.mascots.banner)
-                .fit_to_exact_size(size)
-                .uv(uv)
-                .corner_radius(16.0),
-        );
-        let rect = response.rect;
-        ui.painter()
-            .rect_filled(rect, 16.0, Color32::from_black_alpha(126));
-        ui.painter().rect_stroke(
-            rect,
-            16.0,
-            Stroke::new(1.0, theme::gold().gamma_multiply(0.65)),
-            egui::StrokeKind::Inside,
-        );
-        let text_origin = rect.left_center() + Vec2::new(26.0, -18.0);
-        ui.painter().text(
-            text_origin,
-            egui::Align2::LEFT_CENTER,
-            "夜间观测台",
-            egui::FontId::proportional(13.0),
-            Color32::from_rgb(202, 164, 91),
-        );
-        ui.painter().text(
-            text_origin + Vec2::new(0.0, 30.0),
-            egui::Align2::LEFT_CENTER,
-            "准备执行视觉流程",
-            egui::FontId::proportional(26.0),
-            Color32::WHITE,
-        );
-        ui.painter().text(
-            text_origin + Vec2::new(0.0, 58.0),
-            egui::Align2::LEFT_CENTER,
-            &self.profile.name,
-            egui::FontId::proportional(12.0),
-            Color32::from_rgb(199, 210, 218),
-        );
-        ui.put(
-            egui::Rect::from_center_size(
-                rect.right_center() - Vec2::new(58.0, 0.0),
-                Vec2::splat(86.0),
-            ),
-            egui::Image::new(&self.mascots.owl)
-                .fit_to_exact_size(Vec2::splat(86.0))
-                .corner_radius(14.0)
-                .tint(Color32::from_white_alpha(224)),
-        );
+        egui::Frame::new()
+            .fill(theme::surface_muted())
+            .stroke(Stroke::new(1.0, theme::gold().gamma_multiply(0.52)))
+            .corner_radius(16.0)
+            .inner_margin(egui::Margin::symmetric(24, 14))
+            .show(ui, |ui| {
+                ui.set_min_height(104.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("守密人行动终端")
+                                .size(12.0)
+                                .color(theme::gold()),
+                        );
+                        ui.add_space(3.0);
+                        ui.label(RichText::new("准备执行视觉流程").size(25.0).strong());
+                        ui.add_space(5.0);
+                        ui.label(
+                            RichText::new(&self.profile.name)
+                                .size(12.0)
+                                .color(theme::secondary_label()),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add(
+                            egui::Image::new(&self.mascots.ramona_point)
+                                .fit_to_exact_size(Vec2::splat(104.0)),
+                        );
+                    });
+                });
+            });
     }
 
     fn run_page(&mut self, ui: &mut egui::Ui) {
@@ -3302,17 +3274,10 @@ impl Make5771App {
             if self.logs.is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(110.0);
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::Image::new(&self.mascots.keeper_me)
-                                .fit_to_exact_size(Vec2::splat(96.0)),
-                        );
-                        ui.add(
-                            egui::Image::new(&self.mascots.moth)
-                                .fit_to_exact_size(Vec2::splat(72.0))
-                                .corner_radius(12.0),
-                        );
-                    });
+                    ui.add(
+                        egui::Image::new(&self.mascots.keeper_me)
+                            .fit_to_exact_size(Vec2::splat(96.0)),
+                    );
                     ui.add_space(6.0);
                     ui.label(RichText::new("还没有日志").size(18.0).strong());
                     ui.label(

@@ -1,18 +1,12 @@
 use eframe::egui;
 
-/// Decorative artwork embedded into the binary.
-///
-/// This keeps the project’s existing fan-use emoji set and adds original
-/// night-observatory artwork from `assets/ui/`. See README copyright notes.
+/// Chibi Morimens emoji embedded into the binary for UI decoration.
 ///
 /// These are official 《忘却前夜》(Morimens) battle emojis, sourced from the
 /// community wiki mirror for personal fan use only — do not redistribute
 /// commercially. Replace or remove the `assets/emoji/` files if the project
 /// is ever published beyond personal use.
 pub struct Mascots {
-    pub banner: egui::TextureHandle,
-    pub owl: egui::TextureHandle,
-    pub moth: egui::TextureHandle,
     pub keeper_hi: egui::TextureHandle,
     pub ramona_point: egui::TextureHandle,
     pub erika_ok: egui::TextureHandle,
@@ -33,18 +27,6 @@ pub struct Mascots {
 }
 
 const ENTRIES: &[(&str, &[u8])] = &[
-    (
-        "night-observatory-banner",
-        include_bytes!("../assets/ui/night-observatory-banner.jpg"),
-    ),
-    (
-        "observatory-owl",
-        include_bytes!("../assets/ui/observatory-owl.jpg"),
-    ),
-    (
-        "archive-moth",
-        include_bytes!("../assets/ui/archive-moth.jpg"),
-    ),
     ("keeper-hi", include_bytes!("../assets/emoji/keeper-hi.png")),
     (
         "ramona-point",
@@ -114,9 +96,6 @@ impl Mascots {
         }
         let mut take = |name: &str| textures.remove(name).expect("表情纹理缺失");
         Self {
-            banner: take("night-observatory-banner"),
-            owl: take("observatory-owl"),
-            moth: take("archive-moth"),
             keeper_hi: take("keeper-hi"),
             ramona_point: take("ramona-point"),
             erika_ok: take("erika-ok"),
@@ -157,20 +136,9 @@ fn decode(name: &str, bytes: &[u8]) -> image::DynamicImage {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn embedded_artwork_decodes_with_enabled_image_formats() {
+    fn embedded_emojis_decode_with_enabled_image_formats() {
         for (name, bytes) in super::ENTRIES {
             super::decode(name, bytes);
         }
-    }
-
-    #[test]
-    fn original_ui_artwork_stays_bounded() {
-        let original = &super::ENTRIES[..3];
-        let expected = [(1200, 509), (384, 384), (384, 384)];
-        for ((name, bytes), expected_size) in original.iter().zip(expected) {
-            let image = super::decode(name, bytes);
-            assert_eq!((image.width(), image.height()), expected_size);
-        }
-        assert!(original.iter().map(|(_, bytes)| bytes.len()).sum::<usize>() < 160 * 1024);
     }
 }
