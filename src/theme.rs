@@ -12,40 +12,46 @@ pub struct Palette {
     pub tertiary_label: Color32,
     pub separator: Color32,
     pub blue: Color32,
+    pub gold: Color32,
     pub green: Color32,
     pub orange: Color32,
     pub purple: Color32,
     pub red: Color32,
 }
 
+// A quiet night-academy palette: teal carries interactive state, while gold
+// is reserved for hierarchy and decorative accents. Both themes keep WCAG-like
+// contrast rather than placing text directly on decorative artwork.
 const LIGHT: Palette = Palette {
-    background: Color32::from_rgb(242, 242, 247),
-    surface: Color32::from_rgb(255, 255, 255),
-    surface_muted: Color32::from_rgb(248, 248, 250),
-    label: Color32::from_rgb(28, 28, 30),
-    secondary_label: Color32::from_rgb(99, 99, 102),
-    tertiary_label: Color32::from_rgb(142, 142, 147),
-    separator: Color32::from_rgb(225, 225, 230),
-    blue: Color32::from_rgb(0, 122, 255),
-    green: Color32::from_rgb(52, 199, 89),
-    orange: Color32::from_rgb(255, 149, 0),
-    purple: Color32::from_rgb(175, 82, 222),
-    red: Color32::from_rgb(255, 59, 48),
+    background: Color32::from_rgb(239, 238, 233),
+    surface: Color32::from_rgb(253, 252, 248),
+    surface_muted: Color32::from_rgb(246, 244, 238),
+    label: Color32::from_rgb(31, 35, 43),
+    secondary_label: Color32::from_rgb(91, 98, 108),
+    tertiary_label: Color32::from_rgb(128, 133, 140),
+    separator: Color32::from_rgb(217, 211, 198),
+    blue: Color32::from_rgb(31, 126, 126),
+    gold: Color32::from_rgb(162, 119, 48),
+    green: Color32::from_rgb(42, 145, 92),
+    orange: Color32::from_rgb(190, 112, 34),
+    purple: Color32::from_rgb(99, 83, 146),
+    red: Color32::from_rgb(191, 64, 62),
 };
 
 const DARK: Palette = Palette {
-    background: Color32::from_rgb(24, 24, 27),
-    surface: Color32::from_rgb(38, 38, 42),
-    surface_muted: Color32::from_rgb(30, 30, 34),
-    label: Color32::from_rgb(242, 242, 247),
-    secondary_label: Color32::from_rgb(174, 174, 178),
-    tertiary_label: Color32::from_rgb(110, 110, 115),
-    separator: Color32::from_rgb(58, 58, 62),
-    blue: Color32::from_rgb(10, 132, 255),
-    green: Color32::from_rgb(48, 209, 88),
-    orange: Color32::from_rgb(255, 159, 10),
-    purple: Color32::from_rgb(191, 90, 242),
-    red: Color32::from_rgb(255, 69, 58),
+    background: Color32::from_rgb(11, 15, 26),
+    surface: Color32::from_rgb(20, 26, 40),
+    surface_muted: Color32::from_rgb(16, 21, 34),
+    label: Color32::from_rgb(238, 240, 244),
+    secondary_label: Color32::from_rgb(172, 180, 194),
+    tertiary_label: Color32::from_rgb(111, 122, 142),
+    separator: Color32::from_rgb(45, 55, 74),
+    blue: Color32::from_rgb(36, 130, 130),
+    gold: Color32::from_rgb(202, 164, 91),
+    green: Color32::from_rgb(66, 184, 120),
+    orange: Color32::from_rgb(220, 145, 67),
+    purple: Color32::from_rgb(139, 119, 190),
+    red: Color32::from_rgb(224, 91, 88),
 };
 
 thread_local! {
@@ -88,6 +94,10 @@ pub fn blue() -> Color32 {
     palette().blue
 }
 
+pub fn gold() -> Color32 {
+    palette().gold
+}
+
 pub fn green() -> Color32 {
     palette().green
 }
@@ -102,6 +112,50 @@ pub fn purple() -> Color32 {
 
 pub fn red() -> Color32 {
     palette().red
+}
+
+/// Paints a very low-contrast observatory motif behind opaque content cards.
+/// The geometry is original and intentionally subtle so it never competes
+/// with labels, controls, or recognition previews.
+pub fn paint_background(painter: &egui::Painter, rect: egui::Rect) {
+    let center = rect.right_top() + egui::vec2(-42.0, 38.0);
+    let gold = gold().gamma_multiply(0.055);
+    let teal = blue().gamma_multiply(0.045);
+    for radius in [54.0, 88.0, 128.0] {
+        painter.circle_stroke(center, radius, Stroke::new(1.0, gold));
+    }
+    painter.line_segment(
+        [
+            center + egui::vec2(-128.0, 0.0),
+            center + egui::vec2(128.0, 0.0),
+        ],
+        Stroke::new(1.0, gold),
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(0.0, -128.0),
+            center + egui::vec2(0.0, 128.0),
+        ],
+        Stroke::new(1.0, gold),
+    );
+
+    let origin = rect.left_bottom() + egui::vec2(28.0, -22.0);
+    let stars = [
+        egui::vec2(0.0, 0.0),
+        egui::vec2(46.0, -24.0),
+        egui::vec2(91.0, -8.0),
+        egui::vec2(132.0, -54.0),
+        egui::vec2(181.0, -39.0),
+    ];
+    for segment in stars.windows(2) {
+        painter.line_segment(
+            [origin + segment[0], origin + segment[1]],
+            Stroke::new(1.0, teal),
+        );
+    }
+    for point in stars {
+        painter.circle_filled(origin + point, 2.0, teal);
+    }
 }
 
 pub fn install(ctx: &egui::Context, dark: bool) {
@@ -140,15 +194,15 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     style.visuals.widgets.inactive.bg_fill = palette.surface_muted;
     style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, palette.separator);
     style.visuals.widgets.hovered.bg_fill = if dark {
-        Color32::from_rgb(46, 50, 58)
+        Color32::from_rgb(28, 42, 55)
     } else {
-        Color32::from_rgb(238, 244, 252)
+        Color32::from_rgb(233, 243, 239)
     };
     style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.blue.gamma_multiply(0.55));
     style.visuals.widgets.active.bg_fill = if dark {
-        Color32::from_rgb(30, 58, 88)
+        Color32::from_rgb(25, 61, 66)
     } else {
-        Color32::from_rgb(224, 237, 252)
+        Color32::from_rgb(219, 237, 232)
     };
     style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, palette.blue);
     style.visuals.widgets.open.bg_fill = palette.surface;
@@ -169,8 +223,17 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
 }
 
 fn install_system_font(ctx: &egui::Context) {
-    // Windows installations differ by language pack. Load one CJK-capable UI
-    // font and a symbol fallback instead of assuming Microsoft YaHei exists.
+    // Bundle a small OFL-licensed Noto Sans CJK subset containing every glyph
+    // used by the application. This prevents tofu boxes on Windows systems
+    // without a Chinese language pack. System faces remain later fallbacks for
+    // user-entered names containing glyphs outside the bundled subset.
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "embedded-cjk-ui".to_owned(),
+        FontData::from_static(include_bytes!("../assets/fonts/NotoSansCJKsc-UI.otf")).into(),
+    );
+    let mut loaded_names = vec!["embedded-cjk-ui".to_owned()];
+
     let font_groups: [(&str, &[&str]); 2] = [
         (
             "system-ui",
@@ -197,8 +260,6 @@ fn install_system_font(ctx: &egui::Context) {
         ),
     ];
 
-    let mut fonts = FontDefinitions::default();
-    let mut loaded_names = Vec::new();
     for (name, candidates) in font_groups {
         if let Some(bytes) = candidates.iter().find_map(|path| std::fs::read(path).ok()) {
             fonts
@@ -206,9 +267,6 @@ fn install_system_font(ctx: &egui::Context) {
                 .insert(name.to_owned(), FontData::from_owned(bytes).into());
             loaded_names.push(name.to_owned());
         }
-    }
-    if loaded_names.is_empty() {
-        return;
     }
     let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
     for (index, name) in loaded_names.iter().enumerate() {
@@ -272,4 +330,59 @@ pub fn section_card() -> egui::Frame {
         .stroke(Stroke::new(1.0, separator()))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(egui::Margin::symmetric(12, 10))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DARK, LIGHT, Palette};
+    use eframe::egui::Color32;
+
+    fn relative_luminance(color: Color32) -> f32 {
+        let linear = |channel: u8| {
+            let value = f32::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    }
+
+    fn contrast(first: Color32, second: Color32) -> f32 {
+        let first = relative_luminance(first);
+        let second = relative_luminance(second);
+        let (lighter, darker) = if first >= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn assert_readable(palette: Palette) {
+        assert!(contrast(palette.label, palette.surface) >= 7.0);
+        assert!(contrast(palette.secondary_label, palette.surface) >= 4.5);
+        assert!(contrast(Color32::WHITE, palette.blue) >= 4.5);
+    }
+
+    #[test]
+    fn themed_palettes_keep_primary_text_and_actions_readable() {
+        assert_readable(LIGHT);
+        assert_readable(DARK);
+    }
+
+    #[test]
+    fn embedded_font_covers_core_chinese_ui_labels() {
+        let ctx = eframe::egui::Context::default();
+        super::install_system_font(&ctx);
+        let _ = ctx.run_ui(eframe::egui::RawInput::default(), |_| {});
+        let font_id = eframe::egui::FontId::proportional(14.0);
+        ctx.fonts_mut(|fonts| {
+            assert!(fonts.has_glyphs(
+                &font_id,
+                "流程工作台 识别目标 搜索范围 点击动作 等待策略 运行前检查"
+            ));
+        });
+    }
 }
