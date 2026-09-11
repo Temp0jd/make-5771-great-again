@@ -540,6 +540,8 @@ impl RunnerStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepKind {
+    CallSubflow,
+    PrioritySelect,
     WaitAndClick,
     WaitAny,
     VisualCondition,
@@ -898,6 +900,8 @@ impl StepKind {
             Self::WaitAndClick => "等待并点击",
             Self::WaitAny => "等待任一目标",
             Self::VisualCondition => "视觉条件",
+            Self::CallSubflow => "调用子流程",
+            Self::PrioritySelect => "物品 / Buff 选择",
             Self::Branch => "条件分支",
             Self::Delay => "固定等待",
             Self::SendKeys => "键盘输入",
@@ -908,6 +912,10 @@ impl StepKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStep {
+    #[serde(default)]
+    pub subflow_id: Option<u64>,
+    #[serde(default)]
+    pub priority: crate::subflow::PriorityChoice,
     pub id: u64,
     pub name: String,
     pub kind: StepKind,
@@ -950,8 +958,47 @@ pub struct WorkflowStep {
 }
 
 impl WorkflowStep {
+    pub fn template_paths(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.template)
+            .chain(std::iter::once(&self.priority.stage_template))
+            .chain(self.priority.rules.iter().map(|rule| &rule.template))
+            .chain(self.branches.iter().flat_map(|branch| {
+                std::iter::once(&branch.trigger_template)
+                    .chain(branch.actions.iter().map(|action| &action.template))
+            }))
+            .chain(
+                self.visual_condition
+                    .terms
+                    .iter()
+                    .map(|term| &term.template),
+            )
+            .filter_map(Option::as_ref)
+    }
+    pub fn template_paths_mut(&mut self) -> impl Iterator<Item = &mut Option<String>> {
+        std::iter::once(&mut self.template)
+            .chain(std::iter::once(&mut self.priority.stage_template))
+            .chain(
+                self.priority
+                    .rules
+                    .iter_mut()
+                    .map(|rule| &mut rule.template),
+            )
+            .chain(self.branches.iter_mut().flat_map(|branch| {
+                std::iter::once(&mut branch.trigger_template)
+                    .chain(branch.actions.iter_mut().map(|action| &mut action.template))
+            }))
+            .chain(
+                self.visual_condition
+                    .terms
+                    .iter_mut()
+                    .map(|term| &mut term.template),
+            )
+    }
+
     pub fn new(id: u64, name: impl Into<String>, kind: StepKind, indent: u8) -> Self {
         Self {
+            subflow_id: None,
+            priority: Default::default(),
             id,
             name: name.into(),
             kind,
@@ -1048,6 +1095,8 @@ pub struct MacroProfile {
     pub deadline: String,
     pub finish_current_round: bool,
     pub steps: Vec<WorkflowStep>,
+    #[serde(default)]
+    pub subflows: Vec<crate::subflow::Subflow>,
     pub templates: Vec<TemplateAsset>,
     #[serde(default)]
     pub click_method: ClickMethod,
@@ -1119,6 +1168,7 @@ impl Default for MacroProfile {
             loop_count: 20,
             deadline: "23:30".to_owned(),
             finish_current_round: true,
+            subflows: Vec::new(),
             steps: vec![
                 WorkflowStep::new(1, "开始游戏", StepKind::WaitAndClick, 0),
                 WorkflowStep::new(2, "开启 Auto", StepKind::WaitAndClick, 0),
@@ -1145,6 +1195,41 @@ impl Default for MacroProfile {
 }
 
 impl MacroProfile {
+    pub fn all_steps(&self) -> impl Iterator<Item = &WorkflowStep> {
+        self.steps
+            .iter()
+            .chain(self.subflows.iter().flat_map(|flow| flow.steps.iter()))
+    }
+    pub fn all_steps_mut(&mut self) -> impl Iterator<Item = &mut WorkflowStep> {
+        self.steps.iter_mut().chain(
+            self.subflows
+                .iter_mut()
+                .flat_map(|flow| flow.steps.iter_mut()),
+        )
+    }
+    /// Only called definitions participate in execution preflight; unused drafts may remain incomplete.
+    pub fn execution_steps(&self) -> impl Iterator<Item = &WorkflowStep> {
+        self.steps.iter().filter(|step| step.enabled).chain(
+            self.subflows
+                .iter()
+                .filter(|flow| {
+                    self.steps.iter().any(|step| {
+                        step.enabled
+                            && step.kind == StepKind::CallSubflow
+                            && step.subflow_id == Some(flow.id)
+                    })
+                })
+                .flat_map(|flow| flow.steps.iter().filter(|step| step.enabled)),
+        )
+    }
+    pub fn next_step_id(&self) -> u64 {
+        self.all_steps()
+            .map(|step| step.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut issues = Vec::new();
 
@@ -1190,10 +1275,83 @@ impl MacroProfile {
             }
         }
 
+        if self.subflows.len() > 100 || self.all_steps().count() > 1000 {
+            issues.push("主流程与子流程合计不能超过 1000 步，子流程不能超过 100 个".to_owned());
+        }
+        let mut subflow_ids = std::collections::HashSet::new();
+        for flow in &self.subflows {
+            if !subflow_ids.insert(flow.id) || flow.name.trim().is_empty() {
+                issues.push("子流程名称不能为空且 ID 不能重复".to_owned());
+            }
+            for step in &flow.steps {
+                if matches!(step.kind, StepKind::CallSubflow | StepKind::RoundEnd)
+                    || (step.kind == StepKind::VisualCondition
+                        && matches!(
+                            step.visual_condition.outcome,
+                            ConditionOutcome::CompleteRound | ConditionOutcome::StopTask
+                        ))
+                    || (step.kind == StepKind::WaitAny
+                        && step.branches.iter().any(|b| {
+                            matches!(
+                                b.outcome,
+                                BranchOutcome::CompleteRound | BranchOutcome::StopTask
+                            )
+                        }))
+                {
+                    issues.push(format!(
+                        "子流程“{}”不能嵌套调用、结束本局或停止主流程",
+                        flow.name
+                    ));
+                }
+            }
+        }
+
         let mut ids = std::collections::HashSet::new();
-        for step in &self.steps {
+        for step in self.all_steps() {
             if !ids.insert(step.id) {
                 issues.push(format!("步骤 ID {} 重复", step.id));
+            }
+            if step.kind == StepKind::CallSubflow
+                && step.subflow_id.is_some_and(|id| !subflow_ids.contains(&id))
+            {
+                issues.push(format!("步骤“{}”引用的子流程不存在", step.name));
+            }
+            if step.priority.rules.len() > 100 || step.priority.slots.len() > 20 {
+                issues.push(format!(
+                    "步骤“{}”最多配置 100 条选择规则、20 个候选区域",
+                    step.name
+                ));
+            }
+            let mut rule_ids = std::collections::HashSet::new();
+            for rule in &step.priority.rules {
+                if !rule_ids.insert(rule.id) || rule.name.trim().is_empty() {
+                    issues.push(format!("步骤“{}”的选择规则名称为空或 ID 重复", step.name));
+                }
+            }
+            let mut slot_ids = std::collections::HashSet::new();
+            for slot in &step.priority.slots {
+                let r = slot.region;
+                if !slot_ids.insert(slot.id)
+                    || slot.name.trim().is_empty()
+                    || r.width == 0
+                    || r.height == 0
+                    || r.x.saturating_add(r.width) > self.expected_client_width
+                    || r.y.saturating_add(r.height) > self.expected_client_height
+                {
+                    issues.push(format!("步骤“{}”的候选区域无效或 ID 重复", step.name));
+                }
+            }
+            for (i, slot) in step.priority.slots.iter().enumerate() {
+                for other in step.priority.slots.iter().skip(i + 1) {
+                    let (a, b) = (slot.region, other.region);
+                    if a.x < b.x.saturating_add(b.width)
+                        && b.x < a.x.saturating_add(a.width)
+                        && a.y < b.y.saturating_add(b.height)
+                        && b.y < a.y.saturating_add(a.height)
+                    {
+                        issues.push(format!("步骤“{}”的候选区域不能重叠", step.name));
+                    }
+                }
             }
             if step.name.trim().is_empty() {
                 issues.push(format!("步骤 {} 的名称不能为空", step.id));
@@ -1400,6 +1558,92 @@ pub enum LogLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_profiles_default_to_no_subflows() {
+        let mut json = serde_json::to_value(MacroProfile::default()).unwrap();
+        json.as_object_mut().unwrap().remove("subflows");
+        let restored: MacroProfile = serde_json::from_value(json).unwrap();
+        assert!(restored.subflows.is_empty());
+        assert_eq!(restored.steps[0].subflow_id, None);
+        assert!(!restored.steps[0].priority.random_unknown);
+    }
+
+    #[test]
+    fn subflows_reject_nesting_missing_calls_and_global_id_collisions() {
+        let mut profile = MacroProfile::default();
+        let child_id = profile.next_step_id();
+        profile.subflows.push(crate::subflow::Subflow {
+            id: 1,
+            name: "商店".to_owned(),
+            steps: vec![WorkflowStep::new(child_id, "等待", StepKind::Delay, 0)],
+        });
+        assert!(profile.validate().is_ok());
+        profile.subflows[0].steps[0].kind = StepKind::CallSubflow;
+        profile.subflows[0].steps[0].subflow_id = Some(1);
+        assert!(
+            profile
+                .validate()
+                .unwrap_err()
+                .iter()
+                .any(|s| s.contains("嵌套"))
+        );
+        profile.subflows[0].steps[0].kind = StepKind::Delay;
+        profile.subflows[0].steps[0].id = profile.steps[0].id;
+        assert!(
+            profile
+                .validate()
+                .unwrap_err()
+                .iter()
+                .any(|s| s.contains("重复"))
+        );
+        profile.subflows.clear();
+        profile.steps[0].kind = StepKind::CallSubflow;
+        profile.steps[0].subflow_id = Some(99);
+        assert!(
+            profile
+                .validate()
+                .unwrap_err()
+                .iter()
+                .any(|s| s.contains("不存在"))
+        );
+    }
+
+    #[test]
+    fn priority_slots_reject_overlap_and_out_of_frame() {
+        let mut profile = MacroProfile::default();
+        let slot = crate::subflow::ChoiceSlot {
+            id: 1,
+            name: "卡片".to_owned(),
+            region: SearchRegionSpec {
+                x: 10,
+                y: 10,
+                width: 100,
+                height: 100,
+            },
+        };
+        profile.steps[0].priority.slots = vec![slot.clone()];
+        assert!(profile.validate().is_ok());
+        let mut other = slot;
+        other.id = 2;
+        profile.steps[0].priority.slots.push(other);
+        assert!(
+            profile
+                .validate()
+                .unwrap_err()
+                .iter()
+                .any(|s| s.contains("重叠"))
+        );
+        profile.steps[0].priority.slots.truncate(1);
+        profile.steps[0].priority.slots[0].region.width = u32::MAX;
+        assert!(
+            profile
+                .validate()
+                .unwrap_err()
+                .iter()
+                .any(|s| s.contains("候选区域无效"))
+        );
+    }
 
     #[test]
     fn relative_click_scales_and_clamps_to_client() {

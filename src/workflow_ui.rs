@@ -65,6 +65,8 @@ impl SaveTracker {
 
 pub fn step_kind_chip(kind: StepKind) -> (&'static str, Color32) {
     match kind {
+        StepKind::CallSubflow => ("调用", theme::purple()),
+        StepKind::PrioritySelect => ("选择", theme::orange()),
         StepKind::WaitAndClick => ("点击", theme::blue()),
         StepKind::WaitAny => ("任一", theme::orange()),
         StepKind::VisualCondition => ("条件", theme::green()),
@@ -103,6 +105,20 @@ pub fn step_summary(step: &WorkflowStep, templates: &[(u64, String, String)]) ->
             .unwrap_or_else(|| "未选择模板".to_owned())
     };
     let mut summary = match step.kind {
+        StepKind::CallSubflow => step
+            .subflow_id
+            .map(|id| format!("调用子流程 #{id}，完成后返回"))
+            .unwrap_or_else(|| "未选择子流程".to_owned()),
+        StepKind::PrioritySelect => format!(
+            "{} 个候选区域，{} 条规则，未知随机：{}",
+            step.priority.slots.len(),
+            step.priority.rules.len(),
+            if step.priority.random_unknown {
+                "开启"
+            } else {
+                "关闭"
+            }
+        ),
         StepKind::WaitAndClick => format!(
             "{}，{}，{}，超时 {}s{}",
             template_name(&step.template),
@@ -249,6 +265,28 @@ pub fn step_warning(
         return None;
     }
     match step.kind {
+        StepKind::CallSubflow => {
+            if step.subflow_id.is_none() {
+                return Some("未选择子流程".to_owned());
+            }
+        }
+        StepKind::PrioritySelect => {
+            if step.priority.stage_template.is_none() || step.priority.slots.is_empty() {
+                return Some("请设置阶段标志和候选区域".to_owned());
+            }
+            if step
+                .priority
+                .rules
+                .iter()
+                .any(|rule| rule.template.is_none())
+            {
+                return Some("选择规则尚未绑定图片".to_owned());
+            }
+            if step.priority.random_unknown {
+                return Some("未知随机已开启，无法保证排除未识别的禁选项".to_owned());
+            }
+        }
+
         StepKind::WaitAndClick => {
             if step.template.is_none() {
                 return Some("未选择模板图片".to_owned());
@@ -470,7 +508,7 @@ impl WorkflowPreflightReport {
                 step_id,
                 recommended_secs,
             } => {
-                if let Some(step) = profile.steps.iter_mut().find(|s| s.id == step_id) {
+                if let Some(step) = profile.all_steps_mut().find(|s| s.id == step_id) {
                     let old_timeout = step.timeout_secs;
                     step.timeout_secs = recommended_secs;
                     Ok(format!(
@@ -526,7 +564,7 @@ pub fn evaluate_preflight(
     // 3. Executable profile validation via runner rules
     if let Err(runner_err) = crate::runner::validate_executable_profile(profile) {
         // Find which step caused it, if identifiable
-        let matched_step = profile.steps.iter().find(|step| {
+        let matched_step = profile.execution_steps().find(|step| {
             if !step.enabled {
                 return false;
             }
@@ -575,25 +613,8 @@ pub fn evaluate_preflight(
     // 4. File existence check
     if check_files {
         let mut referenced_paths = std::collections::HashSet::new();
-        for step in profile.steps.iter().filter(|s| s.enabled) {
-            if let Some(path) = &step.template {
-                referenced_paths.insert(path.clone());
-            }
-            for branch in &step.branches {
-                if let Some(path) = &branch.trigger_template {
-                    referenced_paths.insert(path.clone());
-                }
-                for action in &branch.actions {
-                    if let Some(path) = &action.template {
-                        referenced_paths.insert(path.clone());
-                    }
-                }
-            }
-            for term in &step.visual_condition.terms {
-                if let Some(path) = &term.template {
-                    referenced_paths.insert(path.clone());
-                }
-            }
+        for step in profile.execution_steps() {
+            referenced_paths.extend(step.template_paths().cloned());
         }
 
         for template in &profile.templates {
@@ -601,19 +622,8 @@ pub fn evaluate_preflight(
                 && !std::path::Path::new(&template.path).is_file()
             {
                 // Find a step referencing it for navigation
-                let referencing_step = profile.steps.iter().find(|s| {
-                    s.enabled
-                        && (s.template.as_deref() == Some(&template.path)
-                            || s.branches.iter().any(|b| {
-                                b.trigger_template.as_deref() == Some(&template.path)
-                                    || b.actions
-                                        .iter()
-                                        .any(|a| a.template.as_deref() == Some(&template.path))
-                            })
-                            || s.visual_condition
-                                .terms
-                                .iter()
-                                .any(|t| t.template.as_deref() == Some(&template.path)))
+                let referencing_step = profile.all_steps().find(|step| {
+                    step.enabled && step.template_paths().any(|path| path == &template.path)
                 });
 
                 let target = match referencing_step {
@@ -642,7 +652,7 @@ pub fn evaluate_preflight(
     }
 
     // 5. Per-step warnings & safe fixes
-    for step in profile.steps.iter().filter(|s| s.enabled) {
+    for step in profile.execution_steps() {
         if matches!(
             step.kind,
             StepKind::WaitAndClick | StepKind::WaitAny | StepKind::VisualCondition
@@ -673,6 +683,13 @@ pub fn evaluate_preflight(
         }
 
         match step.kind {
+            StepKind::PrioritySelect if step.priority.random_unknown => {
+                issues.push(PreflightIssue {
+                    severity: PreflightSeverity::Warning, title: "未知候选随机选择已开启".to_owned(),
+                    detail: format!("步骤“{}”：未识别的候选可能是禁选、空位或售罄，请确保配置区域当前都可选择。", step.name),
+                    target: PreflightTarget::Step { step_id: step.id, step_name: step.name.clone() }, safe_fix: None,
+                });
+            }
             StepKind::WaitAndClick => {
                 if !(0.75..=0.98).contains(&step.threshold) {
                     issues.push(PreflightIssue {

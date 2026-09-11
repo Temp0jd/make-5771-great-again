@@ -1,0 +1,230 @@
+{
+  "format": "make5771.workflow-package",
+  "format_version": 1,
+  "app_version": "0.7.0",
+  "created_at": "2026-09-11T00:00:00+08:00",
+  "profile": {
+    "name": "主流程与子流程框架（需配置截图）",
+    "target_window": "忘却前夜",
+    "expected_client_width": 1280,
+    "expected_client_height": 720,
+    "loop_mode": "Count",
+    "loop_count": 1,
+    "deadline": "23:30",
+    "finish_current_round": true,
+    "steps": [
+      {
+        "id": 1,
+        "name": "调用商店购买",
+        "kind": "CallSubflow",
+        "indent": 0,
+        "enabled": true,
+        "template": null,
+        "threshold": 0.9,
+        "timeout_secs": 60,
+        "delay_ms": 500,
+        "branches": [],
+        "subflow_id": 1
+      },
+      {
+        "id": 2,
+        "name": "调用 Buff 选择",
+        "kind": "CallSubflow",
+        "indent": 0,
+        "enabled": true,
+        "template": null,
+        "threshold": 0.9,
+        "timeout_secs": 60,
+        "delay_ms": 500,
+        "branches": [],
+        "subflow_id": 2
+      },
+      {
+        "id": 3,
+        "name": "本局结束",
+        "kind": "RoundEnd",
+        "indent": 0,
+        "enabled": true,
+        "template": null,
+        "threshold": 0.9,
+        "timeout_secs": 60,
+        "delay_ms": 500,
+        "branches": []
+      }
+    ],
+    "templates": [],
+    "sharing": {
+      "author": "Make 5771 Team",
+      "description": "用于创建社区流程包的起步骨架。导入后请自行截取开始、Auto 和结算画面。",
+      "game_version": "",
+      "game_language": "简体中文",
+      "tags": "Auto,起步模板"
+    },
+    "match_algorithm": "Hybrid",
+    "recognition_performance": "Balanced",
+    "adaptive_roi": true,
+    "template_scale_mode": "UniformFit",
+    "subflows": [
+      {
+        "id": 1,
+        "name": "商店购买",
+        "steps": [
+          {
+            "id": 100,
+            "name": "商店：按物品优先级选择",
+            "kind": "PrioritySelect",
+            "indent": 0,
+            "enabled": true,
+            "template": null,
+            "threshold": 0.9,
+            "timeout_secs": 60,
+            "delay_ms": 500,
+            "branches": [],
+            "priority": {
+              "stage_template": null,
+              "random_unknown": false,
+              "rules": [
+                {
+                  "id": 1,
+                  "name": "首选物品（请绑定模板）",
+                  "template": null,
+                  "policy": "Prefer"
+                },
+                {
+                  "id": 2,
+                  "name": "禁止购买物品（请绑定模板）",
+                  "template": null,
+                  "policy": "Forbid"
+                }
+              ],
+              "slots": [
+                {
+                  "id": 1,
+                  "name": "商品 1",
+                  "region": {
+                    "x": 160,
+                    "y": 180,
+                    "width": 240,
+                    "height": 300
+                  }
+                },
+                {
+                  "id": 2,
+                  "name": "商品 2",
+                  "region": {
+                    "x": 480,
+                    "y": 180,
+                    "width": 240,
+                    "height": 300
+                  }
+                },
+                {
+                  "id": 3,
+                  "name": "商品 3",
+                  "region": {
+                    "x": 800,
+                    "y": 180,
+                    "width": 240,
+                    "height": 300
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "id": 101,
+            "name": "确认购买（绑定确认按钮模板）",
+            "kind": "WaitAndClick",
+            "indent": 0,
+            "enabled": true,
+            "template": null,
+            "threshold": 0.9,
+            "timeout_secs": 60,
+            "delay_ms": 500,
+            "branches": []
+          },
+          {
+            "id": 102,
+            "name": "退出商店（绑定退出按钮模板）",
+            "kind": "WaitAndClick",
+            "indent": 0,
+            "enabled": true,
+            "template": null,
+            "threshold": 0.9,
+            "timeout_secs": 60,
+            "delay_ms": 500,
+            "branches": []
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "name": "Buff 选择",
+        "steps": [
+          {
+            "id": 200,
+            "name": "Buff：数据不足时随机（需核对区域）",
+            "kind": "PrioritySelect",
+            "indent": 0,
+            "enabled": true,
+            "template": null,
+            "threshold": 0.9,
+            "timeout_secs": 60,
+            "delay_ms": 500,
+            "branches": [],
+            "priority": {
+              "stage_template": null,
+              "random_unknown": true,
+              "rules": [],
+              "slots": [
+                {
+                  "id": 1,
+                  "name": "Buff 1",
+                  "region": {
+                    "x": 160,
+                    "y": 160,
+                    "width": 240,
+                    "height": 360
+                  }
+                },
+                {
+                  "id": 2,
+                  "name": "Buff 2",
+                  "region": {
+                    "x": 480,
+                    "y": 160,
+                    "width": 240,
+                    "height": 360
+                  }
+                },
+                {
+                  "id": 3,
+                  "name": "Buff 3",
+                  "region": {
+                    "x": 800,
+                    "y": 160,
+                    "width": 240,
+                    "height": 360
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "id": 201,
+            "name": "确认 Buff（绑定确认按钮模板）",
+            "kind": "WaitAndClick",
+            "indent": 0,
+            "enabled": true,
+            "template": null,
+            "threshold": 0.9,
+            "timeout_secs": 60,
+            "delay_ms": 500,
+            "branches": []
+          }
+        ]
+      }
+    ]
+  },
+  "assets": []
+}

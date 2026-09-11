@@ -6,6 +6,7 @@ mod model;
 mod platform;
 mod runner;
 mod storage;
+mod subflow;
 mod template_editor;
 mod theme;
 mod vision;

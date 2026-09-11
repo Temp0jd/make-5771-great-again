@@ -96,8 +96,41 @@ pub fn validate_executable_profile(profile: &MacroProfile) -> Result<(), String>
     {
         return Err("“本局结束”必须是最后一个启用的步骤".to_owned());
     }
-    for step in profile.steps.iter().filter(|step| step.enabled) {
+    for step in profile.execution_steps() {
         match step.kind {
+            StepKind::CallSubflow => {
+                let flow = profile
+                    .subflows
+                    .iter()
+                    .find(|flow| Some(flow.id) == step.subflow_id)
+                    .ok_or_else(|| format!("步骤“{}”尚未选择有效子流程", step.name))?;
+                if !flow.steps.iter().any(|step| step.enabled) {
+                    return Err(format!("子流程“{}”没有启用的步骤", flow.name));
+                }
+            }
+            StepKind::PrioritySelect => {
+                validate_template_reference(
+                    profile,
+                    step.priority.stage_template.as_ref(),
+                    &format!("选择步骤“{}”的阶段标志", step.name),
+                )?;
+                if step.priority.slots.is_empty() {
+                    return Err(format!("选择步骤“{}”需要至少一个候选区域", step.name));
+                }
+                if step.priority.rules.is_empty() && !step.priority.random_unknown {
+                    return Err(format!(
+                        "选择步骤“{}”需要识别规则或显式开启未知随机",
+                        step.name
+                    ));
+                }
+                for rule in &step.priority.rules {
+                    validate_template_reference(
+                        profile,
+                        rule.template.as_ref(),
+                        &format!("选择规则“{}”", rule.name),
+                    )?;
+                }
+            }
             StepKind::WaitAndClick => {
                 validate_template_reference(
                     profile,
@@ -274,20 +307,7 @@ fn run_workflow(
             }
 
             let _ = events.send(RunnerEvent::StepChanged(step.name.clone()));
-            let result: Result<StepControl, String> = match step.kind {
-                StepKind::WaitAndClick => {
-                    wait_and_click(&mut ctx, step).map(|()| StepControl::Continue)
-                }
-                StepKind::Delay => {
-                    interruptible_wait(Duration::from_millis(step.delay_ms as u64), &stop)
-                        .map(|()| StepControl::Continue)
-                }
-                StepKind::RoundEnd => Ok(StepControl::CompleteRound),
-                StepKind::WaitAny => wait_any(&mut ctx, step),
-                StepKind::Branch => Err(format!("步骤“{}”的条件分支执行尚未开放", step.name)),
-                StepKind::VisualCondition => visual_condition(&mut ctx, step),
-                StepKind::SendKeys => send_keys(&mut ctx, step).map(|()| StepControl::Continue),
-            };
+            let result = execute_step(&mut ctx, step, false);
             match result {
                 Ok(StepControl::Continue) => {}
                 Ok(StepControl::CompleteRound) => {
@@ -310,6 +330,217 @@ fn run_workflow(
             }
         }
     }
+}
+
+fn execute_step(
+    ctx: &mut StepContext<'_>,
+    step: &WorkflowStep,
+    in_subflow: bool,
+) -> Result<StepControl, String> {
+    if ctx.stop.load(Ordering::Acquire) {
+        return Err("用户停止".to_owned());
+    }
+    match step.kind {
+        StepKind::CallSubflow => {
+            if in_subflow {
+                return Err("不允许嵌套调用子流程".to_owned());
+            }
+            let flow = ctx
+                .profile
+                .subflows
+                .iter()
+                .find(|flow| Some(flow.id) == step.subflow_id)
+                .ok_or_else(|| "引用的子流程不存在".to_owned())?;
+            let _ = ctx
+                .events
+                .send(RunnerEvent::Notice(format!("进入子流程：{}", flow.name)));
+            for child in flow.steps.iter().filter(|step| step.enabled) {
+                let _ = ctx.events.send(RunnerEvent::StepChanged(format!(
+                    "{} / {}",
+                    flow.name, child.name
+                )));
+                match execute_step(ctx, child, true)? {
+                    StepControl::Continue => {}
+                    _ => return Err("子流程只能完成后返回主流程".to_owned()),
+                }
+            }
+            let _ = ctx.events.send(RunnerEvent::Notice(format!(
+                "子流程“{}”完成，返回主流程",
+                flow.name
+            )));
+            Ok(StepControl::Continue)
+        }
+        StepKind::PrioritySelect => priority_select(ctx, step).map(|()| StepControl::Continue),
+        StepKind::WaitAndClick => wait_and_click(ctx, step).map(|()| StepControl::Continue),
+        StepKind::Delay => {
+            interruptible_wait(Duration::from_millis(u64::from(step.delay_ms)), ctx.stop)
+                .map(|()| StepControl::Continue)
+        }
+        StepKind::SendKeys => send_keys(ctx, step).map(|()| StepControl::Continue),
+        StepKind::VisualCondition => visual_condition(ctx, step),
+        StepKind::WaitAny => wait_any(ctx, step),
+        StepKind::RoundEnd => Ok(StepControl::CompleteRound),
+        StepKind::Branch => Err("旧条件分支暂不支持执行".to_owned()),
+    }
+}
+
+/// Each decision uses a complete frame scan of every rule in every slot.
+/// No clicks until both the stage and the entire evidence vector repeat.
+fn priority_select(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), String> {
+    use crate::subflow::choose_slot;
+    let spec = &step.priority;
+    let mut deadline = Instant::now() + Duration::from_secs(step.timeout_secs as u64);
+    let mut state = WaitState::default();
+    let mut previous = None;
+    loop {
+        if !ctx.poll_gate(&mut state, &mut deadline)? {
+            continue;
+        }
+        if state.resumed {
+            previous = None;
+            state.resumed = false;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "选择步骤“{}”超时：阶段未确认或没有可安全选择的候选",
+                step.name
+            ));
+        }
+        let frame = FrameSnapshot::capture(ctx)?;
+        let stage = priority_report(
+            ctx,
+            &frame,
+            spec.stage_template.as_ref(),
+            step.threshold,
+            &step.search,
+        )?;
+        if stage.matched.is_none() {
+            previous = None;
+            ctx.recognition_wait(false, step.scan_interval_secs)?;
+            continue;
+        }
+        let mut evidence = Vec::new();
+        let mut regions = Vec::new();
+        for slot in &spec.slots {
+            let region = ctx.profile.template_scale_mode.search_region(
+                slot.region,
+                ctx.profile.expected_client_width,
+                ctx.profile.expected_client_height,
+                frame.rgba.width(),
+                frame.rgba.height(),
+            );
+            let search = TemplateUseSearch {
+                strategy: crate::model::SearchStrategy::FixedRoi,
+                region: Some(region),
+                reference_width: frame.rgba.width(),
+                reference_height: frame.rgba.height(),
+            };
+            evidence.push(priority_slot_evidence(ctx, &frame, step, &search)?);
+            regions.push(region);
+        }
+        if previous.as_ref() == Some(&evidence)
+            && let Some(index) = choose_slot(&evidence, spec.random_unknown, ctx.jitter.next())
+        {
+            // Recognition can be expensive. Recheck focus/stop/deadline before input;
+            // a pause invalidates all prior evidence and restarts the scan.
+            if !ctx.poll_gate(&mut state, &mut deadline)? || state.resumed {
+                previous = None;
+                continue;
+            }
+            if Instant::now() >= deadline {
+                return Err("选择识别超时，未执行点击".to_owned());
+            }
+            // A long rule scan must not act on a stage that has already disappeared.
+            let fresh = FrameSnapshot::capture(ctx)?;
+            let selected_search = TemplateUseSearch {
+                strategy: crate::model::SearchStrategy::FixedRoi,
+                region: Some(regions[index]),
+                reference_width: fresh.rgba.width(),
+                reference_height: fresh.rgba.height(),
+            };
+            if priority_report(
+                ctx,
+                &fresh,
+                spec.stage_template.as_ref(),
+                step.threshold,
+                &step.search,
+            )?
+            .matched
+            .is_none()
+                || priority_slot_evidence(ctx, &fresh, step, &selected_search)? != evidence[index]
+            {
+                previous = None;
+                continue;
+            }
+            if Instant::now() >= deadline {
+                return Err("选择确认超时，未执行点击".to_owned());
+            }
+            if !ctx.poll_gate(&mut state, &mut deadline)? || state.resumed {
+                previous = None;
+                continue;
+            }
+            let r = regions[index];
+            let _ = ctx.events.send(RunnerEvent::Notice(format!(
+                "{}：选择“{}”（{:?}）",
+                step.name, spec.slots[index].name, evidence[index]
+            )));
+            ctx.click(r.x + r.width / 2, r.y + r.height / 2)?;
+            ctx.clear_match_cache();
+            return ctx.wait(step.delay_ms);
+        }
+        previous = Some(evidence);
+        // Always allow the stage to settle, even immediately after an earlier click.
+        ctx.wait(500)?;
+    }
+}
+
+fn priority_slot_evidence(
+    ctx: &StepContext<'_>,
+    frame: &FrameSnapshot,
+    step: &WorkflowStep,
+    search: &TemplateUseSearch,
+) -> Result<crate::subflow::SlotEvidence, String> {
+    let mut hits = Vec::new();
+    let mut ambiguous = false;
+    for (rank, rule) in step.priority.rules.iter().enumerate() {
+        if ctx.stop.load(Ordering::Acquire) {
+            return Err("用户停止".to_owned());
+        }
+        let report = priority_report(ctx, frame, rule.template.as_ref(), step.threshold, search)?;
+        ambiguous |= report.ambiguous || !report.search_complete;
+        if report.matched.is_some() {
+            hits.push((rank, rule.policy));
+        }
+    }
+    Ok(crate::subflow::classify_slot(&hits, ambiguous))
+}
+
+fn priority_report(
+    ctx: &StepContext<'_>,
+    frame: &FrameSnapshot,
+    path: Option<&String>,
+    threshold: f32,
+    search: &TemplateUseSearch,
+) -> Result<RecognitionReport, String> {
+    let template = path
+        .and_then(|path| ctx.templates.get(path))
+        .ok_or_else(|| "选择模板未加载".to_owned())?;
+    Ok(find_loaded_template(
+        &frame.rgba,
+        frame.gray.as_ref(),
+        frame.hybrid.as_ref(),
+        frame.rgba.width(),
+        frame.rgba.height(),
+        ctx.profile.template_scale_mode,
+        template,
+        threshold,
+        ctx.profile.match_algorithm,
+        ctx.profile.recognition_performance.max_threads(),
+        ctx.profile.recognition_performance.roi_recovery_checks(),
+        false,
+        search,
+        true,
+    ))
 }
 
 /// Loads template images, scaling them from their reference resolution to the
@@ -1397,7 +1628,8 @@ fn find_loaded_template(
     } else {
         base_region
     };
-    if let Some((last_x, last_y)) = template.last_match.get()
+    if !force_thorough
+        && let Some((last_x, last_y)) = template.last_match.get()
         && let Some(tracked) = tracking_region(
             tracking_base,
             last_x,
@@ -1582,6 +1814,264 @@ fn stop_reason(profile: &MacroProfile) -> String {
 mod tests {
     use super::*;
     use crate::model::{BranchOutcome, WorkflowBranch};
+
+    #[test]
+    fn priority_scans_images_inside_each_slot_and_forbid_wins() {
+        use crate::subflow::{ChoicePolicy, ChoiceRule, SlotEvidence};
+        fn loaded(seed: u32) -> LoadedTemplate {
+            let rgb = image::RgbaImage::from_fn(12, 12, |x, y| {
+                let v = ((x * 73 + y * seed + x * y * 31) % 220 + 20) as u8;
+                image::Rgba([v, 255 - v, v / 2, 255])
+            });
+            LoadedTemplate {
+                asset: TemplateAsset {
+                    id: u64::from(seed),
+                    name: "test".to_owned(),
+                    path: format!("{seed}.png"),
+                    width: 12,
+                    height: 12,
+                    reference_width: 200,
+                    reference_height: 80,
+                    search_region: None,
+                },
+                image: image::imageops::grayscale(&rgb),
+                weights: vision::TemplateWeights::analyze(&rgb),
+                prepared_scales: vec![vision::PreparedTemplate::new(&rgb)],
+                image_rgb: rgb,
+                last_match: Cell::new(None),
+                recovery_misses: Cell::new(0),
+            }
+        }
+        let allow = loaded(109);
+        let forbid = loaded(53);
+        let mut rgba = image::RgbaImage::from_pixel(200, 80, image::Rgba([5, 5, 5, 255]));
+        image::imageops::replace(&mut rgba, &allow.image_rgb, 10, 20);
+        image::imageops::replace(&mut rgba, &forbid.image_rgb, 55, 20);
+        let frame = FrameSnapshot {
+            hybrid: Some(vision::PreparedFrame::new(&rgba)),
+            gray: None,
+            rgba,
+        };
+        let templates = HashMap::from([
+            ("allow.png".to_owned(), allow),
+            ("forbid.png".to_owned(), forbid),
+        ]);
+        let profile = MacroProfile::default();
+        let stop = AtomicBool::new(false);
+        let (events, _) = mpsc::channel();
+        let ctx = StepContext {
+            profile: &profile,
+            target: TargetWindow {
+                handle: 0,
+                title: "test".to_owned(),
+                client_width: 200,
+                client_height: 80,
+            },
+            templates: &templates,
+            frame_width: 200,
+            frame_height: 80,
+            stop: &stop,
+            events: &events,
+            jitter: Jitter(1),
+            accelerated_until: Cell::new(None),
+        };
+        let mut step = WorkflowStep::new(1, "选择", StepKind::PrioritySelect, 0);
+        step.priority.rules = vec![
+            ChoiceRule {
+                id: 1,
+                name: "首选".to_owned(),
+                template: Some("allow.png".to_owned()),
+                policy: ChoicePolicy::Prefer,
+            },
+            ChoiceRule {
+                id: 2,
+                name: "禁止".to_owned(),
+                template: Some("forbid.png".to_owned()),
+                policy: ChoicePolicy::Forbid,
+            },
+        ];
+        let mut search = TemplateUseSearch {
+            strategy: crate::model::SearchStrategy::FixedRoi,
+            region: Some(crate::model::SearchRegionSpec {
+                x: 0,
+                y: 0,
+                width: 90,
+                height: 80,
+            }),
+            reference_width: 200,
+            reference_height: 80,
+        };
+        assert_eq!(
+            priority_slot_evidence(&ctx, &frame, &step, &search).unwrap(),
+            SlotEvidence::Blocked
+        );
+        search.region.as_mut().unwrap().width = 40;
+        assert_eq!(
+            priority_slot_evidence(&ctx, &frame, &step, &search).unwrap(),
+            SlotEvidence::Preferred(0)
+        );
+        search.region.as_mut().unwrap().x = 140;
+        assert_eq!(
+            priority_slot_evidence(&ctx, &frame, &step, &search).unwrap(),
+            SlotEvidence::Unknown
+        );
+        stop.store(true, Ordering::Release);
+        assert!(
+            priority_slot_evidence(&ctx, &frame, &step, &search)
+                .unwrap_err()
+                .contains("停止")
+        );
+    }
+
+    #[test]
+    fn subflow_call_returns_in_order_and_stop_prevents_execution() {
+        let mut profile = MacroProfile {
+            click_jitter: false,
+            ..MacroProfile::default()
+        };
+        let mut a = WorkflowStep::new(100, "选完后确认", StepKind::Delay, 0);
+        a.delay_ms = 0;
+        let mut b = WorkflowStep::new(101, "退出", StepKind::Delay, 0);
+        b.delay_ms = 0;
+        profile.subflows.push(crate::subflow::Subflow {
+            id: 7,
+            name: "商店".to_owned(),
+            steps: vec![a, b],
+        });
+        let mut call = WorkflowStep::new(102, "调用", StepKind::CallSubflow, 0);
+        call.subflow_id = Some(7);
+        let stop = AtomicBool::new(false);
+        let (events, receiver) = mpsc::channel();
+        let templates = HashMap::new();
+        let mut ctx = StepContext {
+            profile: &profile,
+            target: TargetWindow {
+                handle: 0,
+                title: "test".to_owned(),
+                client_width: 100,
+                client_height: 100,
+            },
+            templates: &templates,
+            frame_width: 100,
+            frame_height: 100,
+            stop: &stop,
+            events: &events,
+            jitter: Jitter(1),
+            accelerated_until: Cell::new(None),
+        };
+        assert!(matches!(
+            execute_step(&mut ctx, &call, false),
+            Ok(StepControl::Continue)
+        ));
+        let names: Vec<_> = receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                RunnerEvent::StepChanged(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["商店 / 选完后确认", "商店 / 退出"]);
+        assert!(
+            execute_step(&mut ctx, &call, true)
+                .unwrap_err()
+                .contains("嵌套")
+        );
+        stop.store(true, Ordering::Release);
+        assert!(
+            execute_step(&mut ctx, &call, false)
+                .unwrap_err()
+                .contains("用户停止")
+        );
+        assert!(receiver.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn thorough_priority_scan_does_not_hide_second_instance_behind_tracking() {
+        let template_rgb = image::RgbaImage::from_fn(16, 16, |x, y| {
+            let v = ((x * 71 + y * 109 + x * y * 17) % 220 + 20) as u8;
+            image::Rgba([v, 255 - v, v / 2, 255])
+        });
+        let mut frame = image::RgbaImage::from_pixel(320, 80, image::Rgba([5, 5, 5, 255]));
+        image::imageops::replace(&mut frame, &template_rgb, 20, 20);
+        image::imageops::replace(&mut frame, &template_rgb, 260, 20);
+        let loaded = LoadedTemplate {
+            asset: TemplateAsset {
+                id: 1,
+                name: "重复物品".to_owned(),
+                path: "test.png".to_owned(),
+                width: 16,
+                height: 16,
+                reference_width: 320,
+                reference_height: 80,
+                search_region: None,
+            },
+            image: image::imageops::grayscale(&template_rgb),
+            weights: vision::TemplateWeights::analyze(&template_rgb),
+            prepared_scales: vec![vision::PreparedTemplate::new(&template_rgb)],
+            image_rgb: template_rgb,
+            last_match: Cell::new(Some((20, 20))),
+            recovery_misses: Cell::new(0),
+        };
+        let prepared = vision::PreparedFrame::new(&frame);
+        let report = find_loaded_template(
+            &frame,
+            None,
+            Some(&prepared),
+            320,
+            80,
+            TemplateScaleMode::Stretch,
+            &loaded,
+            0.9,
+            MatchAlgorithm::Hybrid,
+            2,
+            2,
+            false,
+            &TemplateUseSearch::for_new_use(),
+            true,
+        );
+        assert!(report.ambiguous && report.matched.is_none());
+    }
+
+    #[test]
+    fn subflow_preflight_checks_calls_but_allows_unused_drafts() {
+        let mut profile = MacroProfile {
+            steps: vec![WorkflowStep::new(1, "结束", StepKind::RoundEnd, 0)],
+            ..MacroProfile::default()
+        };
+        profile.subflows.push(crate::subflow::Subflow {
+            id: 7,
+            name: "未完成草稿".to_owned(),
+            steps: vec![WorkflowStep::new(
+                2,
+                "待配置选择",
+                StepKind::PrioritySelect,
+                0,
+            )],
+        });
+        assert!(validate_executable_profile(&profile).is_ok());
+        let mut call = WorkflowStep::new(3, "调用", StepKind::CallSubflow, 0);
+        call.subflow_id = Some(7);
+        profile.steps.insert(0, call);
+        assert!(
+            validate_executable_profile(&profile)
+                .unwrap_err()
+                .contains("阶段标志")
+        );
+        profile.subflows[0].steps[0].kind = StepKind::Delay;
+        assert!(validate_executable_profile(&profile).is_ok());
+        profile.subflows[0].steps[0].enabled = false;
+        assert!(
+            validate_executable_profile(&profile)
+                .unwrap_err()
+                .contains("没有启用")
+        );
+        profile.steps[0].subflow_id = None;
+        assert!(
+            validate_executable_profile(&profile)
+                .unwrap_err()
+                .contains("有效子流程")
+        );
+    }
 
     #[test]
     fn executable_profile_requires_templates() {

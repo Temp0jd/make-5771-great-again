@@ -213,6 +213,9 @@ pub struct Make5771App {
     exit_confirm_open: bool,
     allow_close_once: bool,
     ui_expert_mode: bool,
+    subflow_library: bool,
+    selected_subflow: Option<u64>,
+    selected_subflow_step: Option<u64>,
     workflow_step_filter: String,
 }
 
@@ -270,8 +273,8 @@ impl Make5771App {
             Err(error) => (None, None, Some(error.to_string())),
         };
         let save_tracker = workflow_ui::SaveTracker::new(&profile);
-        let workflow_history_snapshot =
-            serde_json::to_string(&profile.steps).unwrap_or_else(|_| "[]".to_owned());
+        let workflow_history_snapshot = serde_json::to_string(&(&profile.steps, &profile.subflows))
+            .unwrap_or_else(|_| "[]".to_owned());
         let mut app = Self {
             active_tab: AppTab::Run,
             profile,
@@ -333,7 +336,11 @@ impl Make5771App {
             workflow_redo: Vec::new(),
             exit_confirm_open: false,
             allow_close_once: false,
-            ui_expert_mode: false,
+            // Temporarily expose only expert mode; keep the simplified editors for later.
+            ui_expert_mode: true,
+            subflow_library: false,
+            selected_subflow: None,
+            selected_subflow_step: None,
             workflow_step_filter: String::new(),
         };
         if let Some(target) = &app.target_window {
@@ -378,20 +385,14 @@ impl Make5771App {
     fn bind_template_path(&mut self, locator: TemplateUseLocator, path: String) {
         match locator {
             TemplateUseLocator::Step(step_id) => {
-                if let Some(step) = self
-                    .profile
-                    .steps
-                    .iter_mut()
-                    .find(|step| step.id == step_id)
-                {
+                if let Some(step) = self.profile.all_steps_mut().find(|step| step.id == step_id) {
                     step.template = Some(path);
                 }
             }
             TemplateUseLocator::Branch { step_id, branch_id } => {
                 if let Some(branch) = self
                     .profile
-                    .steps
-                    .iter_mut()
+                    .all_steps_mut()
                     .find(|step| step.id == step_id)
                     .and_then(|step| {
                         step.branches
@@ -409,8 +410,7 @@ impl Make5771App {
             } => {
                 if let Some(action) = self
                     .profile
-                    .steps
-                    .iter_mut()
+                    .all_steps_mut()
                     .find(|step| step.id == step_id)
                     .and_then(|step| {
                         step.branches
@@ -430,8 +430,7 @@ impl Make5771App {
             TemplateUseLocator::Condition { step_id, term_id } => {
                 if let Some(term) = self
                     .profile
-                    .steps
-                    .iter_mut()
+                    .all_steps_mut()
                     .find(|step| step.id == step_id)
                     .and_then(|step| {
                         step.visual_condition
@@ -470,20 +469,14 @@ impl Make5771App {
         };
         match locator {
             TemplateUseLocator::Step(step_id) => {
-                if let Some(step) = self
-                    .profile
-                    .steps
-                    .iter_mut()
-                    .find(|step| step.id == step_id)
-                {
+                if let Some(step) = self.profile.all_steps_mut().find(|step| step.id == step_id) {
                     update(&mut step.search);
                 }
             }
             TemplateUseLocator::Branch { step_id, branch_id } => {
                 if let Some(branch) = self
                     .profile
-                    .steps
-                    .iter_mut()
+                    .all_steps_mut()
                     .find(|step| step.id == step_id)
                     .and_then(|step| {
                         step.branches
@@ -501,8 +494,7 @@ impl Make5771App {
             } => {
                 if let Some(action) = self
                     .profile
-                    .steps
-                    .iter_mut()
+                    .all_steps_mut()
                     .find(|step| step.id == step_id)
                     .and_then(|step| {
                         step.branches
@@ -522,8 +514,7 @@ impl Make5771App {
             TemplateUseLocator::Condition { step_id, term_id } => {
                 if let Some(term) = self
                     .profile
-                    .steps
-                    .iter_mut()
+                    .all_steps_mut()
                     .find(|step| step.id == step_id)
                     .and_then(|step| {
                         step.visual_condition
@@ -1355,7 +1346,8 @@ impl Make5771App {
     }
 
     fn observe_workflow_history(&mut self) {
-        let Ok(current) = serde_json::to_string(&self.profile.steps) else {
+        let Ok(current) = serde_json::to_string(&(&self.profile.steps, &self.profile.subflows))
+        else {
             return;
         };
         if current == self.workflow_history_snapshot {
@@ -1371,10 +1363,14 @@ impl Make5771App {
 
     fn reset_workflow_history(&mut self) {
         self.workflow_history_snapshot =
-            serde_json::to_string(&self.profile.steps).unwrap_or_else(|_| "[]".to_owned());
+            serde_json::to_string(&(&self.profile.steps, &self.profile.subflows))
+                .unwrap_or_else(|_| "[]".to_owned());
         self.workflow_undo.clear();
         self.workflow_redo.clear();
         self.workflow_step_filter.clear();
+        self.subflow_library = false;
+        self.selected_subflow = None;
+        self.selected_subflow_step = None;
     }
 
     fn undo_workflow_edit(&mut self) {
@@ -1382,7 +1378,7 @@ impl Make5771App {
         let Some(previous) = self.workflow_undo.pop() else {
             return;
         };
-        let Ok(steps) = serde_json::from_str(&previous) else {
+        let Ok((steps, subflows)) = serde_json::from_str(&previous) else {
             return;
         };
         self.workflow_redo.push(std::mem::replace(
@@ -1390,6 +1386,7 @@ impl Make5771App {
             previous,
         ));
         self.profile.steps = steps;
+        self.profile.subflows = subflows;
         if self
             .selected_step
             .is_none_or(|id| !self.profile.steps.iter().any(|step| step.id == id))
@@ -1404,12 +1401,13 @@ impl Make5771App {
         let Some(next) = self.workflow_redo.pop() else {
             return;
         };
-        let Ok(steps) = serde_json::from_str(&next) else {
+        let Ok((steps, subflows)) = serde_json::from_str(&next) else {
             return;
         };
         self.workflow_undo
             .push(std::mem::replace(&mut self.workflow_history_snapshot, next));
         self.profile.steps = steps;
+        self.profile.subflows = subflows;
         if self
             .selected_step
             .is_none_or(|id| !self.profile.steps.iter().any(|step| step.id == id))
@@ -2372,7 +2370,20 @@ impl Make5771App {
                                     PreflightTarget::Step { step_id, .. } => {
                                         if ui.small_button("定位到步骤").clicked() {
                                             self.active_tab = AppTab::Flow;
-                                            self.selected_step = Some(*step_id);
+                                            if let Some(flow) =
+                                                self.profile.subflows.iter().find(|flow| {
+                                                    flow.steps
+                                                        .iter()
+                                                        .any(|step| step.id == *step_id)
+                                                })
+                                            {
+                                                self.subflow_library = true;
+                                                self.selected_subflow = Some(flow.id);
+                                                self.selected_subflow_step = Some(*step_id);
+                                            } else {
+                                                self.subflow_library = false;
+                                                self.selected_step = Some(*step_id);
+                                            }
                                         }
                                     }
                                     PreflightTarget::Window => {
@@ -2508,6 +2519,11 @@ impl Make5771App {
                 }
                 ui.menu_button("新增步骤", |ui| {
                     for (kind, hint) in workflow_step_kinds() {
+                        if self.subflow_library
+                            && matches!(kind, StepKind::CallSubflow | StepKind::RoundEnd)
+                        {
+                            continue;
+                        }
                         if ui.button(kind.label()).on_hover_text(hint).clicked() {
                             toolbar_add_kind = Some(kind);
                             ui.close();
@@ -2557,20 +2573,26 @@ impl Make5771App {
                     .color(theme::tertiary_label()),
             );
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("编辑模式：");
-            ui.selectable_value(&mut self.ui_expert_mode, false, "简洁模式");
-            ui.selectable_value(&mut self.ui_expert_mode, true, "专家模式");
-            ui.label(if self.ui_expert_mode {
-                "专家：直接显示阈值、精确 ROI、锚点偏移与扫描参数"
-            } else {
-                "简洁：优先显示常用设置；底层参数需展开查看"
-            });
-        });
         if let Some(kind) = toolbar_add_kind {
-            let id = add_workflow_step(&mut self.profile, kind);
-            self.selected_step = Some(id);
-            self.workflow_step_filter.clear();
+            if self.subflow_library {
+                let id = self.profile.next_step_id();
+                if let Some(flow) = self
+                    .profile
+                    .subflows
+                    .iter_mut()
+                    .find(|flow| Some(flow.id) == self.selected_subflow)
+                {
+                    flow.steps
+                        .push(WorkflowStep::new(id, kind.label(), kind, 0));
+                    self.selected_subflow_step = Some(id);
+                } else {
+                    self.toast = Some("请先创建或选择子流程".to_owned());
+                }
+            } else {
+                let id = add_workflow_step(&mut self.profile, kind);
+                self.selected_step = Some(id);
+                self.workflow_step_filter.clear();
+            }
         }
 
         ui.horizontal_wrapped(|ui| {
@@ -2614,6 +2636,21 @@ impl Make5771App {
             }
         });
 
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.subflow_library, false, "主流程");
+            ui.selectable_value(&mut self.subflow_library, true, "子流程库");
+            ui.label("子流程独立编辑，主流程按引用调用；修改一次，所有调用共用。");
+        });
+        if self.subflow_library {
+            self.subflows_page(ui, &template_options);
+            return;
+        }
+        let subflow_options: Vec<_> = self
+            .profile
+            .subflows
+            .iter()
+            .map(|flow| (flow.id, flow.name.clone()))
+            .collect();
         let flow_preflight = self.workflow_preflight(false);
         if flow_preflight.has_blockers() || flow_preflight.warnings().next().is_some() {
             theme::section_card().show(ui, |ui| {
@@ -2844,14 +2881,7 @@ impl Make5771App {
                             }
                             Some(StepListCommand::Duplicate(index)) => {
                                 let mut copy = self.profile.steps[index].clone();
-                                copy.id = self
-                                    .profile
-                                    .steps
-                                    .iter()
-                                    .map(|step| step.id)
-                                    .max()
-                                    .unwrap_or(0)
-                                    + 1;
+                                copy.id = self.profile.next_step_id();
                                 copy.name = format!("{} 副本", copy.name);
                                 let new_id = copy.id;
                                 self.profile.steps.insert(index + 1, copy);
@@ -2955,6 +2985,8 @@ impl Make5771App {
                             &mut self.thumbs,
                             &mut workflow_action,
                             self.ui_expert_mode,
+                            &subflow_options,
+                            false,
                         );
 
                         ui.add_space(8.0);
@@ -3006,6 +3038,14 @@ impl Make5771App {
         if request_run_check {
             self.active_tab = AppTab::Run;
         }
+        self.handle_workflow_action(ui, workflow_action);
+    }
+
+    fn handle_workflow_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        workflow_action: Option<WorkflowTemplateAction>,
+    ) {
         if let Some(action) = workflow_action {
             match action {
                 WorkflowTemplateAction::CaptureNew(locator) => {
@@ -3036,6 +3076,176 @@ impl Make5771App {
                 }
             }
         }
+    }
+
+    fn subflows_page(&mut self, ui: &mut egui::Ui, templates: &[(u64, String, String)]) {
+        let mut delete_flow = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("新建子流程").clicked() {
+                let id = self
+                    .profile
+                    .subflows
+                    .iter()
+                    .map(|flow| flow.id)
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                self.profile.subflows.push(crate::subflow::Subflow {
+                    id,
+                    name: format!("子流程 {id}"),
+                    steps: Vec::new(),
+                });
+                self.selected_subflow = Some(id);
+                self.selected_subflow_step = None;
+            }
+            for flow in &self.profile.subflows {
+                if ui
+                    .selectable_value(&mut self.selected_subflow, Some(flow.id), &flow.name)
+                    .clicked()
+                {
+                    self.selected_subflow_step = flow.steps.first().map(|step| step.id);
+                }
+            }
+        });
+        let next_id = self.profile.next_step_id();
+        let refs = self
+            .profile
+            .steps
+            .iter()
+            .filter(|step| {
+                step.kind == StepKind::CallSubflow && step.subflow_id == self.selected_subflow
+            })
+            .count();
+        let reference_size = (
+            self.profile.expected_client_width,
+            self.profile.expected_client_height,
+        );
+        let scan = self.profile.idle_scan_secs;
+        let mut action = None;
+        if let Some(flow) = self
+            .profile
+            .subflows
+            .iter_mut()
+            .find(|flow| Some(flow.id) == self.selected_subflow)
+        {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("子流程名称");
+                ui.text_edit_singleline(&mut flow.name);
+                ui.label(format!("被主流程引用 {refs} 次"));
+                if ui
+                    .add_enabled(refs == 0, theme::small_danger_button("删除子流程"))
+                    .on_disabled_hover_text("先移除主流程中的调用引用")
+                    .clicked()
+                {
+                    delete_flow = Some(flow.id);
+                }
+            });
+            ui.label("建议：先添加物品 / Buff 选择（含阶段识别），再添加识别点击确认、退出等步骤。末尾自动返回主流程。模板在模板库截图后选择。");
+            let mut add = None;
+            ui.horizontal_wrapped(|ui| {
+                for (kind, _) in workflow_step_kinds() {
+                    if matches!(kind, StepKind::CallSubflow | StepKind::RoundEnd) {
+                        continue;
+                    }
+                    if ui.button(format!("+ {}", kind.label())).clicked() {
+                        add = Some(kind);
+                    }
+                }
+            });
+            if let Some(kind) = add {
+                flow.steps
+                    .push(WorkflowStep::new(next_id, kind.label(), kind, 0));
+                self.selected_subflow_step = Some(next_id);
+            }
+            if !flow
+                .steps
+                .iter()
+                .any(|step| Some(step.id) == self.selected_subflow_step)
+            {
+                self.selected_subflow_step = flow.steps.first().map(|step| step.id);
+            }
+            let mut command = None;
+            for (index, step) in flow.steps.iter().enumerate() {
+                let (row, dropped) = ui.dnd_drop_zone::<usize, _>(egui::Frame::NONE, |ui| {
+                    render_step_list_row(
+                        ui,
+                        step,
+                        index,
+                        flow.steps.len(),
+                        Some(step.id) == self.selected_subflow_step,
+                        templates,
+                        scan,
+                        &mut command,
+                        true,
+                    )
+                });
+                if let Some(id) = row.inner {
+                    self.selected_subflow_step = Some(id);
+                }
+                if let Some(from) = dropped
+                    && *from < flow.steps.len()
+                    && *from != index
+                {
+                    command = Some(StepListCommand::Move {
+                        from: *from,
+                        to: index,
+                    });
+                }
+            }
+            match command {
+                Some(StepListCommand::MoveUp(i)) => flow.steps.swap(i, i - 1),
+                Some(StepListCommand::MoveDown(i)) => flow.steps.swap(i, i + 1),
+                Some(StepListCommand::Move { from, to }) => {
+                    let step = flow.steps.remove(from);
+                    flow.steps.insert(to, step);
+                }
+                Some(StepListCommand::Delete(i)) => {
+                    flow.steps.remove(i);
+                }
+                Some(StepListCommand::ToggleEnabled(i)) => {
+                    flow.steps[i].enabled = !flow.steps[i].enabled
+                }
+                Some(StepListCommand::Duplicate(i)) => {
+                    let mut step = flow.steps[i].clone();
+                    step.id = next_id;
+                    step.name.push_str(" 副本");
+                    self.selected_subflow_step = Some(step.id);
+                    flow.steps.insert(i + 1, step);
+                }
+                _ => {}
+            }
+            ui.separator();
+            if let Some(step) = flow
+                .steps
+                .iter_mut()
+                .find(|step| Some(step.id) == self.selected_subflow_step)
+            {
+                ui.push_id(("subflow-editor", flow.id, step.id), |ui| {
+                    render_step_editor_5stages(
+                        ui,
+                        step,
+                        reference_size,
+                        scan,
+                        templates,
+                        &mut self.thumbs,
+                        &mut action,
+                        true,
+                        &[],
+                        true,
+                    );
+                });
+            } else {
+                ui.label("使用上方按钮添加子流程步骤。");
+            }
+        } else {
+            ui.label("创建或选择一个子流程；它会与主流程一起保存和导出。");
+        }
+        if let Some(id) = delete_flow {
+            self.profile.subflows.retain(|flow| flow.id != id);
+            self.selected_subflow = None;
+            self.selected_subflow_step = None;
+        }
+        self.handle_workflow_action(ui, action);
     }
 
     fn templates_page(&mut self, ui: &mut egui::Ui) {
@@ -4587,8 +4797,13 @@ enum StepListCommand {
     Delete(usize),
 }
 
-fn workflow_step_kinds() -> [(StepKind, &'static str); 6] {
+fn workflow_step_kinds() -> [(StepKind, &'static str); 8] {
     [
+        (StepKind::CallSubflow, "调用独立子流程，完成后返回主流程"),
+        (
+            StepKind::PrioritySelect,
+            "识别阶段后按优先级或随机选择物品 / Buff",
+        ),
         (StepKind::WaitAndClick, "等到目标图片出现后点击它，最常用"),
         (StepKind::WaitAny, "同时监控多个画面并处理先出现的目标"),
         (StepKind::VisualCondition, "根据一个或多个画面条件决定结果"),
@@ -4599,7 +4814,7 @@ fn workflow_step_kinds() -> [(StepKind, &'static str); 6] {
 }
 
 fn add_workflow_step(profile: &mut MacroProfile, kind: StepKind) -> u64 {
-    let id = profile.steps.iter().map(|step| step.id).max().unwrap_or(0) + 1;
+    let id = profile.next_step_id();
     let count = profile
         .steps
         .iter()
@@ -4762,6 +4977,8 @@ fn render_step_editor_5stages(
     thumbs: &mut TemplateThumbs,
     workflow_action: &mut Option<WorkflowTemplateAction>,
     expert_mode: bool,
+    subflows: &[(u64, String)],
+    in_subflow: bool,
 ) {
     // Header & Meta
     ui.horizontal(|ui| {
@@ -4782,6 +4999,8 @@ fn render_step_editor_5stages(
             .selected_text(step.kind.label())
             .show_ui(ui, |ui| {
                 for (kind, label) in [
+                    (StepKind::CallSubflow, "调用子流程"),
+                    (StepKind::PrioritySelect, "物品 / Buff 选择"),
                     (StepKind::WaitAndClick, "等待并点击"),
                     (StepKind::WaitAny, "等待任一目标"),
                     (StepKind::VisualCondition, "视觉条件"),
@@ -4789,6 +5008,9 @@ fn render_step_editor_5stages(
                     (StepKind::SendKeys, "键盘输入"),
                     (StepKind::RoundEnd, "本局结束"),
                 ] {
+                    if in_subflow && matches!(kind, StepKind::CallSubflow | StepKind::RoundEnd) {
+                        continue;
+                    }
                     ui.selectable_value(&mut step.kind, kind, label);
                 }
             });
@@ -4823,6 +5045,27 @@ fn render_step_editor_5stages(
     }
 
     match step.kind {
+        StepKind::CallSubflow => {
+            egui::ComboBox::from_id_salt(("subflow-call", step.id))
+                .selected_text(
+                    subflows
+                        .iter()
+                        .find(|(id, _)| Some(*id) == step.subflow_id)
+                        .map(|(_, name)| name.as_str())
+                        .unwrap_or("选择子流程"),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut step.subflow_id, None, "尚未选择");
+                    for (id, name) in subflows {
+                        ui.selectable_value(&mut step.subflow_id, Some(*id), name);
+                    }
+                });
+            ui.label("请在子流程库中创建和编辑。执行到此处进入子流程，完成后返回下一步；失败则停止，不自动跳过。");
+        }
+        StepKind::PrioritySelect => {
+            priority_choice_editor(ui, step, reference_size, template_options, thumbs)
+        }
+
         StepKind::WaitAndClick => {
             // 阶段 1：识别什么
             theme::section_card().show(ui, |ui| {
@@ -6199,6 +6442,224 @@ fn push_threshold_warning(warnings: &mut Vec<String>, owner: &str, threshold: f3
     }
 }
 
+fn priority_choice_editor(
+    ui: &mut egui::Ui,
+    step: &mut WorkflowStep,
+    reference_size: (u32, u32),
+    templates: &[(u64, String, String)],
+    thumbs: &mut TemplateThumbs,
+) {
+    use crate::subflow::{ChoicePolicy, ChoiceRule, ChoiceSlot};
+    ui.label("先识别当前阶段，再扫描所有候选区域。优先项按列表顺序选择，禁止项不选，其余允许项随机。选择后继续下一个步骤，可添加购买确认或退出操作。");
+    template_picker(
+        ui,
+        ("choice-stage", step.id),
+        "阶段标志（必须，例如商店标题 / Buff 选择标题）",
+        &mut step.priority.stage_template,
+        templates,
+        thumbs,
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.label("阶段标志搜索范围");
+        for strategy in [
+            SearchStrategy::FullFrame,
+            SearchStrategy::FixedRoi,
+            SearchStrategy::RoiThenFullFrame,
+            SearchStrategy::Inherit,
+        ] {
+            ui.selectable_value(&mut step.search.strategy, strategy, strategy.label());
+        }
+    });
+    if matches!(
+        step.search.strategy,
+        SearchStrategy::FixedRoi | SearchStrategy::RoiThenFullFrame
+    ) {
+        if step.search.reference_width == 0 {
+            step.search.reference_width = reference_size.0.max(1);
+        }
+        if step.search.reference_height == 0 {
+            step.search.reference_height = reference_size.1.max(1);
+        }
+        let region = step.search.region.get_or_insert(SearchRegionSpec {
+            x: 0,
+            y: 0,
+            width: step.search.reference_width,
+            height: step.search.reference_height,
+        });
+        ui.label(format!(
+            "阶段搜索参考尺寸：{} × {}",
+            step.search.reference_width, step.search.reference_height
+        ));
+        search_region_fields(
+            ui,
+            region,
+            step.search.reference_width,
+            step.search.reference_height,
+        );
+    }
+    threshold_editor(ui, &mut step.threshold);
+    timeout_editor(ui, &mut step.timeout_secs);
+    delay_editor(ui, "选择后等待", &mut step.delay_ms);
+    ui.separator();
+    ui.label("候选区域：每个区域只能包含一个当前可选的物品 / Buff，点击落点为区域中心。坐标按流程参考分辨率保存，运行时等比映射。");
+    ui.label(format!(
+        "参考尺寸：{} × {}。请勿包含刷新、退出或购买确认按钮。",
+        reference_size.0, reference_size.1
+    ));
+    let mut remove_slot = None;
+    let mut slots = Vec::new();
+    for (index, slot) in step.priority.slots.iter_mut().enumerate() {
+        ui.push_id(("choice-slot", step.id, slot.id), |ui| {
+            theme::section_card().show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.text_edit_singleline(&mut slot.name);
+                    if ui.small_button("删除区域").clicked() {
+                        remove_slot = Some(index);
+                    }
+                });
+                search_region_fields(ui, &mut slot.region, reference_size.0, reference_size.1);
+            });
+        });
+        slots.push(slot.region);
+    }
+    if let Some(index) = remove_slot {
+        step.priority.slots.remove(index);
+    }
+    if ui.button("添加候选区域").clicked() {
+        let id = step
+            .priority
+            .slots
+            .iter()
+            .map(|slot| slot.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        step.priority.slots.push(ChoiceSlot {
+            id,
+            name: format!("候选 {id}"),
+            region: SearchRegionSpec {
+                x: 0,
+                y: 0,
+                width: (reference_size.0 / 4).max(1),
+                height: (reference_size.1 / 4).max(1),
+            },
+        });
+    }
+    // Proportional diagram makes edited regions and center click points visible.
+    let width = ui.available_width().clamp(1.0, 500.0);
+    let size = Vec2::new(
+        width,
+        width * reference_size.1.max(1) as f32 / reference_size.0.max(1) as f32,
+    );
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(1.0, theme::secondary_label()),
+        egui::StrokeKind::Inside,
+    );
+    for (i, region) in slots.iter().enumerate() {
+        let scale = width / reference_size.0.max(1) as f32;
+        let r = egui::Rect::from_min_size(
+            rect.min + Vec2::new(region.x as f32, region.y as f32) * scale,
+            Vec2::new(region.width as f32, region.height as f32) * scale,
+        );
+        ui.painter().rect_stroke(
+            r,
+            0.0,
+            Stroke::new(1.0, theme::blue()),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{} +", i + 1),
+            egui::FontId::proportional(12.0),
+            theme::blue(),
+        );
+    }
+    ui.separator();
+    ui.label("识别规则（从上到下优先级递减；禁止优先于其他规则）");
+    let mut rule_command = None;
+    let count = step.priority.rules.len();
+    for (index, rule) in step.priority.rules.iter_mut().enumerate() {
+        ui.push_id(("choice-rule", step.id, rule.id), |ui| {
+            theme::section_card().show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{}", index + 1));
+                    ui.text_edit_singleline(&mut rule.name);
+                    for policy in [
+                        ChoicePolicy::Prefer,
+                        ChoicePolicy::Allow,
+                        ChoicePolicy::Forbid,
+                    ] {
+                        ui.selectable_value(&mut rule.policy, policy, policy.label());
+                    }
+                });
+                template_picker(
+                    ui,
+                    "rule-template",
+                    "物品 / Buff 图片（建议截取名称或独特图标）",
+                    &mut rule.template,
+                    templates,
+                    thumbs,
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(index > 0, egui::Button::new("提高优先级"))
+                        .clicked()
+                    {
+                        rule_command = Some((index, 0));
+                    }
+                    if ui
+                        .add_enabled(index + 1 < count, egui::Button::new("降低优先级"))
+                        .clicked()
+                    {
+                        rule_command = Some((index, 1));
+                    }
+                    if ui.button("删除规则").clicked() {
+                        rule_command = Some((index, 2));
+                    }
+                });
+            });
+        });
+    }
+    if let Some((i, cmd)) = rule_command {
+        match cmd {
+            0 => step.priority.rules.swap(i, i - 1),
+            1 => step.priority.rules.swap(i, i + 1),
+            _ => {
+                step.priority.rules.remove(i);
+            }
+        }
+    }
+    if ui.button("添加识别规则").clicked() {
+        let id = step
+            .priority
+            .rules
+            .iter()
+            .map(|rule| rule.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        step.priority.rules.push(ChoiceRule {
+            id,
+            name: format!("规则 {id}"),
+            template: None,
+            policy: ChoicePolicy::Prefer,
+        });
+    }
+    ui.checkbox(
+        &mut step.priority.random_unknown,
+        "数据不足时，允许从未识别的候选区域随机选择",
+    );
+    if step.priority.random_unknown {
+        ui.colored_label(theme::orange(), "风险：未识别不等于允许，无法保证它不是禁选项、空位或售罄项。请确认所有候选区域当前都可选。命中禁止或识别冲突的区域仍会排除。");
+    } else {
+        ui.label("未识别的候选不会点击；没有允许项时持续重试，超时停止。");
+    }
+}
+
 fn template_picker(
     ui: &mut egui::Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
@@ -6727,16 +7188,9 @@ fn remap_profile_template_paths(
             *slot = Some(new_path.clone());
         }
     };
-    for step in &mut profile.steps {
-        apply(&mut step.template);
-        for branch in &mut step.branches {
-            apply(&mut branch.trigger_template);
-            for action in &mut branch.actions {
-                apply(&mut action.template);
-            }
-        }
-        for term in &mut step.visual_condition.terms {
-            apply(&mut term.template);
+    for step in profile.all_steps_mut() {
+        for path in step.template_paths_mut() {
+            apply(path);
         }
     }
 }
@@ -6795,58 +7249,25 @@ fn profiles_referencing_template(path: &str, exclude: &std::path::Path) -> Vec<S
 }
 
 fn referenced_template_paths(profile: &MacroProfile) -> std::collections::HashSet<String> {
-    let mut paths = std::collections::HashSet::new();
-    for step in &profile.steps {
-        if let Some(path) = &step.template {
-            paths.insert(path.clone());
-        }
-        for branch in &step.branches {
-            if let Some(path) = &branch.trigger_template {
-                paths.insert(path.clone());
-            }
-            for action in &branch.actions {
-                if let Some(path) = &action.template {
-                    paths.insert(path.clone());
-                }
-            }
-        }
-        for term in &step.visual_condition.terms {
-            if let Some(path) = &term.template {
-                paths.insert(path.clone());
-            }
-        }
-    }
-    paths
+    profile
+        .all_steps()
+        .flat_map(WorkflowStep::template_paths)
+        .cloned()
+        .collect()
 }
 
 fn count_template_references(profile: &MacroProfile, path: &str) -> usize {
-    let mut count = 0;
-    for step in &profile.steps {
-        count += usize::from(step.template.as_deref() == Some(path));
-        for branch in &step.branches {
-            count += usize::from(branch.trigger_template.as_deref() == Some(path));
-            for action in &branch.actions {
-                count += usize::from(action.template.as_deref() == Some(path));
-            }
-        }
-        for term in &step.visual_condition.terms {
-            count += usize::from(term.template.as_deref() == Some(path));
-        }
-    }
-    count
+    profile
+        .all_steps()
+        .flat_map(WorkflowStep::template_paths)
+        .filter(|candidate| candidate.as_str() == path)
+        .count()
 }
 
 fn clear_template_references(profile: &mut MacroProfile, path: &str) {
-    for step in &mut profile.steps {
-        clear_matching_path(&mut step.template, path);
-        for branch in &mut step.branches {
-            clear_matching_path(&mut branch.trigger_template, path);
-            for action in &mut branch.actions {
-                clear_matching_path(&mut action.template, path);
-            }
-        }
-        for term in &mut step.visual_condition.terms {
-            clear_matching_path(&mut term.template, path);
+    for step in profile.all_steps_mut() {
+        for value in step.template_paths_mut() {
+            clear_matching_path(value, path);
         }
     }
 }
@@ -7434,6 +7855,93 @@ mod tests {
 
     /// Simulates actual egui pointer frames, including the production drop zone.
     #[test]
+    fn priority_editor_exposes_stage_roi_and_random_controls() {
+        fn has_text(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.job.text.contains(needle),
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, needle)),
+                _ => false,
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut step = WorkflowStep::new(1, "选择", StepKind::PrioritySelect, 0);
+        step.search = TemplateUseSearch {
+            strategy: SearchStrategy::FixedRoi,
+            region: Some(SearchRegionSpec {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 80,
+            }),
+            reference_width: 1280,
+            reference_height: 720,
+        };
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(700.0, 5000.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                priority_choice_editor(
+                    ui,
+                    &mut step,
+                    (1280, 720),
+                    &[],
+                    &mut TemplateThumbs::default(),
+                );
+            },
+        );
+        for label in [
+            "阶段标志搜索范围",
+            "阶段搜索参考尺寸",
+            "添加候选区域",
+            "添加识别规则",
+            "数据不足时",
+        ] {
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| has_text(&shape.shape, label)),
+                "missing {label}"
+            );
+        }
+        assert_eq!(step.search.strategy, SearchStrategy::FixedRoi);
+        assert!(!step.priority.random_unknown);
+    }
+
+    #[test]
+    fn modular_template_maintenance_reaches_stage_rules_and_children() {
+        let mut profile = MacroProfile::default();
+        let mut child =
+            WorkflowStep::new(profile.next_step_id(), "选择", StepKind::PrioritySelect, 0);
+        child.priority.stage_template = Some("old.png".to_owned());
+        child.priority.rules.push(crate::subflow::ChoiceRule {
+            id: 1,
+            name: "物品".to_owned(),
+            template: Some("old.png".to_owned()),
+            policy: crate::subflow::ChoicePolicy::Prefer,
+        });
+        profile.subflows.push(crate::subflow::Subflow {
+            id: 1,
+            name: "商店".to_owned(),
+            steps: vec![child],
+        });
+        assert_eq!(count_template_references(&profile, "old.png"), 2);
+        remap_profile_template_paths(
+            &mut profile,
+            &std::collections::HashMap::from([("old.png".to_owned(), "new.png".to_owned())]),
+        );
+        assert_eq!(count_template_references(&profile, "new.png"), 2);
+        assert!(referenced_template_paths(&profile).contains("new.png"));
+        clear_template_references(&mut profile, "new.png");
+        assert_eq!(count_template_references(&profile, "new.png"), 0);
+    }
+
+    #[test]
     fn workflow_drag_handle_still_starts_drag_without_selecting() {
         let ctx = egui::Context::default();
         let step = WorkflowStep::new(7, "Test step", StepKind::Delay, 0);
@@ -7517,6 +8025,8 @@ mod tests {
                         &mut TemplateThumbs::default(),
                         &mut None,
                         expert,
+                        &[],
+                        false,
                     );
                 },
             );

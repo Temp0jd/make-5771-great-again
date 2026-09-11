@@ -405,16 +405,9 @@ fn remap_profile_paths(
     profile: &mut MacroProfile,
     remap: &HashMap<String, String>,
 ) -> Result<(), PackageError> {
-    for step in &mut profile.steps {
-        remap_optional_path(&mut step.template, remap)?;
-        for branch in &mut step.branches {
-            remap_optional_path(&mut branch.trigger_template, remap)?;
-            for action in &mut branch.actions {
-                remap_optional_path(&mut action.template, remap)?;
-            }
-        }
-        for term in &mut step.visual_condition.terms {
-            remap_optional_path(&mut term.template, remap)?;
+    for step in profile.all_steps_mut() {
+        for path in step.template_paths_mut() {
+            remap_optional_path(path, remap)?;
         }
     }
     for template in &mut profile.templates {
@@ -760,6 +753,29 @@ mod tests {
             x_percent: 25.0,
             y_percent: 75.0,
         });
+        let mut child =
+            crate::model::WorkflowStep::new(100, "选择", crate::model::StepKind::PrioritySelect, 0);
+        child.priority.stage_template = Some(profile.templates[0].path.clone());
+        child.priority.random_unknown = true;
+        child.priority.rules.push(crate::subflow::ChoiceRule {
+            id: 1,
+            name: "优先物品".to_owned(),
+            template: Some(profile.templates[0].path.clone()),
+            policy: crate::subflow::ChoicePolicy::Prefer,
+        });
+        profile.subflows.push(crate::subflow::Subflow {
+            id: 9,
+            name: "商店".to_owned(),
+            steps: vec![child],
+        });
+        let mut call = crate::model::WorkflowStep::new(
+            101,
+            "调用商店",
+            crate::model::StepKind::CallSubflow,
+            0,
+        );
+        call.subflow_id = Some(9);
+        profile.steps.insert(1, call);
         let package_path = root.join("flow.m5771pack");
         let exported = export_workflow_package(&package_path, &profile).unwrap();
         assert_eq!(exported.template_count, 1);
@@ -767,6 +783,17 @@ mod tests {
         let import_root = root.join("imports");
         let (imported, summary) = import_workflow_package_to(&package_path, &import_root).unwrap();
         assert_eq!(summary.profile_name, "shareable");
+        assert_eq!(imported.steps[1].subflow_id, Some(9));
+        assert_eq!(imported.subflows[0].name, "商店");
+        assert!(imported.subflows[0].steps[0].priority.random_unknown);
+        assert_eq!(
+            imported.subflows[0].steps[0].priority.stage_template,
+            Some(imported.templates[0].path.clone())
+        );
+        assert_eq!(
+            imported.subflows[0].steps[0].priority.rules[0].template,
+            Some(imported.templates[0].path.clone())
+        );
         assert_eq!(
             imported.steps[0].relative_click,
             profile.steps[0].relative_click
@@ -783,6 +810,20 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn modular_example_is_valid_draft_but_not_executable_without_templates() {
+        let package: WorkflowPackage =
+            serde_json::from_str(include_str!("../examples/modular-subflows-draft.m5771pack"))
+                .unwrap();
+        assert!(package.profile.validate().is_ok());
+        assert_eq!(package.profile.subflows.len(), 2);
+        assert!(
+            crate::runner::validate_executable_profile(&package.profile)
+                .unwrap_err()
+                .contains("阶段标志")
+        );
     }
 
     #[test]
