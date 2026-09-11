@@ -682,6 +682,36 @@ impl VisualConditionTerm {
     }
 }
 
+/// Position relative to the entire target client area, independent of the match ROI.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RelativeClickPoint {
+    pub x_percent: f32,
+    pub y_percent: f32,
+}
+
+impl Default for RelativeClickPoint {
+    fn default() -> Self {
+        Self {
+            x_percent: 50.0,
+            y_percent: 50.0,
+        }
+    }
+}
+
+impl RelativeClickPoint {
+    pub fn resolve(self, width: u32, height: u32) -> (u32, u32) {
+        fn axis(percent: f32, size: u32) -> u32 {
+            let percent = if percent.is_finite() {
+                percent.clamp(0.0, 100.0)
+            } else {
+                50.0
+            };
+            ((size as f64 * percent as f64 / 100.0).round() as u32).min(size.saturating_sub(1))
+        }
+        (axis(self.x_percent, width), axis(self.y_percent, height))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisualConditionSpec {
     pub mode: ConditionMatchMode,
@@ -689,6 +719,8 @@ pub struct VisualConditionSpec {
     pub outcome: ConditionOutcome,
     #[serde(default)]
     pub click_anchor: ClickAnchor,
+    #[serde(default)]
+    pub relative_click: Option<RelativeClickPoint>,
     #[serde(default)]
     pub click_offset_x: i32,
     #[serde(default)]
@@ -704,6 +736,7 @@ impl Default for VisualConditionSpec {
             stable_checks: 2,
             outcome: ConditionOutcome::ContinueFlow,
             click_anchor: ClickAnchor::default(),
+            relative_click: None,
             click_offset_x: 0,
             click_offset_y: 0,
             terms: Vec::new(),
@@ -766,6 +799,8 @@ pub struct BranchAction {
     #[serde(default)]
     pub click_anchor: ClickAnchor,
     #[serde(default)]
+    pub relative_click: Option<RelativeClickPoint>,
+    #[serde(default)]
     pub click_offset_x: i32,
     #[serde(default)]
     pub click_offset_y: i32,
@@ -796,6 +831,7 @@ impl BranchAction {
             timeout_secs: 60,
             delay_ms: 500,
             click_anchor: ClickAnchor::default(),
+            relative_click: None,
             click_offset_x: 0,
             click_offset_y: 0,
             click_count: default_click_count(),
@@ -818,6 +854,8 @@ pub struct WorkflowBranch {
     pub outcome: BranchOutcome,
     #[serde(default)]
     pub click_anchor: ClickAnchor,
+    #[serde(default)]
+    pub relative_click: Option<RelativeClickPoint>,
     #[serde(default)]
     pub click_offset_x: i32,
     #[serde(default)]
@@ -843,6 +881,7 @@ impl WorkflowBranch {
             trigger_delay_ms: 400,
             outcome: BranchOutcome::RepeatWait,
             click_anchor: ClickAnchor::default(),
+            relative_click: None,
             click_offset_x: 0,
             click_offset_y: 0,
             click_count: default_click_count(),
@@ -881,6 +920,8 @@ pub struct WorkflowStep {
     pub delay_ms: u32,
     #[serde(default)]
     pub click_anchor: ClickAnchor,
+    #[serde(default)]
+    pub relative_click: Option<RelativeClickPoint>,
     #[serde(default)]
     pub click_offset_x: i32,
     #[serde(default)]
@@ -921,6 +962,7 @@ impl WorkflowStep {
             timeout_secs: 60,
             delay_ms: 500,
             click_anchor: ClickAnchor::default(),
+            relative_click: None,
             click_offset_x: 0,
             click_offset_y: 0,
             click_count: default_click_count(),
@@ -1358,6 +1400,48 @@ pub enum LogLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_click_scales_and_clamps_to_client() {
+        let point = RelativeClickPoint {
+            x_percent: 25.0,
+            y_percent: 75.0,
+        };
+        assert_eq!(point.resolve(1920, 1080), (480, 810));
+        assert_eq!(point.resolve(2560, 1440), (640, 1080));
+        assert_eq!(
+            RelativeClickPoint {
+                x_percent: -20.0,
+                y_percent: 120.0
+            }
+            .resolve(1920, 1080),
+            (0, 1079)
+        );
+        assert_eq!(RelativeClickPoint::default().resolve(0, 0), (0, 0));
+        assert_eq!(
+            RelativeClickPoint {
+                x_percent: f32::NAN,
+                y_percent: f32::INFINITY
+            }
+            .resolve(100, 100),
+            (50, 50)
+        );
+    }
+
+    #[test]
+    fn relative_click_roundtrip_and_legacy_defaults() {
+        let mut step = WorkflowStep::new(1, "比例点击", StepKind::WaitAndClick, 0);
+        step.relative_click = Some(RelativeClickPoint {
+            x_percent: 31.5,
+            y_percent: 80.0,
+        });
+        let mut value = serde_json::to_value(&step).unwrap();
+        let restored: WorkflowStep = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored.relative_click, step.relative_click);
+        value.as_object_mut().unwrap().remove("relative_click");
+        let legacy: WorkflowStep = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.relative_click, None);
+    }
 
     #[test]
     fn default_profile_is_valid() {

@@ -2556,14 +2556,15 @@ impl Make5771App {
                     .size(11.0)
                     .color(theme::tertiary_label()),
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.selectable_value(&mut self.ui_expert_mode, true, "专家模式");
-                ui.selectable_value(&mut self.ui_expert_mode, false, "简洁模式");
-                ui.label(
-                    RichText::new("UI 模式:")
-                        .size(11.5)
-                        .color(theme::secondary_label()),
-                );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("编辑模式：");
+            ui.selectable_value(&mut self.ui_expert_mode, false, "简洁模式");
+            ui.selectable_value(&mut self.ui_expert_mode, true, "专家模式");
+            ui.label(if self.ui_expert_mode {
+                "专家：直接显示阈值、精确 ROI、锚点偏移与扫描参数"
+            } else {
+                "简洁：优先显示常用设置；底层参数需展开查看"
             });
         });
         if let Some(kind) = toolbar_add_kind {
@@ -2717,7 +2718,7 @@ impl Make5771App {
                             RichText::new(if filter_active {
                                 "过滤期间仅改变显示，拖动排序已停用；清除过滤后可拖动"
                             } else {
-                                "拖动步骤卡可排序，也可在操作菜单中调整"
+                                "点击步骤卡选择；拖动左侧手柄排序，或使用操作菜单"
                             })
                             .size(11.0)
                             .color(theme::tertiary_label()),
@@ -2787,29 +2788,22 @@ impl Make5771App {
                                                 &template_options,
                                                 profile_scan_interval,
                                                 &mut list_command,
+                                                false,
                                             );
                                         } else {
                                             let (_, dropped) = ui.dnd_drop_zone::<usize, _>(
                                                 egui::Frame::NONE,
                                                 |ui| {
-                                                    ui.dnd_drag_source(
-                                                        egui::Id::new((
-                                                            "workflow-step-drag",
-                                                            step.id,
-                                                        )),
+                                                    selected_id = render_step_list_row(
+                                                        ui,
+                                                        step,
                                                         index,
-                                                        |ui| {
-                                                            selected_id = render_step_list_row(
-                                                                ui,
-                                                                step,
-                                                                index,
-                                                                self.profile.steps.len(),
-                                                                selected,
-                                                                &template_options,
-                                                                profile_scan_interval,
-                                                                &mut list_command,
-                                                            );
-                                                        },
+                                                        self.profile.steps.len(),
+                                                        selected,
+                                                        &template_options,
+                                                        profile_scan_interval,
+                                                        &mut list_command,
+                                                        true,
                                                     );
                                                 },
                                             );
@@ -4633,9 +4627,31 @@ fn render_step_list_row(
     template_options: &[(u64, String, String)],
     profile_scan_interval: Option<u8>,
     command: &mut Option<StepListCommand>,
+    draggable: bool,
 ) -> Option<u64> {
     let mut selected_id = None;
     ui.horizontal(|ui| {
+        if draggable {
+            ui.dnd_drag_source(
+                egui::Id::new(("workflow-step-drag", step.id)),
+                index,
+                |ui| {
+                    let (rect, response) =
+                        ui.allocate_exact_size(Vec2::new(20.0, 52.0), Sense::hover());
+                    // Paint dots instead of depending on a font containing a drag-handle glyph.
+                    for x in [-3.0, 3.0] {
+                        for y in [-6.0, 0.0, 6.0] {
+                            ui.painter().circle_filled(
+                                rect.center() + Vec2::new(x, y),
+                                1.5,
+                                theme::secondary_label(),
+                            );
+                        }
+                    }
+                    response.on_hover_text("拖动此手柄排序；点击步骤卡选择");
+                },
+            );
+        }
         let controls_width = 54.0;
         let button_width = (ui.available_width() - controls_width).max(80.0);
         let button = egui::Button::new(workflow_ui::step_row_text(
@@ -4655,6 +4671,7 @@ fn render_step_list_row(
         } else {
             Stroke::NONE
         })
+        .wrap()
         .min_size(Vec2::new(button_width, 52.0));
         if ui.add(button).clicked() {
             selected_id = Some(step.id);
@@ -4717,7 +4734,7 @@ enum ActionListCommand {
 }
 
 fn stage_header(ui: &mut egui::Ui, number: u8, title: &str, hint: &str) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(
             RichText::new(format!("{number}. {title}"))
                 .size(13.0)
@@ -4993,6 +5010,7 @@ fn render_step_editor_5stages(
                     &mut step.click_anchor,
                     &mut step.click_offset_x,
                     &mut step.click_offset_y,
+                    &mut step.relative_click,
                 );
                 click_repeat_editor(ui, &mut step.click_count, &mut step.click_interval_ms);
                 if expert_mode {
@@ -5002,6 +5020,7 @@ fn render_step_editor_5stages(
                         &mut step.click_anchor,
                         &mut step.click_offset_x,
                         &mut step.click_offset_y,
+                        step.relative_click.is_some(),
                     );
                 }
             });
@@ -5053,6 +5072,7 @@ fn render_step_editor_5stages(
                                 &mut step.click_anchor,
                                 &mut step.click_offset_x,
                                 &mut step.click_offset_y,
+                                step.relative_click.is_some(),
                             );
                             if matches!(
                                 step.search.strategy,
@@ -5601,6 +5621,7 @@ fn visual_condition_editor(
                 &mut step.visual_condition.click_anchor,
                 &mut step.visual_condition.click_offset_x,
                 &mut step.visual_condition.click_offset_y,
+                &mut step.visual_condition.relative_click,
             );
             delay_editor(ui, "点击后等待", &mut step.delay_ms);
             click_repeat_editor(ui, &mut step.click_count, &mut step.click_interval_ms);
@@ -5611,6 +5632,7 @@ fn visual_condition_editor(
                     &mut step.visual_condition.click_anchor,
                     &mut step.visual_condition.click_offset_x,
                     &mut step.visual_condition.click_offset_y,
+                    step.visual_condition.relative_click.is_some(),
                 );
             }
         });
@@ -5706,6 +5728,7 @@ fn visual_condition_editor(
                         &mut step.visual_condition.click_anchor,
                         &mut step.visual_condition.click_offset_x,
                         &mut step.visual_condition.click_offset_y,
+                        step.visual_condition.relative_click.is_some(),
                     );
                 }
             });
@@ -5884,6 +5907,7 @@ fn edit_workflow_branch(
             &mut branch.click_anchor,
             &mut branch.click_offset_x,
             &mut branch.click_offset_y,
+            &mut branch.relative_click,
         );
         delay_editor(ui, "点击后等待", &mut branch.trigger_delay_ms);
         click_repeat_editor(ui, &mut branch.click_count, &mut branch.click_interval_ms);
@@ -5894,6 +5918,7 @@ fn edit_workflow_branch(
                 &mut branch.click_anchor,
                 &mut branch.click_offset_x,
                 &mut branch.click_offset_y,
+                branch.relative_click.is_some(),
             );
         }
     }
@@ -6066,6 +6091,7 @@ fn edit_workflow_branch(
                         &mut action.click_anchor,
                         &mut action.click_offset_x,
                         &mut action.click_offset_y,
+                        &mut action.relative_click,
                     );
                     click_repeat_editor(ui, &mut action.click_count, &mut action.click_interval_ms);
                     if expert_mode {
@@ -6075,6 +6101,7 @@ fn edit_workflow_branch(
                             &mut action.click_anchor,
                             &mut action.click_offset_x,
                             &mut action.click_offset_y,
+                            action.relative_click.is_some(),
                         );
                     }
 
@@ -6155,6 +6182,7 @@ fn edit_workflow_branch(
                         &mut branch.click_anchor,
                         &mut branch.click_offset_x,
                         &mut branch.click_offset_y,
+                        branch.relative_click.is_some(),
                     );
                 }
             });
@@ -6476,6 +6504,10 @@ fn better_test_report(
 
 /// The template image with a click-to-aim marker; clicking sets the anchor to
 /// Center and the offsets so the runtime click lands on the picked pixel.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared click configuration and execution context"
+)]
 fn click_point_picker(
     ui: &mut egui::Ui,
     template_path: Option<&String>,
@@ -6484,7 +6516,22 @@ fn click_point_picker(
     anchor: &mut ClickAnchor,
     offset_x: &mut i32,
     offset_y: &mut i32,
+    relative: &mut Option<crate::model::RelativeClickPoint>,
 ) {
+    let mut use_relative = relative.is_some();
+    ui.horizontal_wrapped(|ui| {
+        ui.selectable_value(&mut use_relative, false, "点击图片位置");
+        ui.selectable_value(&mut use_relative, true, "点击窗口比例位置");
+    });
+    if use_relative {
+        let point = relative.get_or_insert_with(Default::default);
+        ui.label("识别成功后点击整个目标窗口客户区的位置，与图片位置及搜索区域无关。全屏游戏即游戏全屏范围。");
+        ui.add(egui::Slider::new(&mut point.x_percent, 0.0..=100.0).text("横向 %"));
+        ui.add(egui::Slider::new(&mut point.y_percent, 0.0..=100.0).text("纵向 %"));
+        ui.label("左上角为 0%, 0%；右下角为 100%, 100%。此模式忽略图片锚点与像素偏移。");
+        return;
+    }
+    *relative = None;
     let click_template = template_path
         .and_then(|path| {
             template_options
@@ -6496,8 +6543,10 @@ fn click_point_picker(
         && let Some(texture) = thumbs.texture(ui.ctx(), &template_path, &template_name)
     {
         let [tex_w, tex_h] = texture.size();
-        let max_width = (ui.available_width() - 8.0).max(140.0);
-        let scale = (max_width / tex_w as f32).clamp(0.2, 2.0);
+        let max_width = (ui.available_width() - 8.0).max(1.0);
+        let scale = (max_width / tex_w as f32)
+            .min(2.0)
+            .min(240.0 / tex_h as f32);
         let display_size = Vec2::new(tex_w as f32 * scale, tex_h as f32 * scale);
         let response = ui.add(
             egui::Image::new(texture)
@@ -6554,7 +6603,12 @@ fn click_anchor_offset_editors(
     anchor: &mut ClickAnchor,
     offset_x: &mut i32,
     offset_y: &mut i32,
+    relative: bool,
 ) {
+    if relative {
+        ui.label("当前使用窗口比例落点，图片锚点与像素偏移不生效。");
+        return;
+    }
     ui.label(
         RichText::new("点击位置")
             .size(11.0)
@@ -7375,6 +7429,163 @@ mod tests {
             reference_width: 100,
             reference_height: 100,
             search_region: None,
+        }
+    }
+
+    /// Simulates actual egui pointer frames, including the production drop zone.
+    #[test]
+    fn workflow_drag_handle_still_starts_drag_without_selecting() {
+        let ctx = egui::Context::default();
+        let step = WorkflowStep::new(7, "Test step", StepKind::Delay, 0);
+        let start = egui::pos2(12.0, 16.0);
+        for events in [
+            vec![],
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            vec![egui::Event::PointerMoved(egui::pos2(12.0, 90.0))],
+            vec![],
+        ] {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(400.0, 300.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        let (row, _) = ui.dnd_drop_zone::<usize, _>(egui::Frame::NONE, |ui| {
+                            render_step_list_row(
+                                ui,
+                                &step,
+                                0,
+                                1,
+                                false,
+                                &[],
+                                Some(3),
+                                &mut None,
+                                true,
+                            )
+                        });
+                        assert_eq!(row.inner, None);
+                    });
+                },
+            );
+        }
+        assert_eq!(
+            egui::DragAndDrop::payload::<usize>(&ctx).as_deref(),
+            Some(&0)
+        );
+    }
+
+    #[test]
+    fn expert_mode_renders_threshold_while_simple_mode_hides_it() {
+        fn contains_text(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.job.text.contains(needle),
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| contains_text(shape, needle)),
+                _ => false,
+            }
+        }
+        for expert in [false, true] {
+            let ctx = egui::Context::default();
+            let mut step = WorkflowStep::new(1, "Test", StepKind::WaitAndClick, 0);
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(900.0, 4000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    render_step_editor_5stages(
+                        ui,
+                        &mut step,
+                        (1920, 1080),
+                        Some(3),
+                        &[],
+                        &mut TemplateThumbs::default(),
+                        &mut None,
+                        expert,
+                    );
+                },
+            );
+            assert_eq!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| contains_text(&shape.shape, "识别相似度")),
+                expert
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_row_click_selects_with_and_without_drag_handle() {
+        for draggable in [true, false] {
+            let ctx = egui::Context::default();
+            let step = WorkflowStep::new(7, "Test step", StepKind::Delay, 0);
+            let pos = egui::pos2(100.0, 32.0);
+            let mut selected = None;
+            for events in [
+                vec![],
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ] {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(400.0, 300.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(input, |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        let mut command = None;
+                        ui.dnd_drop_zone::<usize, _>(egui::Frame::NONE, |ui| {
+                            if let Some(id) = render_step_list_row(
+                                ui,
+                                &step,
+                                0,
+                                1,
+                                false,
+                                &[],
+                                Some(3),
+                                &mut command,
+                                draggable,
+                            ) {
+                                selected = Some(id);
+                            }
+                        });
+                        assert!(command.is_none());
+                    });
+                });
+            }
+            assert_eq!(selected, Some(7), "draggable={draggable}");
         }
     }
 

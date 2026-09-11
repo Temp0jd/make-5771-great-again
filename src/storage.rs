@@ -756,6 +756,10 @@ mod tests {
         visual_step.visual_condition.terms.push(term);
         profile.steps.push(visual_step);
 
+        profile.steps[0].relative_click = Some(crate::model::RelativeClickPoint {
+            x_percent: 25.0,
+            y_percent: 75.0,
+        });
         let package_path = root.join("flow.m5771pack");
         let exported = export_workflow_package(&package_path, &profile).unwrap();
         assert_eq!(exported.template_count, 1);
@@ -763,6 +767,10 @@ mod tests {
         let import_root = root.join("imports");
         let (imported, summary) = import_workflow_package_to(&package_path, &import_root).unwrap();
         assert_eq!(summary.profile_name, "shareable");
+        assert_eq!(
+            imported.steps[0].relative_click,
+            profile.steps[0].relative_click
+        );
         assert_eq!(imported.templates.len(), 1);
         assert!(Path::new(&imported.templates[0].path).exists());
         assert_eq!(

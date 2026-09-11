@@ -148,6 +148,14 @@ pub fn step_summary(step: &WorkflowStep, templates: &[(u64, String, String)]) ->
         StepKind::RoundEnd => "结算本局并开始下一轮".to_owned(),
         StepKind::Branch => "条件分支（旧版占位）".to_owned(),
     };
+    if step.kind == StepKind::WaitAndClick
+        && let Some(point) = step.relative_click
+    {
+        summary.push_str(&format!(
+            "，点击窗口 ({:.1}%, {:.1}%)",
+            point.x_percent, point.y_percent
+        ));
+    }
     if !step.enabled {
         summary.push_str(" · 已停用");
     }

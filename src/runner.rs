@@ -708,6 +708,7 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
             click_match_repeated(
                 ctx,
                 &found,
+                step.relative_click,
                 step.click_anchor,
                 step.click_offset_x,
                 step.click_offset_y,
@@ -740,20 +741,30 @@ fn same_target(a: (u32, u32), b: (u32, u32)) -> bool {
 
 /// Clicks a matched template box at the configured anchor plus pixel offset,
 /// clamped to the client area.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared click configuration and execution context"
+)]
 fn click_match_repeated(
     ctx: &mut StepContext<'_>,
     found: &vision::TemplateMatch,
+    relative: Option<crate::model::RelativeClickPoint>,
     anchor: ClickAnchor,
     offset_x: i32,
     offset_y: i32,
     count: u8,
     interval_ms: u32,
 ) -> Result<(), String> {
-    let (base_x, base_y) = anchor_point(found, anchor);
-    let x = (base_x as i32 + offset_x).clamp(0, ctx.target.client_width.saturating_sub(1) as i32)
-        as u32;
-    let y = (base_y as i32 + offset_y).clamp(0, ctx.target.client_height.saturating_sub(1) as i32)
-        as u32;
+    let (x, y) = if let Some(relative) = relative {
+        relative.resolve(ctx.target.client_width, ctx.target.client_height)
+    } else {
+        let (base_x, base_y) = anchor_point(found, anchor);
+        let x = (base_x as i64 + offset_x as i64)
+            .clamp(0, ctx.target.client_width.saturating_sub(1) as i64) as u32;
+        let y = (base_y as i64 + offset_y as i64)
+            .clamp(0, ctx.target.client_height.saturating_sub(1) as i64) as u32;
+        (x, y)
+    };
     for index in 0..count.max(1) {
         ctx.click(x, y)?;
         if index + 1 < count {
@@ -1009,6 +1020,7 @@ fn wait_any(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<StepContro
             click_match_repeated(
                 ctx,
                 &found,
+                branch.relative_click,
                 branch.click_anchor,
                 branch.click_offset_x,
                 branch.click_offset_y,
@@ -1151,6 +1163,7 @@ fn visual_condition(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<St
                 click_match_repeated(
                     ctx,
                     &found,
+                    spec.relative_click,
                     spec.click_anchor,
                     spec.click_offset_x,
                     spec.click_offset_y,
@@ -1212,6 +1225,7 @@ fn wait_and_click_action(ctx: &mut StepContext<'_>, action: &BranchAction) -> Re
         timeout_secs: action.timeout_secs,
         delay_ms: action.delay_ms,
         click_anchor: action.click_anchor,
+        relative_click: action.relative_click,
         click_offset_x: action.click_offset_x,
         click_offset_y: action.click_offset_y,
         click_count: action.click_count,

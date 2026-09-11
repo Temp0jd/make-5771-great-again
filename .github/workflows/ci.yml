@@ -37,6 +37,7 @@ jobs:
         with:
           name: Make 5771 Great Again ${{ github.ref_name }}
           generate_release_notes: true
+          body_path: docs/RELEASE_NOTES.md
           files: |
             target/release/Make5771GreatAgain.exe
             template.zip
