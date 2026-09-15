@@ -44,7 +44,7 @@ const DARK: Palette = Palette {
     surface_muted: Color32::from_rgb(16, 21, 34),
     label: Color32::from_rgb(238, 240, 244),
     secondary_label: Color32::from_rgb(172, 180, 194),
-    tertiary_label: Color32::from_rgb(131, 141, 160),
+    tertiary_label: Color32::from_rgb(147, 159, 180),
     separator: Color32::from_rgb(45, 55, 74),
     blue: Color32::from_rgb(36, 130, 130),
     gold: Color32::from_rgb(202, 164, 91),
@@ -76,7 +76,7 @@ const ABYSS_DARK: Palette = Palette {
     surface_muted: Color32::from_rgb(13, 23, 30),
     label: Color32::from_rgb(235, 242, 244),
     secondary_label: Color32::from_rgb(168, 182, 190),
-    tertiary_label: Color32::from_rgb(128, 142, 150),
+    tertiary_label: Color32::from_rgb(144, 160, 169),
     separator: Color32::from_rgb(40, 56, 66),
     blue: Color32::from_rgb(32, 120, 132),
     gold: Color32::from_rgb(200, 165, 95),
@@ -108,7 +108,7 @@ const APRICOT_DARK: Palette = Palette {
     surface_muted: Color32::from_rgb(30, 23, 18),
     label: Color32::from_rgb(245, 238, 230),
     secondary_label: Color32::from_rgb(186, 174, 160),
-    tertiary_label: Color32::from_rgb(150, 138, 124),
+    tertiary_label: Color32::from_rgb(173, 159, 143),
     separator: Color32::from_rgb(70, 58, 48),
     blue: Color32::from_rgb(150, 100, 44),
     gold: Color32::from_rgb(215, 175, 105),
@@ -140,7 +140,7 @@ const CRIMSON_DARK: Palette = Palette {
     surface_muted: Color32::from_rgb(22, 14, 19),
     label: Color32::from_rgb(240, 232, 236),
     secondary_label: Color32::from_rgb(176, 162, 168),
-    tertiary_label: Color32::from_rgb(152, 138, 146),
+    tertiary_label: Color32::from_rgb(163, 148, 157),
     separator: Color32::from_rgb(58, 42, 50),
     blue: Color32::from_rgb(190, 70, 80),
     gold: Color32::from_rgb(205, 165, 95),
@@ -220,16 +220,20 @@ fn blend(from: Color32, to: Color32, t: f32) -> Color32 {
     )
 }
 
-/// Translucent card surface derived from the skin, so every skin keeps the
-/// same glass look while the contrast tests still verify readability.
+/// Translucent card surface derived from the skin.
+///
+/// The alpha is deliberately low enough for the background portrait to show
+/// through (dark cards are ~81% opaque), which is why the dark skins brighten
+/// their helper text and the tests now composite against the brightest possible
+/// portrait pixel instead of only the flat panel.
 pub fn glass_surface() -> Color32 {
-    with_alpha(palette().surface, if is_dark() { 236 } else { 242 })
+    with_alpha(palette().surface, if is_dark() { 206 } else { 228 })
 }
 
 pub fn glass_muted() -> Color32 {
     with_alpha(
         blend(palette().surface, palette().background, 0.35),
-        if is_dark() { 234 } else { 238 },
+        if is_dark() { 214 } else { 232 },
     )
 }
 
@@ -796,6 +800,44 @@ mod tests {
                 assert!(
                     contrast(super::control_fill(), card) >= 1.10,
                     "skin {} dark={dark}: control fill",
+                    skin.id
+                );
+            }
+        }
+    }
+
+    /// The background portrait can be at full strength with a white pixel right
+    /// behind a card, so readability is asserted against that worst case.
+    #[test]
+    fn cards_stay_readable_over_the_background_portrait() {
+        for skin in super::SKINS.iter() {
+            for dark in [false, true] {
+                let palette = if dark { skin.dark } else { skin.light };
+                super::PALETTE.with(|current| current.set(palette));
+                super::DARK_MODE.with(|current| current.set(dark));
+                let portrait = composite(
+                    Color32::from_rgba_unmultiplied(
+                        255,
+                        255,
+                        255,
+                        (crate::art::MAX_PORTRAIT_ALPHA * 255.0).round() as u8,
+                    ),
+                    palette.background,
+                );
+                let card = composite(super::glass_surface(), portrait);
+                assert!(
+                    contrast(palette.label, card) >= 7.0,
+                    "skin {} dark={dark}: label over portrait",
+                    skin.id
+                );
+                assert!(
+                    contrast(palette.secondary_label, card) >= 4.5,
+                    "skin {} dark={dark}: secondary over portrait",
+                    skin.id
+                );
+                assert!(
+                    contrast(palette.tertiary_label, card) >= 4.5,
+                    "skin {} dark={dark}: tertiary over portrait",
                     skin.id
                 );
             }
