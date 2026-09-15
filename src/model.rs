@@ -1156,6 +1156,10 @@ pub struct MacroProfile {
     /// Automatic recovery when a step times out (see [`FailureRecovery`]).
     #[serde(default)]
     pub failure_recovery: FailureRecovery,
+    /// Experimental gold/shop configuration. Reserved for a later release: no
+    /// UI writes it yet, see `docs/ECONOMY_MODULE.md`.
+    #[serde(default)]
+    pub economy: crate::economy::EconomyConfig,
     #[serde(default)]
     pub sharing: SharingMetadata,
 }
@@ -1254,6 +1258,7 @@ impl Default for MacroProfile {
             finish_current_round: true,
             subflows: Vec::new(),
             failure_recovery: FailureRecovery::default(),
+            economy: crate::economy::EconomyConfig::default(),
             steps: vec![
                 WorkflowStep::new(1, "开始游戏", StepKind::WaitAndClick, 0),
                 WorkflowStep::new(2, "开启 Auto", StepKind::WaitAndClick, 0),

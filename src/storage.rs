@@ -270,6 +270,35 @@ fn prune_failure_snapshots() {
     }
 }
 
+/// One row of the run report CSV.
+#[derive(Debug, Clone)]
+pub struct ReportRow {
+    pub category: &'static str,
+    pub name: String,
+    pub value: String,
+}
+
+/// Writes the run statistics as CSV next to the log files.
+pub fn export_run_report(rows: &[ReportRow]) -> Result<PathBuf, String> {
+    fs::create_dir_all("logs").map_err(|error| format!("无法创建日志目录：{error}"))?;
+    let path = PathBuf::from(format!(
+        "logs/report-{}.csv",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    let mut contents = String::from("\u{feff}类别,名称,数值\n");
+    for row in rows {
+        let escape = |value: &str| value.replace(',', "，").replace('"', "”");
+        contents.push_str(&format!(
+            "{},{},{}\n",
+            row.category,
+            escape(&row.name),
+            escape(&row.value)
+        ));
+    }
+    fs::write(&path, contents).map_err(|error| format!("无法写入报表：{error}"))?;
+    Ok(path)
+}
+
 pub fn load_profile(path: &Path) -> Result<MacroProfile, StorageError> {
     let contents = fs::read_to_string(path).map_err(StorageError::Read)?;
     let profile: MacroProfile = serde_json::from_str(&contents).map_err(StorageError::Decode)?;

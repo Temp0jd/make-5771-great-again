@@ -266,6 +266,11 @@ pub struct Make5771App {
     /// Logs queued while a mutable borrow of the profile is active.
     pending_logs: Vec<(LogLevel, String)>,
     settings_section: SettingsSection,
+    /// Run statistics for the current/last run (see the run page report card).
+    report_failures: std::collections::BTreeMap<String, u32>,
+    report_matches: std::collections::BTreeMap<String, u32>,
+    report_score_sum: f32,
+    report_score_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +400,10 @@ impl Make5771App {
             step_clipboard: None,
             pending_logs: Vec::new(),
             settings_section: SettingsSection::Interface,
+            report_failures: std::collections::BTreeMap::new(),
+            report_matches: std::collections::BTreeMap::new(),
+            report_score_sum: 0.0,
+            report_score_count: 0,
             force_stop_confirm: false,
             target_window,
             template_draft: None,
@@ -982,10 +991,15 @@ impl Make5771App {
                     self.current_step = name;
                     self.runner_status = RunnerStatus::Running;
                 }
-                RunnerEvent::MatchFound { name, score } => self.push_log(
-                    LogLevel::Success,
-                    format!("已识别并点击“{name}”，相似度 {score:.3}"),
-                ),
+                RunnerEvent::MatchFound { name, score } => {
+                    *self.report_matches.entry(name.clone()).or_default() += 1;
+                    self.report_score_sum += score;
+                    self.report_score_count += 1;
+                    self.push_log(
+                        LogLevel::Success,
+                        format!("已识别并点击“{name}”，相似度 {score:.3}"),
+                    );
+                }
                 RunnerEvent::BranchMatched {
                     step,
                     branch,
@@ -1030,6 +1044,10 @@ impl Make5771App {
                     runner_finished = true;
                 }
                 RunnerEvent::Failed(error) => {
+                    *self
+                        .report_failures
+                        .entry(self.current_step.clone())
+                        .or_default() += 1;
                     self.runner_status = RunnerStatus::Ready;
                     self.current_step = "运行失败".to_owned();
                     self.run_started_at = None;
@@ -1117,6 +1135,65 @@ impl Make5771App {
         report
     }
 
+    /// Flattens the current run statistics into CSV rows.
+    fn report_rows(&self) -> Vec<storage::ReportRow> {
+        let row = |category: &'static str, name: &str, value: String| storage::ReportRow {
+            category,
+            name: name.to_owned(),
+            value,
+        };
+        let mut rows = vec![
+            row("总览", "完成局数", self.completed_rounds.to_string()),
+            row("总览", "当前状态", self.runner_status.label().to_owned()),
+        ];
+        if !self.round_durations.is_empty() {
+            let total: u64 = self.round_durations.iter().sum();
+            let count = self.round_durations.len() as u64;
+            rows.push(row(
+                "耗时",
+                "平均每局（秒）",
+                format!("{:.1}", total as f32 / count as f32),
+            ));
+            rows.push(row(
+                "耗时",
+                "最短一局（秒）",
+                self.round_durations
+                    .iter()
+                    .min()
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+            ));
+            rows.push(row(
+                "耗时",
+                "最长一局（秒）",
+                self.round_durations
+                    .iter()
+                    .max()
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+            ));
+        }
+        if self.report_score_count > 0 {
+            rows.push(row(
+                "识别",
+                "平均相似度",
+                format!(
+                    "{:.3}",
+                    self.report_score_sum / self.report_score_count as f32
+                ),
+            ));
+        }
+        for (name, count) in &self.report_failures {
+            rows.push(row("失败步骤", name, count.to_string()));
+        }
+        for (name, count) in &self.report_matches {
+            rows.push(row("命中模板", name, count.to_string()));
+        }
+        rows
+    }
+
     /// Same contract as [`Self::cached_preflight`]; the exit guard and Ctrl+S
     /// read [`Self::save_tracker`] directly.
     fn cached_save_status(&mut self) -> SaveStatus {
@@ -1170,6 +1247,10 @@ impl Make5771App {
                     return;
                 }
                 self.completed_rounds = 0;
+                self.report_failures.clear();
+                self.report_matches.clear();
+                self.report_score_sum = 0.0;
+                self.report_score_count = 0;
                 self.current_step = "正在启动".to_owned();
                 self.manual_pause = false;
                 self.runner_status = RunnerStatus::Running;
@@ -2612,6 +2693,80 @@ impl Make5771App {
                         }
                     }
                     self.invalidate_ui_caches();
+                }
+            });
+        }
+
+        if !self.report_matches.is_empty()
+            || !self.report_failures.is_empty()
+            || !self.round_durations.is_empty()
+        {
+            ui.add_space(10.0);
+            theme::card().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("本次运行统计").size(18.0).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(theme::secondary_button("导出 CSV")).clicked() {
+                            let rows = self.report_rows();
+                            match storage::export_run_report(&rows) {
+                                Ok(path) => {
+                                    let message = format!("报表已导出：{}", path.display());
+                                    self.toast = Some(message.clone());
+                                    self.push_log(LogLevel::Success, message);
+                                }
+                                Err(error) => {
+                                    self.toast = Some(error.clone());
+                                    self.push_log(LogLevel::Warning, error);
+                                }
+                            }
+                        }
+                    });
+                });
+                ui.separator();
+                if !self.round_durations.is_empty() {
+                    let total: u64 = self.round_durations.iter().sum();
+                    let count = self.round_durations.len() as u64;
+                    ui.label(format!(
+                        "完成局数 {} · 平均每局 {:.1}s · 最近一局 {}s",
+                        self.completed_rounds,
+                        total as f32 / count as f32,
+                        self.round_durations.back().copied().unwrap_or(0)
+                    ));
+                } else {
+                    ui.label(format!("完成局数 {}", self.completed_rounds));
+                }
+                if self.report_score_count > 0 {
+                    ui.label(format!(
+                        "平均识别相似度 {:.3}（{} 次命中）",
+                        self.report_score_sum / self.report_score_count as f32,
+                        self.report_score_count
+                    ));
+                }
+                let mut failures: Vec<(&String, &u32)> = self.report_failures.iter().collect();
+                failures.sort_by(|left, right| right.1.cmp(left.1));
+                if !failures.is_empty() {
+                    ui.separator();
+                    ui.label(
+                        RichText::new("失败最多的步骤")
+                            .size(12.0)
+                            .color(theme::secondary_label()),
+                    );
+                    for (name, count) in failures.iter().take(3) {
+                        ui.label(RichText::new(format!("{name} × {count}")).size(12.0));
+                    }
+                }
+                let mut matches: Vec<(&String, &u32)> = self.report_matches.iter().collect();
+                matches.sort_by(|left, right| right.1.cmp(left.1));
+                if !matches.is_empty() {
+                    ui.separator();
+                    ui.label(
+                        RichText::new("命中最多的模板")
+                            .size(12.0)
+                            .color(theme::secondary_label()),
+                    );
+                    for (name, count) in matches.iter().take(3) {
+                        ui.label(RichText::new(format!("{name} × {count}")).size(12.0));
+                    }
                 }
             });
         }
