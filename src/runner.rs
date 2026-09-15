@@ -53,6 +53,7 @@ pub enum RunnerEvent {
 
 pub struct RunnerHandle {
     stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     events: mpsc::Receiver<RunnerEvent>,
 }
 
@@ -61,16 +62,32 @@ impl RunnerHandle {
         validate_executable_profile(&profile)?;
         let (sender, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let thread_pause = Arc::clone(&pause);
         std::thread::Builder::new()
             .name("m5771-runner".to_owned())
-            .spawn(move || run_workflow(profile, target, thread_stop, sender))
+            .spawn(move || run_workflow(profile, target, thread_stop, thread_pause, sender))
             .map_err(|error| format!("无法启动执行线程：{error}"))?;
-        Ok(Self { stop, events })
+        Ok(Self {
+            stop,
+            pause,
+            events,
+        })
     }
 
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
+    }
+
+    /// Requests a manual pause. Recognition and input stop at the next
+    /// checkpoint; the current step deadline is extended by the paused time.
+    pub fn request_pause(&self) {
+        self.pause.store(true, Ordering::Release);
+    }
+
+    pub fn request_resume(&self) {
+        self.pause.store(false, Ordering::Release);
     }
 
     pub fn drain_events(&self) -> Vec<RunnerEvent> {
@@ -223,6 +240,7 @@ fn run_workflow(
     profile: MacroProfile,
     target: TargetWindow,
     stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     events: mpsc::Sender<RunnerEvent>,
 ) {
     let startup_frame = match platform::capture_client(&target) {
@@ -278,6 +296,7 @@ fn run_workflow(
         frame_width,
         frame_height,
         stop: &stop,
+        pause: Arc::clone(&pause),
         events: &events,
         jitter: Jitter::new(),
         accelerated_until: Cell::new(None),
@@ -372,10 +391,12 @@ fn execute_step(
         }
         StepKind::PrioritySelect => priority_select(ctx, step).map(|()| StepControl::Continue),
         StepKind::WaitAndClick => wait_and_click(ctx, step).map(|()| StepControl::Continue),
-        StepKind::Delay => {
-            interruptible_wait(Duration::from_millis(u64::from(step.delay_ms)), ctx.stop)
-                .map(|()| StepControl::Continue)
-        }
+        StepKind::Delay => interruptible_wait(
+            Duration::from_millis(u64::from(step.delay_ms)),
+            ctx.stop,
+            Some(&ctx.pause),
+        )
+        .map(|()| StepControl::Continue),
         StepKind::SendKeys => send_keys(ctx, step).map(|()| StepControl::Continue),
         StepKind::VisualCondition => visual_condition(ctx, step),
         StepKind::WaitAny => wait_any(ctx, step),
@@ -726,6 +747,8 @@ struct StepContext<'a> {
     frame_width: u32,
     frame_height: u32,
     stop: &'a AtomicBool,
+    /// Manual pause request; recognition and input idle while it is set.
+    pause: Arc<AtomicBool>,
     events: &'a mpsc::Sender<RunnerEvent>,
     jitter: Jitter,
     /// After an input, temporarily use the fast cadence while the next screen
@@ -757,6 +780,7 @@ impl StepContext<'_> {
                 step_interval_secs,
             ),
             self.stop,
+            Some(&self.pause),
         )
     }
 
@@ -779,7 +803,7 @@ impl StepContext<'_> {
     fn wait(&mut self, ms: u32) -> Result<(), String> {
         let humanize = self.profile.click_jitter;
         let duration = Duration::from_millis(self.jitter.jitter_ms(ms, humanize));
-        interruptible_wait(duration, self.stop)
+        interruptible_wait(duration, self.stop, Some(&self.pause))
     }
 
     /// Handles the stop flag, dead-window reconnection and foreground pausing
@@ -792,6 +816,17 @@ impl StepContext<'_> {
     ) -> Result<bool, String> {
         if self.stop.load(Ordering::Acquire) {
             return Err("用户停止".to_owned());
+        }
+        if self.pause.load(Ordering::Acquire) {
+            if !state.paused {
+                let _ = self
+                    .events
+                    .send(RunnerEvent::Paused("已手动暂停".to_owned()));
+                state.paused = true;
+                state.paused_since = Some(Instant::now());
+            }
+            interruptible_wait(Duration::from_millis(200), self.stop, Some(&self.pause))?;
+            return Ok(false);
         }
         if state.window_missing || !platform::is_window_alive(&self.target) {
             if !state.window_missing {
@@ -813,7 +848,7 @@ impl StepContext<'_> {
                     state.window_missing = false;
                 }
                 Err(_) => {
-                    interruptible_wait(Duration::from_millis(500), self.stop)?;
+                    interruptible_wait(Duration::from_millis(500), self.stop, Some(&self.pause))?;
                     return Ok(false);
                 }
             }
@@ -826,7 +861,7 @@ impl StepContext<'_> {
                 state.paused = true;
                 state.paused_since = Some(Instant::now());
             }
-            interruptible_wait(Duration::from_millis(250), self.stop)?;
+            interruptible_wait(Duration::from_millis(250), self.stop, Some(&self.pause))?;
             return Ok(false);
         }
         if state.paused {
@@ -1049,7 +1084,7 @@ fn send_keys(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), Strin
                 }
                 platform::send_unicode_char(&ctx.target, ch).map_err(|error| error.to_string())?;
                 let interval = ctx.jitter.jitter_ms(step.key_interval_ms, humanize);
-                interruptible_wait(Duration::from_millis(interval), ctx.stop)?;
+                interruptible_wait(Duration::from_millis(interval), ctx.stop, Some(&ctx.pause))?;
             }
         }
         KeyInputMode::Combo => {
@@ -1754,17 +1789,77 @@ fn tracking_region(
     }
 }
 
-fn interruptible_wait(duration: Duration, stop: &AtomicBool) -> Result<(), String> {
-    let end = Instant::now() + duration;
-    while Instant::now() < end {
+/// Waits up to `duration`, aborting when the run is stopped. When a pause flag
+/// is supplied, paused time does not consume the remaining duration, matching
+/// the way step deadlines are extended by the paused interval.
+fn interruptible_wait(
+    duration: Duration,
+    stop: &AtomicBool,
+    pause: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let mut remaining = duration;
+    while remaining > Duration::ZERO {
         if stop.load(Ordering::Acquire) {
             return Err("用户停止".to_owned());
         }
-        std::thread::sleep(
-            Duration::from_millis(25).min(end.saturating_duration_since(Instant::now())),
-        );
+        if pause.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let started = Instant::now();
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+        remaining = remaining.saturating_sub(started.elapsed());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::interruptible_wait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn paused_wait_does_not_consume_its_remaining_time() {
+        let stop = AtomicBool::new(false);
+        let pause_flag = Arc::new(AtomicBool::new(true));
+        let pause = Arc::clone(&pause_flag);
+        let releaser = {
+            let pause = Arc::clone(&pause_flag);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                pause.store(false, Ordering::Release);
+            })
+        };
+        let started = Instant::now();
+        interruptible_wait(Duration::from_millis(40), &stop, Some(&pause))
+            .expect("pause without stop must not fail");
+        let elapsed = started.elapsed();
+        releaser.join().expect("releaser thread");
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "paused time must not consume the wait (elapsed {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn stop_during_pause_still_aborts_the_wait() {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stop_flag);
+        let pause_flag = Arc::new(AtomicBool::new(true));
+        let pause = Arc::clone(&pause_flag);
+        let stopper = {
+            let stop = Arc::clone(&stop_flag);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                stop.store(true, Ordering::Release);
+            })
+        };
+        let result = interruptible_wait(Duration::from_secs(5), &stop, Some(&pause));
+        stopper.join().expect("stopper thread");
+        assert_eq!(result, Err("用户停止".to_owned()));
+    }
 }
 
 fn parse_deadline(value: &str) -> Result<NaiveTime, String> {
@@ -1871,6 +1966,7 @@ mod tests {
             frame_width: 200,
             frame_height: 80,
             stop: &stop,
+            pause: std::sync::Arc::new(AtomicBool::new(false)),
             events: &events,
             jitter: Jitter(1),
             accelerated_until: Cell::new(None),
@@ -1955,6 +2051,7 @@ mod tests {
             frame_width: 100,
             frame_height: 100,
             stop: &stop,
+            pause: std::sync::Arc::new(AtomicBool::new(false)),
             events: &events,
             jitter: Jitter(1),
             accelerated_until: Cell::new(None),

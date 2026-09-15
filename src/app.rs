@@ -2566,6 +2566,30 @@ impl Make5771App {
                         .color(theme::tertiary_label()),
                 );
             }
+            if self.workflow_runner.is_some() && self.runner_status != RunnerStatus::Finishing {
+                ui.add_space(8.0);
+                let paused = self.runner_status == RunnerStatus::Paused;
+                let label = if paused { "继续运行" } else { "暂停" };
+                let clicked = ui
+                    .add(theme::secondary_button(label))
+                    .on_hover_text(if paused {
+                        "恢复识别与点击；暂停期间不会消耗步骤超时"
+                    } else {
+                        "暂停识别与点击；当前步骤超时会顺延"
+                    })
+                    .clicked();
+                if clicked && let Some(runner) = &self.workflow_runner {
+                    if paused {
+                        runner.request_resume();
+                        self.runner_status = RunnerStatus::Running;
+                        self.push_log(LogLevel::Info, "已恢复运行");
+                    } else {
+                        runner.request_pause();
+                        self.runner_status = RunnerStatus::Paused;
+                        self.push_log(LogLevel::Info, "已暂停（点击同一按钮继续）");
+                    }
+                }
+            }
         });
     }
 
