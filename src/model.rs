@@ -333,6 +333,10 @@ fn default_stop_hotkey() -> String {
     "f8".to_owned()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_skin_id() -> String {
     crate::theme::DEFAULT_SKIN_ID.to_owned()
 }
@@ -1131,6 +1135,15 @@ pub struct MacroProfile {
     /// `dark_mode`.
     #[serde(default)]
     pub follow_system_dark: bool,
+    /// Draw a semi-transparent character portrait in a background corner.
+    #[serde(default = "default_true")]
+    pub background_portrait: bool,
+    /// Roll a new portrait on every start; when false the current one is kept.
+    #[serde(default = "default_true")]
+    pub background_portrait_random: bool,
+    /// Last portrait id, restored when random mode is off.
+    #[serde(default)]
+    pub background_portrait_id: String,
     /// Colour scheme id; unknown ids fall back to the default skin.
     #[serde(default = "default_skin_id")]
     pub skin_id: String,
@@ -1285,6 +1298,9 @@ impl Default for MacroProfile {
             dark_mode: false,
             follow_system_dark: false,
             skin_id: default_skin_id(),
+            background_portrait: true,
+            background_portrait_random: true,
+            background_portrait_id: String::new(),
             ui_scale: default_ui_scale(),
             capture_hotkey: default_capture_hotkey(),
             stop_hotkey: default_stop_hotkey(),

@@ -212,6 +212,9 @@ pub struct Make5771App {
     template_reference_view: Option<String>,
     /// Which dark mode the theme was last applied with (system-follow support).
     applied_dark: bool,
+    background_art: crate::art::BackgroundArt,
+    background_portrait_index: usize,
+    background_portrait_left: bool,
     template_roi_draft: Option<TemplateRoiDraft>,
     pending_capture: Option<image::RgbaImage>,
     capture_purpose: CapturePurpose,
@@ -342,6 +345,9 @@ impl Make5771App {
             profile.expected_client_width = target.client_width;
             profile.expected_client_height = target.client_height;
         }
+        let background_art = crate::art::BackgroundArt::load(&cc.egui_ctx);
+        let (background_portrait_index, background_portrait_left) =
+            pick_background_portrait(&background_art, &profile);
         let repaint_waker: platform::RepaintWaker = {
             let ctx = cc.egui_ctx.clone();
             std::sync::Arc::new(move || ctx.request_repaint())
@@ -412,6 +418,9 @@ impl Make5771App {
             pending_logs: Vec::new(),
             settings_section: SettingsSection::Interface,
             applied_dark,
+            background_art,
+            background_portrait_index,
+            background_portrait_left,
             report_failures: std::collections::BTreeMap::new(),
             report_matches: std::collections::BTreeMap::new(),
             report_score_sum: 0.0,
@@ -1147,6 +1156,24 @@ impl Make5771App {
         let report = self.workflow_preflight(check_files);
         self.preflight_cache = Some((std::time::Instant::now(), report.clone()));
         report
+    }
+
+    /// Picks another background portrait: random when enabled, otherwise the
+    /// next one in the list.
+    fn roll_background_portrait(&mut self) {
+        if self.background_art.is_empty() {
+            return;
+        }
+        let index = if self.profile.background_portrait_random {
+            random_index(self.background_art.len())
+        } else {
+            (self.background_portrait_index + 1) % self.background_art.len()
+        };
+        self.background_portrait_index = index;
+        self.background_portrait_left = index % 2 == 0;
+        if let Some(portrait) = self.background_art.portrait(index) {
+            self.profile.background_portrait_id = portrait.id.clone();
+        }
     }
 
     /// Flattens the current run statistics into CSV rows.
@@ -4241,6 +4268,56 @@ impl Make5771App {
                     )
                     .size(11.0)
                     .color(theme::tertiary_label()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("背景立绘");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let before = self.profile.background_portrait;
+                        if theme::switch(ui, &mut self.profile.background_portrait).changed()
+                            && !before
+                        {
+                            self.roll_background_portrait();
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("每次启动随机一张");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let mut value = self.profile.background_portrait_random;
+                        let enabled = self.profile.background_portrait;
+                        let response = ui
+                            .add_enabled_ui(enabled, |ui| theme::switch(ui, &mut value))
+                            .inner;
+                        if response.changed() {
+                            self.profile.background_portrait_random = value;
+                            if !value {
+                                self.roll_background_portrait();
+                            }
+                        }
+                        if ui
+                            .add_enabled(enabled, theme::secondary_button("换一张"))
+                            .clicked()
+                        {
+                            self.roll_background_portrait();
+                        }
+                    });
+                });
+                let portrait_note = if self.background_art.is_empty() {
+                    "没有可用的背景立绘文件（assets/art/portraits/）".to_owned()
+                } else {
+                    format!(
+                        "当前：{}　共 {} 张，半透明绘制在左下/右下角，不影响文字对比度，可随时关闭。",
+                        self.background_art
+                            .portrait(self.background_portrait_index)
+                            .map(|portrait| portrait.id.clone())
+                            .unwrap_or_else(|| "—".to_owned()),
+                        self.background_art.len()
+                    )
+                };
+                ui.label(
+                    RichText::new(portrait_note)
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
                 );
                 ui.horizontal(|ui| {
                     ui.label("界面缩放");
@@ -8372,6 +8449,35 @@ fn widget_activated(ui: &egui::Ui, response: &egui::Response) -> bool {
             }))
 }
 
+/// Chooses the startup portrait: random when enabled, otherwise the portrait
+/// saved in the profile (falling back to the first one).
+fn pick_background_portrait(
+    art: &crate::art::BackgroundArt,
+    profile: &MacroProfile,
+) -> (usize, bool) {
+    if art.is_empty() {
+        return (0, false);
+    }
+    let index = if profile.background_portrait_random {
+        random_index(art.len())
+    } else {
+        art.index_of(&profile.background_portrait_id).unwrap_or(0)
+    };
+    (index, index % 2 == 0)
+}
+
+/// Cheap randomness without pulling in an extra dependency.
+fn random_index(count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as usize ^ elapsed.as_secs() as usize)
+        .unwrap_or(0);
+    nanos % count
+}
+
 fn log_level_color(level: LogLevel) -> Color32 {
     match level {
         LogLevel::Info => theme::blue(),
@@ -8892,6 +8998,17 @@ impl eframe::App for Make5771App {
             )
             .show(ui, |ui| {
                 theme::paint_background(ui.painter(), ui.max_rect());
+                if self.profile.background_portrait
+                    && let Some(portrait) =
+                        self.background_art.portrait(self.background_portrait_index)
+                {
+                    crate::art::paint_portrait(
+                        ui.painter(),
+                        ui.max_rect(),
+                        &portrait.texture,
+                        self.background_portrait_left,
+                    );
+                }
                 let active_tab = self.active_tab;
                 egui::ScrollArea::vertical()
                     .id_salt(("main-page", active_tab.label()))
