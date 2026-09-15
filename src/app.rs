@@ -246,6 +246,15 @@ pub struct Make5771App {
     repaint_waker: platform::RepaintWaker,
     log_level_filter: Option<LogLevel>,
     log_query: String,
+    /// Debug start options used by the run page.
+    run_start_step_id: Option<u64>,
+    run_single_step: bool,
+    /// True while the user paused the run themselves (auto foreground pauses
+    /// are reported by the runner instead).
+    manual_pause: bool,
+    step_clipboard: Option<WorkflowStep>,
+    /// Logs queued while a mutable borrow of the profile is active.
+    pending_logs: Vec<(LogLevel, String)>,
 }
 
 /// Upper bound for the in-memory log list (the on-disk log keeps everything).
@@ -334,6 +343,11 @@ impl Make5771App {
             repaint_waker,
             log_level_filter: None,
             log_query: String::new(),
+            run_start_step_id: None,
+            run_single_step: false,
+            manual_pause: false,
+            step_clipboard: None,
+            pending_logs: Vec::new(),
             force_stop_confirm: false,
             target_window,
             template_draft: None,
@@ -937,7 +951,7 @@ impl Make5771App {
                 }
                 RunnerEvent::Resumed => {
                     self.runner_status = RunnerStatus::Running;
-                    self.push_log(LogLevel::Info, "游戏回到前台，流程继续");
+                    self.push_log(LogLevel::Info, "流程继续运行");
                 }
                 RunnerEvent::RoundCompleted(rounds) => {
                     self.completed_rounds = rounds;
@@ -1086,7 +1100,11 @@ impl Make5771App {
             .clone()
             .expect("运行检查已确认目标窗口存在");
         let profile = self.execution_profile();
-        match RunnerHandle::start(profile, target.clone()) {
+        let options = crate::runner::RunOptions {
+            start_step_id: self.run_start_step_id,
+            pause_after_steps: self.run_single_step.then_some(1),
+        };
+        match RunnerHandle::start(profile, target.clone(), options) {
             Ok(runner) => {
                 if let Err(error) = platform::focus_target(&target) {
                     runner.request_stop();
@@ -1096,6 +1114,7 @@ impl Make5771App {
                 }
                 self.completed_rounds = 0;
                 self.current_step = "正在启动".to_owned();
+                self.manual_pause = false;
                 self.runner_status = RunnerStatus::Running;
                 self.workflow_runner = Some(runner);
             }
@@ -2540,6 +2559,49 @@ impl Make5771App {
             });
         }
 
+        ui.add_space(10.0);
+        theme::card().show(ui, |ui| {
+            ui.label(RichText::new("调试运行").size(18.0).strong());
+            ui.separator();
+            let steps: Vec<(u64, String)> = self
+                .profile
+                .steps
+                .iter()
+                .filter(|step| step.enabled)
+                .map(|step| (step.id, step.name.clone()))
+                .collect();
+            ui.horizontal(|ui| {
+                ui.label("起始步骤");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let selected = self
+                        .run_start_step_id
+                        .and_then(|id| steps.iter().find(|(step_id, _)| *step_id == id))
+                        .map(|(_, name)| name.clone());
+                    egui::ComboBox::from_id_salt("run_start_step")
+                        .selected_text(selected.unwrap_or_else(|| "从第一步开始".to_owned()))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.run_start_step_id, None, "从第一步开始");
+                            for (id, name) in &steps {
+                                ui.selectable_value(&mut self.run_start_step_id, Some(*id), name);
+                            }
+                        });
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("运行一步后自动暂停");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    theme::switch(ui, &mut self.run_single_step);
+                });
+            });
+            ui.label(
+                RichText::new(
+                    "调试用：可从指定步骤开始（跳过前面的步骤），或执行一步后自动暂停；恢复运行点「继续运行」。",
+                )
+                .size(11.0)
+                .color(theme::tertiary_label()),
+            );
+        });
+
         ui.add_space(12.0);
         ui.vertical_centered(|ui| {
             if self.runner_status == RunnerStatus::Ready
@@ -2587,7 +2649,7 @@ impl Make5771App {
             }
             if self.workflow_runner.is_some() && self.runner_status != RunnerStatus::Finishing {
                 ui.add_space(8.0);
-                let paused = self.runner_status == RunnerStatus::Paused;
+                let paused = self.manual_pause;
                 let label = if paused { "继续运行" } else { "暂停" };
                 let clicked = ui
                     .add(theme::secondary_button(label))
@@ -2600,10 +2662,12 @@ impl Make5771App {
                 if clicked && let Some(runner) = &self.workflow_runner {
                     if paused {
                         runner.request_resume();
+                        self.manual_pause = false;
                         self.runner_status = RunnerStatus::Running;
                         self.push_log(LogLevel::Info, "已恢复运行");
                     } else {
                         runner.request_pause();
+                        self.manual_pause = true;
                         self.runner_status = RunnerStatus::Paused;
                         self.push_log(LogLevel::Info, "已暂停（点击同一按钮继续）");
                     }
@@ -2626,6 +2690,16 @@ impl Make5771App {
                     RichText::new(format!("当前流程：{}", self.profile.name))
                         .color(theme::secondary_label()),
                 );
+                if let Some(step) = &self.step_clipboard {
+                    ui.label(
+                        RichText::new(format!(
+                            "剪贴板：{}（在任意步骤的「操作」菜单里粘贴）",
+                            step.name
+                        ))
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                    );
+                }
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add(
@@ -2962,6 +3036,9 @@ impl Make5771App {
                                                 selected,
                                                 &template_options,
                                                 profile_scan_interval,
+                                                self.step_clipboard
+                                                    .as_ref()
+                                                    .map(|step| step.name.as_str()),
                                                 &mut list_command,
                                                 false,
                                             );
@@ -2977,6 +3054,9 @@ impl Make5771App {
                                                         selected,
                                                         &template_options,
                                                         profile_scan_interval,
+                                                        self.step_clipboard
+                                                            .as_ref()
+                                                            .map(|step| step.name.as_str()),
                                                         &mut list_command,
                                                         true,
                                                     );
@@ -3024,6 +3104,27 @@ impl Make5771App {
                                 let new_id = copy.id;
                                 self.profile.steps.insert(index + 1, copy);
                                 self.selected_step = Some(new_id);
+                            }
+                            Some(StepListCommand::Clipboard(index)) => {
+                                let step = self.profile.steps[index].clone();
+                                let message = format!("已复制步骤“{}”到剪贴板", step.name);
+                                self.step_clipboard = Some(step);
+                                self.toast = Some(message.clone());
+                                self.push_log(LogLevel::Info, message);
+                            }
+                            Some(StepListCommand::PasteAfter(index)) => {
+                                if let Some(mut pasted) = self.step_clipboard.clone() {
+                                    pasted.id = self.profile.next_step_id();
+                                    let new_id = pasted.id;
+                                    let name = pasted.name.clone();
+                                    self.profile.steps.insert(index + 1, pasted);
+                                    self.selected_step = Some(new_id);
+                                    self.toast = Some(format!("已粘贴步骤“{name}”"));
+                                    self.push_log(
+                                        LogLevel::Success,
+                                        format!("已从剪贴板粘贴步骤“{name}”"),
+                                    );
+                                }
                             }
                             Some(StepListCommand::ToggleEnabled(index)) => {
                                 let step = &mut self.profile.steps[index];
@@ -3246,6 +3347,7 @@ impl Make5771App {
             }
         });
         let next_id = self.profile.next_step_id();
+        let clipboard_name = self.step_clipboard.as_ref().map(|step| step.name.clone());
         let refs = self
             .profile
             .steps
@@ -3313,6 +3415,7 @@ impl Make5771App {
                         Some(step.id) == self.selected_subflow_step,
                         templates,
                         scan,
+                        clipboard_name.as_deref(),
                         &mut command,
                         true,
                     )
@@ -3349,6 +3452,24 @@ impl Make5771App {
                     step.name.push_str(" 副本");
                     self.selected_subflow_step = Some(step.id);
                     flow.steps.insert(i + 1, step);
+                }
+                Some(StepListCommand::Clipboard(i)) => {
+                    let step = flow.steps[i].clone();
+                    let message = format!("已复制步骤“{}”到剪贴板", step.name);
+                    self.step_clipboard = Some(step);
+                    self.toast = Some(message.clone());
+                    self.pending_logs.push((LogLevel::Info, message));
+                }
+                Some(StepListCommand::PasteAfter(i)) => {
+                    if let Some(mut pasted) = self.step_clipboard.clone() {
+                        pasted.id = next_id;
+                        let name = pasted.name.clone();
+                        self.selected_subflow_step = Some(pasted.id);
+                        flow.steps.insert(i + 1, pasted);
+                        self.toast = Some(format!("已粘贴步骤“{name}”"));
+                        self.pending_logs
+                            .push((LogLevel::Success, format!("已从剪贴板粘贴步骤“{name}”")));
+                    }
                 }
                 _ => {}
             }
@@ -5117,8 +5238,15 @@ enum StepListCommand {
     Add(StepKind),
     MoveUp(usize),
     MoveDown(usize),
-    Move { from: usize, to: usize },
+    Move {
+        from: usize,
+        to: usize,
+    },
     Duplicate(usize),
+    /// Copies the step into the app-wide clipboard.
+    Clipboard(usize),
+    /// Pastes the clipboard step below this one.
+    PasteAfter(usize),
     ToggleEnabled(usize),
     Delete(usize),
 }
@@ -5167,6 +5295,7 @@ fn render_step_list_row(
     selected: bool,
     template_options: &[(u64, String, String)],
     profile_scan_interval: Option<u8>,
+    clipboard_step: Option<&str>,
     command: &mut Option<StepListCommand>,
     draggable: bool,
 ) -> Option<u64> {
@@ -5246,8 +5375,32 @@ fn render_step_list_row(
                 *command = Some(StepListCommand::ToggleEnabled(index));
                 ui.close();
             }
-            if ui.button("复制步骤").clicked() {
+            if ui
+                .button("原地复制步骤")
+                .on_hover_text("在当前流程里插入一份副本")
+                .clicked()
+            {
                 *command = Some(StepListCommand::Duplicate(index));
+                ui.close();
+            }
+            if ui
+                .button("复制到剪贴板")
+                .on_hover_text("可在其它流程的步骤菜单里粘贴")
+                .clicked()
+            {
+                *command = Some(StepListCommand::Clipboard(index));
+                ui.close();
+            }
+            let paste_label = match clipboard_step {
+                Some(name) => format!("在下方粘贴“{name}”"),
+                None => "在下方粘贴".to_owned(),
+            };
+            if ui
+                .add_enabled(clipboard_step.is_some(), egui::Button::new(paste_label))
+                .on_disabled_hover_text("剪贴板里还没有步骤")
+                .clicked()
+            {
+                *command = Some(StepListCommand::PasteAfter(index));
                 ui.close();
             }
             ui.separator();
@@ -7902,6 +8055,9 @@ fn window_resize_borders(ui: &mut egui::Ui) {
 
 impl eframe::App for Make5771App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        for (level, message) in std::mem::take(&mut self.pending_logs) {
+            self.push_log(level, message);
+        }
         self.process_background_events(ctx);
     }
 
@@ -8351,6 +8507,7 @@ mod tests {
                                 false,
                                 &[],
                                 Some(3),
+                                None,
                                 &mut None,
                                 true,
                             )
@@ -8456,6 +8613,7 @@ mod tests {
                                 false,
                                 &[],
                                 Some(3),
+                                None,
                                 &mut command,
                                 draggable,
                             ) {

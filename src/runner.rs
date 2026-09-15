@@ -51,6 +51,14 @@ pub enum RunnerEvent {
     Failed(String),
 }
 
+/// Debug-oriented start options: run from a chosen step and/or stop after a
+/// number of executed steps (single-step debugging).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions {
+    pub start_step_id: Option<u64>,
+    pub pause_after_steps: Option<u32>,
+}
+
 pub struct RunnerHandle {
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
@@ -58,7 +66,11 @@ pub struct RunnerHandle {
 }
 
 impl RunnerHandle {
-    pub fn start(profile: MacroProfile, target: TargetWindow) -> Result<Self, String> {
+    pub fn start(
+        profile: MacroProfile,
+        target: TargetWindow,
+        options: RunOptions,
+    ) -> Result<Self, String> {
         validate_executable_profile(&profile)?;
         let (sender, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -67,7 +79,9 @@ impl RunnerHandle {
         let thread_pause = Arc::clone(&pause);
         std::thread::Builder::new()
             .name("m5771-runner".to_owned())
-            .spawn(move || run_workflow(profile, target, thread_stop, thread_pause, sender))
+            .spawn(move || {
+                run_workflow(profile, target, thread_stop, thread_pause, options, sender)
+            })
             .map_err(|error| format!("无法启动执行线程：{error}"))?;
         Ok(Self {
             stop,
@@ -241,6 +255,7 @@ fn run_workflow(
     target: TargetWindow,
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
+    options: RunOptions,
     events: mpsc::Sender<RunnerEvent>,
 ) {
     let startup_frame = match platform::capture_client(&target) {
@@ -303,6 +318,12 @@ fn run_workflow(
         accelerated_until: Cell::new(None),
     };
 
+    let steps: Vec<&WorkflowStep> = profile.steps.iter().filter(|step| step.enabled).collect();
+    let recovery = profile.failure_recovery.sanitised();
+    let start_index = resolve_start_index(&steps, options.start_step_id);
+    let mut first_round = true;
+    let mut executed_steps = 0_u32;
+
     'rounds: loop {
         if stop.load(Ordering::Acquire) {
             let _ = events.send(RunnerEvent::Stopped("用户停止".to_owned()));
@@ -313,10 +334,9 @@ fn run_workflow(
             break;
         }
 
-        let steps: Vec<&WorkflowStep> = profile.steps.iter().filter(|step| step.enabled).collect();
-        let recovery = profile.failure_recovery.sanitised();
         let mut consecutive_recoveries = 0_u8;
-        let mut index = 0_usize;
+        let mut index = if first_round { start_index } else { 0 };
+        first_round = false;
         while index < steps.len() {
             if stop.load(Ordering::Acquire) {
                 let _ = events.send(RunnerEvent::Stopped("用户停止".to_owned()));
@@ -337,6 +357,16 @@ fn run_workflow(
                     consecutive_recoveries = 0;
                     *ctx.failure.borrow_mut() = None;
                     index += 1;
+                    executed_steps += 1;
+                    if options
+                        .pause_after_steps
+                        .is_some_and(|limit| executed_steps >= limit)
+                    {
+                        pause.store(true, Ordering::Release);
+                        let _ = events.send(RunnerEvent::Notice(format!(
+                            "单步调试：已执行 {executed_steps} 步，点击「继续运行」继续"
+                        )));
+                    }
                 }
                 Ok(StepControl::CompleteRound) => {
                     completed_rounds += 1;
@@ -992,6 +1022,14 @@ impl FrameSnapshot {
             (algorithm == MatchAlgorithm::Hybrid).then(|| vision::PreparedFrame::new(&rgba));
         Ok(Self { rgba, gray, hybrid })
     }
+}
+
+/// Index of the step a debug run starts from; unknown or disabled steps fall
+/// back to the first step.
+fn resolve_start_index(steps: &[&WorkflowStep], start_step_id: Option<u64>) -> usize {
+    start_step_id
+        .and_then(|id| steps.iter().position(|step| step.id == id))
+        .unwrap_or(0)
 }
 
 /// A failed step kept around until the flow either recovers or gives up.
@@ -2023,9 +2061,22 @@ fn interruptible_wait(
 #[cfg(test)]
 mod wait_tests {
     use super::interruptible_wait;
+    use crate::model::{StepKind, WorkflowStep};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn debug_start_index_falls_back_to_the_first_step() {
+        let first = WorkflowStep::new(1, "一", StepKind::Delay, 0);
+        let second = WorkflowStep::new(2, "二", StepKind::Delay, 0);
+        let steps = vec![&first, &second];
+        assert_eq!(super::resolve_start_index(&steps, Some(2)), 1);
+        assert_eq!(super::resolve_start_index(&steps, Some(1)), 0);
+        assert_eq!(super::resolve_start_index(&steps, Some(99)), 0);
+        assert_eq!(super::resolve_start_index(&steps, None), 0);
+        assert_eq!(super::resolve_start_index(&[], Some(1)), 0);
+    }
 
     #[test]
     fn resync_picks_the_most_advanced_visible_step() {
