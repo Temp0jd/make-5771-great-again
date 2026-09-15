@@ -5,9 +5,10 @@ use crate::mascot::Mascots;
 use crate::model::{
     AppTab, BranchAction, BranchActionKind, BranchOutcome, ClickAnchor, ClickMethod,
     ConditionExpectation, ConditionMatchMode, ConditionOutcome, KeyCombo, KeyInputMode, LogEntry,
-    LogLevel, LoopMode, MacroProfile, RecognitionPerformance, RunnerStatus, SearchRegionSpec,
-    SearchStrategy, StepKind, TemplateAsset, TemplateScaleMode, TemplateUseSearch,
-    VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_hotkeys, parse_key_combo,
+    LogLevel, LoopMode, MacroProfile, RecognitionPerformance, RecoveryFallback, RunnerStatus,
+    SearchRegionSpec, SearchStrategy, StepKind, TemplateAsset, TemplateScaleMode,
+    TemplateUseSearch, VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_hotkeys,
+    parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
 use crate::runner::{RunnerEvent, RunnerHandle};
@@ -4114,6 +4115,97 @@ impl Make5771App {
                     .color(theme::orange()),
                 );
             }
+        });
+
+        ui.add_space(10.0);
+        theme::card().show(ui, |ui| {
+            ui.label(RichText::new("失败自动恢复").size(18.0).strong());
+            ui.separator();
+            ui.label(
+                RichText::new(
+                    "步骤超时后先补充扫描；仍失败时探测前后步骤，确定游戏当前进度后从该步继续；\n无法定位时按下方方式处理。恢复过程只识别、不点击。",
+                )
+                .size(11.0)
+                .color(theme::tertiary_label()),
+            );
+            let recovery = &mut self.profile.failure_recovery;
+            ui.horizontal(|ui| {
+                ui.label("超时后补充扫描");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("recovery_extra_scans")
+                        .selected_text(match recovery.extra_scans {
+                            0 => "关闭".to_owned(),
+                            count => format!("{count} 次"),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut recovery.extra_scans, 0, "关闭");
+                            for count in 1..=3_u8 {
+                                ui.selectable_value(
+                                    &mut recovery.extra_scans,
+                                    count,
+                                    format!("{count} 次"),
+                                );
+                            }
+                        });
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("重同步探测范围");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("recovery_window")
+                        .selected_text(format!("前后各 {} 步", recovery.resync_window))
+                        .show_ui(ui, |ui| {
+                            for window in 1..=5_u8 {
+                                ui.selectable_value(
+                                    &mut recovery.resync_window,
+                                    window,
+                                    format!("前后各 {window} 步"),
+                                );
+                            }
+                        });
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("最多自动恢复次数");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("recovery_max")
+                        .selected_text(match recovery.max_recoveries {
+                            0 => "不自动恢复".to_owned(),
+                            count => format!("{count} 次"),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut recovery.max_recoveries, 0, "不自动恢复");
+                            for count in 1..=5_u8 {
+                                ui.selectable_value(
+                                    &mut recovery.max_recoveries,
+                                    count,
+                                    format!("{count} 次"),
+                                );
+                            }
+                        });
+                });
+            });
+            ui.label(
+                RichText::new("设为 0 时超时立即按“停止”处理，不做任何回退。")
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
+            ui.horizontal(|ui| {
+                ui.label("无法定位当前进度时");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("recovery_fallback")
+                        .selected_text(recovery.fallback.label())
+                        .show_ui(ui, |ui| {
+                            for fallback in [RecoveryFallback::Restart, RecoveryFallback::Stop] {
+                                ui.selectable_value(
+                                    &mut recovery.fallback,
+                                    fallback,
+                                    fallback.label(),
+                                );
+                            }
+                        });
+                });
+            });
         });
 
         ui.add_space(10.0);

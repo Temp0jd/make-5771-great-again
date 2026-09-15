@@ -1132,8 +1132,71 @@ pub struct MacroProfile {
     pub adaptive_roi: bool,
     #[serde(default = "default_stable_confirm")]
     pub stable_confirm: bool,
+    /// Automatic recovery when a step times out (see [`FailureRecovery`]).
+    #[serde(default)]
+    pub failure_recovery: FailureRecovery,
     #[serde(default)]
     pub sharing: SharingMetadata,
+}
+
+/// Automatic recovery settings for a timed-out step.
+///
+/// The runner first re-checks the failing step (`extra_scans`), then probes the
+/// surrounding steps to find where the game actually is, and only then falls
+/// back to restarting the round or stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureRecovery {
+    /// Extra recognition passes on the failing step before it counts as failed.
+    pub extra_scans: u8,
+    /// Steps probed on each side of the failing step when resynchronising.
+    pub resync_window: u8,
+    /// Consecutive recoveries allowed before the fallback action runs.
+    pub max_recoveries: u8,
+    /// What to do when the resynchronisation probe finds no known step.
+    pub fallback: RecoveryFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RecoveryFallback {
+    /// Re-run the flow from its first step.
+    #[default]
+    Restart,
+    /// Stop the run and ask the user to look at the log.
+    Stop,
+}
+
+impl RecoveryFallback {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Restart => "从头重新执行本流程",
+            Self::Stop => "停止并提醒",
+        }
+    }
+}
+
+impl Default for FailureRecovery {
+    fn default() -> Self {
+        Self {
+            extra_scans: 2,
+            resync_window: 3,
+            max_recoveries: 3,
+            fallback: RecoveryFallback::Restart,
+        }
+    }
+}
+
+impl FailureRecovery {
+    pub fn is_enabled(self) -> bool {
+        self.extra_scans > 0 || self.max_recoveries > 0
+    }
+
+    /// Clamps values to the ranges the UI offers (hand-edited packages).
+    pub fn sanitised(mut self) -> Self {
+        self.extra_scans = self.extra_scans.min(5);
+        self.resync_window = self.resync_window.min(5);
+        self.max_recoveries = self.max_recoveries.min(10);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1169,6 +1232,7 @@ impl Default for MacroProfile {
             deadline: "23:30".to_owned(),
             finish_current_round: true,
             subflows: Vec::new(),
+            failure_recovery: FailureRecovery::default(),
             steps: vec![
                 WorkflowStep::new(1, "开始游戏", StepKind::WaitAndClick, 0),
                 WorkflowStep::new(2, "开启 Auto", StepKind::WaitAndClick, 0),
@@ -1558,6 +1622,34 @@ pub enum LogLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_recovery_defaults_and_sanitising() {
+        let defaults = FailureRecovery::default();
+        assert_eq!(defaults.extra_scans, 2);
+        assert_eq!(defaults.resync_window, 3);
+        assert_eq!(defaults.max_recoveries, 3);
+        assert_eq!(defaults.fallback, RecoveryFallback::Restart);
+        assert!(defaults.is_enabled());
+
+        // Hand-edited packages cannot push the values out of range.
+        let clamped = FailureRecovery {
+            extra_scans: 200,
+            resync_window: 200,
+            max_recoveries: 200,
+            fallback: RecoveryFallback::Stop,
+        }
+        .sanitised();
+        assert_eq!(clamped.extra_scans, 5);
+        assert_eq!(clamped.resync_window, 5);
+        assert_eq!(clamped.max_recoveries, 10);
+
+        // A package written before this feature keeps working with defaults.
+        let mut value = serde_json::to_value(MacroProfile::default()).unwrap();
+        value.as_object_mut().unwrap().remove("failure_recovery");
+        let legacy: MacroProfile = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.failure_recovery, FailureRecovery::default());
+    }
 
     #[test]
     fn legacy_profiles_default_to_no_subflows() {

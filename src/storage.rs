@@ -140,6 +140,87 @@ pub fn append_log(entry: &LogEntry) -> io::Result<()> {
     writeln!(file, "{} [{}] {}", entry.time, level, entry.message)
 }
 
+/// Metadata written next to a failed-step frame.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FailureSnapshotMeta {
+    pub time: String,
+    pub step: String,
+    pub template: String,
+    pub threshold: f32,
+    pub effective_threshold: f32,
+    pub best_score: f32,
+    pub ambiguous: bool,
+    pub search_complete: bool,
+    pub frame_width: u32,
+    pub frame_height: u32,
+}
+
+/// Keeps the newest `KEEP` failure snapshots and removes the rest.
+const KEEP_FAILURE_SNAPSHOTS: usize = 40;
+
+/// Writes the frame that made a step give up, plus a JSON sidecar, under
+/// `logs/frames/`. Users can open the PNG next to the template in the library
+/// to see why matching failed.
+pub fn save_failure_snapshot(
+    frame: &image::RgbaImage,
+    meta: &FailureSnapshotMeta,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all("logs/frames").map_err(|error| format!("无法创建诊断目录：{error}"))?;
+    let stem = format!(
+        "{}-{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S"),
+        sanitise_file_stem(&meta.step)
+    );
+    let png = PathBuf::from(format!("logs/frames/{stem}.png"));
+    frame
+        .save(&png)
+        .map_err(|error| format!("诊断截图保存失败：{error}"))?;
+    let json = PathBuf::from(format!("logs/frames/{stem}.json"));
+    let contents =
+        serde_json::to_string_pretty(meta).map_err(|error| format!("诊断信息编码失败：{error}"))?;
+    fs::write(&json, contents).map_err(|error| format!("诊断信息保存失败：{error}"))?;
+    prune_failure_snapshots();
+    Ok(png)
+}
+
+fn sanitise_file_stem(name: &str) -> String {
+    let mut stem: String = name
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    stem.truncate(24);
+    if stem.trim_matches('_').is_empty() {
+        stem = "step".to_owned();
+    }
+    stem
+}
+
+fn prune_failure_snapshots() {
+    let Ok(entries) = fs::read_dir("logs/frames") else {
+        return;
+    };
+    let mut frames: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
+        .collect();
+    if frames.len() <= KEEP_FAILURE_SNAPSHOTS {
+        return;
+    }
+    frames.sort();
+    let excess = frames.len() - KEEP_FAILURE_SNAPSHOTS;
+    for path in frames.into_iter().take(excess) {
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("json"));
+    }
+}
+
 pub fn load_profile(path: &Path) -> Result<MacroProfile, StorageError> {
     let contents = fs::read_to_string(path).map_err(StorageError::Read)?;
     let profile: MacroProfile = serde_json::from_str(&contents).map_err(StorageError::Decode)?;

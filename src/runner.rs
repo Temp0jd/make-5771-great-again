@@ -9,9 +9,9 @@ use image::{GrayImage, RgbaImage};
 
 use crate::model::{
     BranchAction, BranchActionKind, BranchOutcome, ClickAnchor, ClickMethod, ConditionExpectation,
-    ConditionMatchMode, ConditionOutcome, KeyInputMode, LoopMode, MacroProfile, SearchStrategy,
-    StepKind, TemplateAsset, TemplateScaleMode, TemplateUseSearch, VisualConditionTerm,
-    WorkflowBranch, WorkflowStep, parse_key_combo,
+    ConditionMatchMode, ConditionOutcome, KeyInputMode, LoopMode, MacroProfile, RecoveryFallback,
+    SearchStrategy, StepKind, TemplateAsset, TemplateScaleMode, TemplateUseSearch,
+    VisualConditionTerm, WorkflowBranch, WorkflowStep, parse_key_combo,
 };
 use crate::platform::{self, TargetWindow};
 use crate::vision::{self, MatchAlgorithm, SearchRegion};
@@ -297,6 +297,7 @@ fn run_workflow(
         frame_height,
         stop: &stop,
         pause: Arc::clone(&pause),
+        failure: std::cell::RefCell::new(None),
         events: &events,
         jitter: Jitter::new(),
         accelerated_until: Cell::new(None),
@@ -312,7 +313,11 @@ fn run_workflow(
             break;
         }
 
-        for step in profile.steps.iter().filter(|step| step.enabled) {
+        let steps: Vec<&WorkflowStep> = profile.steps.iter().filter(|step| step.enabled).collect();
+        let recovery = profile.failure_recovery.sanitised();
+        let mut consecutive_recoveries = 0_u8;
+        let mut index = 0_usize;
+        while index < steps.len() {
             if stop.load(Ordering::Acquire) {
                 let _ = events.send(RunnerEvent::Stopped("用户停止".to_owned()));
                 break 'rounds;
@@ -325,10 +330,14 @@ fn run_workflow(
                 break 'rounds;
             }
 
+            let step = steps[index];
             let _ = events.send(RunnerEvent::StepChanged(step.name.clone()));
-            let result = execute_step(&mut ctx, step, false);
-            match result {
-                Ok(StepControl::Continue) => {}
+            match execute_step(&mut ctx, step, false) {
+                Ok(StepControl::Continue) => {
+                    consecutive_recoveries = 0;
+                    *ctx.failure.borrow_mut() = None;
+                    index += 1;
+                }
                 Ok(StepControl::CompleteRound) => {
                     completed_rounds += 1;
                     let _ = events.send(RunnerEvent::RoundCompleted(completed_rounds));
@@ -339,12 +348,57 @@ fn run_workflow(
                     break 'rounds;
                 }
                 Err(error) => {
-                    let _ = events.send(if stop.load(Ordering::Acquire) {
-                        RunnerEvent::Stopped("用户停止".to_owned())
-                    } else {
-                        RunnerEvent::Failed(error)
-                    });
-                    break 'rounds;
+                    if stop.load(Ordering::Acquire) {
+                        let _ = events.send(RunnerEvent::Stopped("用户停止".to_owned()));
+                        break 'rounds;
+                    }
+                    if !recovery.is_enabled() || consecutive_recoveries >= recovery.max_recoveries {
+                        let note = write_pending_failure(&ctx)
+                            .map(|note| format!("；{note}"))
+                            .unwrap_or_default();
+                        let _ = events.send(RunnerEvent::Failed(format!(
+                            "{error}（已自动恢复 {consecutive_recoveries} 次）{note}"
+                        )));
+                        break 'rounds;
+                    }
+
+                    // Locate the game before moving the cursor: probe the
+                    // surrounding steps, highest index first, so a run that is
+                    // actually ahead of the failing step is never dragged back.
+                    let located = resync_candidate(
+                        index,
+                        steps.len(),
+                        usize::from(recovery.resync_window),
+                        |candidate| {
+                            candidate != index && probe_step_visible(&mut ctx, steps[candidate])
+                        },
+                    );
+                    consecutive_recoveries += 1;
+                    match located {
+                        Some(target) => {
+                            let _ = events.send(RunnerEvent::Notice(format!(
+                                "步骤“{}”失败，已重新定位到“{}”（第 {} 次恢复）",
+                                step.name, steps[target].name, consecutive_recoveries
+                            )));
+                            index = target;
+                        }
+                        None if recovery.fallback == RecoveryFallback::Restart => {
+                            let _ = events.send(RunnerEvent::Notice(format!(
+                                "步骤“{}”失败且无法定位当前进度，已从头重新执行本流程（第 {} 次恢复）",
+                                step.name, consecutive_recoveries
+                            )));
+                            index = 0;
+                        }
+                        None => {
+                            let note = write_pending_failure(&ctx)
+                                .map(|note| format!("；{note}"))
+                                .unwrap_or_default();
+                            let _ = events.send(RunnerEvent::Failed(format!(
+                                "{error}（无法定位当前进度，已停止）{note}"
+                            )));
+                            break 'rounds;
+                        }
+                    }
                 }
             }
         }
@@ -749,6 +803,9 @@ struct StepContext<'a> {
     stop: &'a AtomicBool,
     /// Manual pause request; recognition and input idle while it is set.
     pause: Arc<AtomicBool>,
+    /// Last unresolved failure of the current round. Written to `logs/frames/`
+    /// when the flow gives up, so the user can see the screen that failed.
+    failure: std::cell::RefCell<Option<PendingFailure>>,
     events: &'a mpsc::Sender<RunnerEvent>,
     jitter: Jitter,
     /// After an input, temporarily use the fast cadence while the next screen
@@ -797,6 +854,29 @@ impl StepContext<'_> {
             ClickMethod::Background => platform::click_client_background(&self.target, x, y),
         }
         .map_err(|error| error.to_string())
+    }
+
+    /// Keeps the screen that failed, replacing any earlier failure of the round.
+    fn remember_failure(
+        &self,
+        step: &WorkflowStep,
+        template: &LoadedTemplate,
+        report: &RecognitionReport,
+        frame: image::RgbaImage,
+    ) {
+        *self.failure.borrow_mut() = Some(PendingFailure {
+            step: step.name.clone(),
+            template: template.asset.name.clone(),
+            threshold: step.threshold,
+            effective_threshold: vision::effective_threshold(
+                self.profile.match_algorithm,
+                step.threshold,
+            ),
+            best_score: report.best_score,
+            ambiguous: report.ambiguous,
+            search_complete: report.search_complete,
+            frame,
+        });
     }
 
     /// Interruptible wait with optional humanization jitter.
@@ -914,6 +994,139 @@ impl FrameSnapshot {
     }
 }
 
+/// A failed step kept around until the flow either recovers or gives up.
+struct PendingFailure {
+    step: String,
+    template: String,
+    threshold: f32,
+    effective_threshold: f32,
+    best_score: f32,
+    ambiguous: bool,
+    search_complete: bool,
+    frame: image::RgbaImage,
+}
+
+/// Persists the pending failure frame, returning a note for the run log.
+fn write_pending_failure(ctx: &StepContext<'_>) -> Option<String> {
+    let pending = ctx.failure.borrow_mut().take()?;
+    let meta = crate::storage::FailureSnapshotMeta {
+        time: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        step: pending.step.clone(),
+        template: pending.template.clone(),
+        threshold: pending.threshold,
+        effective_threshold: pending.effective_threshold,
+        best_score: pending.best_score,
+        ambiguous: pending.ambiguous,
+        search_complete: pending.search_complete,
+        frame_width: pending.frame.width(),
+        frame_height: pending.frame.height(),
+    };
+    Some(
+        match crate::storage::save_failure_snapshot(&pending.frame, &meta) {
+            Ok(path) => format!("失败现场已保存：{}", path.display()),
+            Err(error) => format!("失败现场保存失败：{error}"),
+        },
+    )
+}
+
+/// One recognition pass for a step's own template. Shared by the normal wait
+/// loop and the post-timeout recovery scans.
+fn scan_step_template(
+    ctx: &StepContext<'_>,
+    step: &WorkflowStep,
+    template: &LoadedTemplate,
+    frame: &FrameSnapshot,
+) -> RecognitionReport {
+    find_loaded_template(
+        &frame.rgba,
+        frame.gray.as_ref(),
+        frame.hybrid.as_ref(),
+        frame.rgba.width(),
+        frame.rgba.height(),
+        ctx.profile.template_scale_mode,
+        template,
+        step.threshold,
+        ctx.profile.match_algorithm,
+        ctx.profile.recognition_performance.max_threads(),
+        ctx.profile.recognition_performance.roi_recovery_checks(),
+        ctx.profile.adaptive_roi,
+        &step.search,
+        false,
+    )
+}
+
+/// Clicks an accepted match and reports it to the UI.
+fn accept_match(
+    ctx: &mut StepContext<'_>,
+    step: &WorkflowStep,
+    found: &vision::TemplateMatch,
+) -> Result<(), String> {
+    click_match_repeated(
+        ctx,
+        found,
+        step.relative_click,
+        step.click_anchor,
+        step.click_offset_x,
+        step.click_offset_y,
+        step.click_count,
+        step.click_interval_ms,
+    )?;
+    let _ = ctx.events.send(RunnerEvent::MatchFound {
+        name: step.name.clone(),
+        score: found.score,
+    });
+    ctx.wait(step.delay_ms)
+}
+
+/// Whether another step's target is on screen right now. Used to find out
+/// where the game actually is after a step times out. Recognition only: this
+/// never clicks.
+fn probe_step_visible(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> bool {
+    if !matches!(
+        step.kind,
+        StepKind::WaitAndClick
+            | StepKind::PrioritySelect
+            | StepKind::WaitAny
+            | StepKind::VisualCondition
+    ) {
+        return false;
+    }
+    let path = match step.kind {
+        StepKind::PrioritySelect => step.priority.stage_template.as_ref(),
+        _ => step.template.as_ref(),
+    };
+    let Some(path) = path else {
+        return false;
+    };
+    let Some(template) = ctx.templates.get(path) else {
+        return false;
+    };
+    let Ok(frame) = FrameSnapshot::capture(ctx) else {
+        return false;
+    };
+    scan_step_template(ctx, step, template, &frame)
+        .matched
+        .is_some()
+}
+
+/// Picks the step to resume from: the highest index inside the window whose
+/// target is currently visible, or `None` when the game position is unknown.
+/// Probing from the highest index down means the first hit is also the most
+/// advanced step, so a run that is actually ahead is never dragged backwards.
+fn resync_candidate(
+    index: usize,
+    len: usize,
+    window: usize,
+    mut visible: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let high = (index + window).min(len - 1);
+    let low = index.saturating_sub(window);
+    (low..=high).rev().find(|candidate| visible(*candidate))
+}
+
 fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), String> {
     let path = step
         .template
@@ -943,25 +1156,13 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
         }
 
         let frame = FrameSnapshot::capture(ctx)?;
-        let algorithm = ctx.profile.match_algorithm;
-
-        let report = find_loaded_template(
-            &frame.rgba,
-            frame.gray.as_ref(),
-            frame.hybrid.as_ref(),
-            frame.rgba.width(),
-            frame.rgba.height(),
-            ctx.profile.template_scale_mode,
-            template,
-            step.threshold,
-            algorithm,
-            ctx.profile.recognition_performance.max_threads(),
-            ctx.profile.recognition_performance.roi_recovery_checks(),
-            ctx.profile.adaptive_roi,
-            &step.search,
-            false,
-        );
+        let report = scan_step_template(ctx, step, template, &frame);
         best_seen = best_seen.max(report.best_score);
+        if report.matched.is_none() {
+            // Keep the last miss; if the flow ultimately gives up, this frame
+            // is saved next to the step's metadata for diagnosis.
+            ctx.remember_failure(step, template, &report, frame.rgba);
+        }
         if let Some(found) = report.matched {
             if ctx.profile.stable_confirm {
                 let position = (found.x, found.y);
@@ -971,25 +1172,31 @@ fn wait_and_click(ctx: &mut StepContext<'_>, step: &WorkflowStep) -> Result<(), 
                     continue;
                 }
             }
-            click_match_repeated(
-                ctx,
-                &found,
-                step.relative_click,
-                step.click_anchor,
-                step.click_offset_x,
-                step.click_offset_y,
-                step.click_count,
-                step.click_interval_ms,
-            )?;
-            let _ = ctx.events.send(RunnerEvent::MatchFound {
-                name: step.name.clone(),
-                score: found.score,
-            });
-            return ctx.wait(step.delay_ms);
+            return accept_match(ctx, step, &found);
         }
         pending_confirm = None;
         ctx.recognition_wait(false, step.scan_interval_secs)?;
     }
+
+    // Jitter guard: the step already timed out, but a network hiccup or a slow
+    // animation can still be resolved by a few fast, fresh scans before the
+    // failure is escalated to the flow-level recovery.
+    let extra_scans = ctx.profile.failure_recovery.sanitised().extra_scans;
+    for attempt in 0..extra_scans {
+        let _ = ctx.events.send(RunnerEvent::Notice(format!(
+            "步骤“{}”超时，正在进行第 {} 次补充扫描",
+            step.name,
+            attempt + 1
+        )));
+        interruptible_wait(Duration::from_millis(300), ctx.stop, Some(&ctx.pause))?;
+        let frame = FrameSnapshot::capture(ctx)?;
+        let report = scan_step_template(ctx, step, template, &frame);
+        best_seen = best_seen.max(report.best_score);
+        if let Some(found) = report.matched {
+            return accept_match(ctx, step, &found);
+        }
+    }
+
     Err(format!(
         "步骤“{}”在 {} 秒内未找到目标（最佳相似度 {:.2}，阈值 {:.2}）",
         step.name,
@@ -1821,6 +2028,36 @@ mod wait_tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn resync_picks_the_most_advanced_visible_step() {
+        // The game is actually at step 3 (index 2), so the probe must choose it
+        // instead of dragging the run backwards to step 1.
+        let visible = [true, true, true, false, false, false, false];
+        let chosen = super::resync_candidate(2, visible.len(), 3, |index| visible[index]);
+        assert_eq!(chosen, Some(2));
+
+        // Steps 4 and 5 are also visible: the highest index wins.
+        let visible = [true, true, true, true, true, false, false];
+        let chosen = super::resync_candidate(2, visible.len(), 3, |index| visible[index]);
+        assert_eq!(chosen, Some(4));
+    }
+
+    #[test]
+    fn resync_reports_nothing_when_the_window_has_no_known_step() {
+        let visible = [false; 6];
+        assert_eq!(
+            super::resync_candidate(2, visible.len(), 3, |index| visible[index]),
+            None
+        );
+        // The window is clamped to the flow bounds.
+        let visible = [false, false, false, false, true];
+        assert_eq!(
+            super::resync_candidate(4, visible.len(), 3, |index| visible[index]),
+            Some(4)
+        );
+        assert_eq!(super::resync_candidate(0, 0, 3, |_| true), None);
+    }
+
+    #[test]
     fn paused_wait_does_not_consume_its_remaining_time() {
         let stop = AtomicBool::new(false);
         let pause_flag = Arc::new(AtomicBool::new(true));
@@ -1967,6 +2204,7 @@ mod tests {
             frame_height: 80,
             stop: &stop,
             pause: std::sync::Arc::new(AtomicBool::new(false)),
+            failure: std::cell::RefCell::new(None),
             events: &events,
             jitter: Jitter(1),
             accelerated_until: Cell::new(None),
@@ -2052,6 +2290,7 @@ mod tests {
             frame_height: 100,
             stop: &stop,
             pause: std::sync::Arc::new(AtomicBool::new(false)),
+            failure: std::cell::RefCell::new(None),
             events: &events,
             jitter: Jitter(1),
             accelerated_until: Cell::new(None),
