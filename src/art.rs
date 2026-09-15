@@ -6,19 +6,58 @@
 //! low alpha so text contrast is untouched, and can be switched off.
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
-/// Alpha at the corner before the fade; kept low so labels stay readable even
-/// where the art is brightest.
-pub const MAX_PORTRAIT_ALPHA: f32 = 0.16;
+/// Strongest alpha the user can select. Headings sit at the top of the page
+/// where the vertical fade has already faded the art out, and content sits on
+/// opaque-enough cards, so this stays readable.
+pub const MAX_PORTRAIT_ALPHA: f32 = 0.60;
+
+/// How much of the window the portrait covers, including the part that bleeds
+/// past the edges. Larger values make the character clearly visible.
+const PORTRAIT_HEIGHT_FACTOR: f32 = 1.12;
+const PORTRAIT_OUTER_BLEED: f32 = 0.10;
+const PORTRAIT_BOTTOM_BLEED: f32 = 0.08;
+/// Vertical fade start: the head keeps a little presence instead of vanishing.
+const PORTRAIT_TOP_FLOOR: f32 = 0.12;
 
 /// Longest edge uploaded for a portrait; keeps GPU memory small.
 const PORTRAIT_MAX_SIZE: u32 = 512;
 
 /// The fade cap is part of the readability contract, so it is checked at
 /// compile time as well as in the unit tests.
-const _: () = assert!(MAX_PORTRAIT_ALPHA <= 0.2);
+const _: () = assert!(MAX_PORTRAIT_ALPHA <= 0.65);
 
 include!(concat!(env!("OUT_DIR"), "/art_assets.rs"));
+
+/// How strongly the background portrait shows through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PortraitStrength {
+    Subtle,
+    #[default]
+    Medium,
+    Strong,
+}
+
+impl PortraitStrength {
+    pub const ALL: [Self; 3] = [Self::Subtle, Self::Medium, Self::Strong];
+
+    pub fn alpha(self) -> f32 {
+        match self {
+            Self::Subtle => 0.20,
+            Self::Medium => 0.42,
+            Self::Strong => 0.60,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Subtle => "淡（20%）",
+            Self::Medium => "中（42%）",
+            Self::Strong => "强（60%）",
+        }
+    }
+}
 
 pub struct Portrait {
     pub id: String,
@@ -87,11 +126,37 @@ impl BackgroundArt {
     }
 }
 
-/// Alpha for one corner of the fade: strongest at the corner, transparent
-/// towards the middle of the window.
+/// Alpha for one corner of the fade: strongest at the outer corner, transparent
+/// towards the middle of the window. The horizontal falloff is slower than
+/// linear so more of the character stays visible.
 pub fn fade_alpha(max_alpha: f32, horizontal: f32, vertical: f32) -> f32 {
     let clamp = |value: f32| value.clamp(0.0, 1.0);
-    max_alpha * clamp(horizontal) * clamp(vertical)
+    let horizontal = clamp(horizontal).powf(0.7);
+    let vertical = PORTRAIT_TOP_FLOOR + (1.0 - PORTRAIT_TOP_FLOOR) * clamp(vertical).powf(1.2);
+    (max_alpha * horizontal * vertical).clamp(0.0, 1.0)
+}
+
+/// Placement of the portrait inside the panel; public for tests.
+pub fn portrait_rect(panel: egui::Rect, source: egui::Vec2, left: bool) -> egui::Rect {
+    let height = (panel.height() * PORTRAIT_HEIGHT_FACTOR).min(panel.width() * 1.4);
+    let width = if source.y > 0.0 {
+        height * (source.x / source.y)
+    } else {
+        height * 0.66
+    };
+    let bottom = panel.bottom() + height * PORTRAIT_BOTTOM_BLEED;
+    let top = bottom - height;
+    if left {
+        egui::Rect::from_min_max(
+            egui::pos2(panel.left() - width * PORTRAIT_OUTER_BLEED, top),
+            egui::pos2(panel.left() + width * (1.0 - PORTRAIT_OUTER_BLEED), bottom),
+        )
+    } else {
+        egui::Rect::from_min_max(
+            egui::pos2(panel.right() - width * (1.0 - PORTRAIT_OUTER_BLEED), top),
+            egui::pos2(panel.right() + width * PORTRAIT_OUTER_BLEED, bottom),
+        )
+    }
 }
 
 /// Paints a portrait in one corner with a soft two-way fade.
@@ -102,24 +167,13 @@ pub fn paint_portrait(
     panel: egui::Rect,
     texture: &egui::TextureHandle,
     left: bool,
+    max_alpha: f32,
 ) {
     let source = texture.size_vec2();
     if source.x <= 0.0 || source.y <= 0.0 {
         return;
     }
-    let height = (panel.height() * 0.72).min(panel.width() * 0.62);
-    let width = height * (source.x / source.y);
-    let rect = if left {
-        egui::Rect::from_min_max(
-            egui::pos2(panel.left() - width * 0.06, panel.bottom() - height),
-            egui::pos2(panel.left() + width * 0.94, panel.bottom() + height * 0.04),
-        )
-    } else {
-        egui::Rect::from_min_max(
-            egui::pos2(panel.right() - width * 0.94, panel.bottom() - height),
-            egui::pos2(panel.right() + width * 0.06, panel.bottom() + height * 0.04),
-        )
-    };
+    let rect = portrait_rect(panel, source, left);
 
     // Fade horizontally towards the window centre and vertically towards the top.
     let (x0, x1) = if left {
@@ -140,11 +194,7 @@ pub fn paint_portrait(
         mesh.vertices.push(egui::epaint::Vertex {
             pos: position,
             uv: uv_point,
-            color: egui::Color32::WHITE.gamma_multiply(fade_alpha(
-                MAX_PORTRAIT_ALPHA,
-                horizontal,
-                vertical,
-            )),
+            color: egui::Color32::WHITE.gamma_multiply(fade_alpha(max_alpha, horizontal, vertical)),
         });
     }
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
@@ -153,7 +203,7 @@ pub fn paint_portrait(
 
 #[cfg(test)]
 mod tests {
-    use super::{BackgroundArt, MAX_PORTRAIT_ALPHA, PORTRAITS, fade_alpha};
+    use super::{BackgroundArt, PORTRAITS, fade_alpha};
 
     #[test]
     fn generated_asset_list_is_available() {
@@ -173,11 +223,43 @@ mod tests {
 
     #[test]
     fn fade_alpha_stays_within_the_readability_budget() {
-        assert_eq!(fade_alpha(MAX_PORTRAIT_ALPHA, 1.0, 1.0), MAX_PORTRAIT_ALPHA);
-        assert_eq!(fade_alpha(MAX_PORTRAIT_ALPHA, 0.0, 1.0), 0.0);
-        assert_eq!(fade_alpha(MAX_PORTRAIT_ALPHA, 1.0, 0.0), 0.0);
+        let strong = super::PortraitStrength::Strong.alpha();
+        assert_eq!(fade_alpha(strong, 1.0, 1.0), strong);
+        // The inner edge still fades out completely.
+        assert_eq!(fade_alpha(strong, 0.0, 1.0), 0.0);
+        // The top keeps a small floor so the character is recognisable.
+        let top = fade_alpha(strong, 1.0, 0.0);
+        assert!(top > 0.0 && top < strong);
         // Values outside 0..1 are clamped, so a mis-placed corner cannot boost alpha.
-        assert_eq!(fade_alpha(MAX_PORTRAIT_ALPHA, 5.0, 5.0), MAX_PORTRAIT_ALPHA);
-        assert!(fade_alpha(MAX_PORTRAIT_ALPHA, 0.5, 0.5) <= MAX_PORTRAIT_ALPHA);
+        assert_eq!(fade_alpha(strong, 5.0, 5.0), strong);
+        assert!(fade_alpha(strong, 0.5, 0.5) <= strong);
+        // Headings live at the top of the page, where the art is nearly gone.
+        assert!(fade_alpha(strong, 1.0, 0.08) <= 0.12);
+    }
+
+    #[test]
+    fn portrait_cover_is_large_and_bleeds_past_the_panel() {
+        let panel = eframe::egui::Rect::from_min_size(
+            eframe::egui::Pos2::ZERO,
+            eframe::egui::vec2(900.0, 700.0),
+        );
+        let source = eframe::egui::vec2(339.0, 512.0);
+        for left in [true, false] {
+            let rect = super::portrait_rect(panel, source, left);
+            assert!(
+                rect.height() > panel.height(),
+                "the portrait must cover the full height"
+            );
+            assert!(
+                rect.width() > panel.width() * 0.5,
+                "the portrait must cover a large share of the width"
+            );
+            assert!(rect.bottom() > panel.bottom(), "bottom edge must bleed off");
+            if left {
+                assert!(rect.left() < panel.left(), "outer edge must bleed off");
+            } else {
+                assert!(rect.right() > panel.right(), "outer edge must bleed off");
+            }
+        }
     }
 }

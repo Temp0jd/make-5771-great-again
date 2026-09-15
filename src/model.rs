@@ -1141,6 +1141,9 @@ pub struct MacroProfile {
     /// Roll a new portrait on every start; when false the current one is kept.
     #[serde(default = "default_true")]
     pub background_portrait_random: bool,
+    /// How strongly the background portrait shows through.
+    #[serde(default)]
+    pub background_portrait_strength: crate::art::PortraitStrength,
     /// Last portrait id, restored when random mode is off.
     #[serde(default)]
     pub background_portrait_id: String,
@@ -1300,6 +1303,7 @@ impl Default for MacroProfile {
             skin_id: default_skin_id(),
             background_portrait: true,
             background_portrait_random: true,
+            background_portrait_strength: crate::art::PortraitStrength::default(),
             background_portrait_id: String::new(),
             ui_scale: default_ui_scale(),
             capture_hotkey: default_capture_hotkey(),

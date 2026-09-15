@@ -4302,11 +4302,21 @@ impl Make5771App {
                         }
                     });
                 });
+                ui.horizontal(|ui| {
+                    ui.label("立绘强度");
+                    for strength in crate::art::PortraitStrength::ALL {
+                        ui.selectable_value(
+                            &mut self.profile.background_portrait_strength,
+                            strength,
+                            strength.label(),
+                        );
+                    }
+                });
                 let portrait_note = if self.background_art.is_empty() {
                     "没有可用的背景立绘文件（assets/art/portraits/）".to_owned()
                 } else {
                     format!(
-                        "当前：{}　共 {} 张，半透明绘制在左下/右下角，不影响文字对比度，可随时关闭。",
+                        "当前：{}　共 {} 张，半透明绘制在左下/右下角，覆盖约整个窗口高度，可随时关闭或调强弱。",
                         self.background_art
                             .portrait(self.background_portrait_index)
                             .map(|portrait| portrait.id.clone())
@@ -9007,6 +9017,7 @@ impl eframe::App for Make5771App {
                         ui.max_rect(),
                         &portrait.texture,
                         self.background_portrait_left,
+                        self.profile.background_portrait_strength.alpha(),
                     );
                 }
                 let active_tab = self.active_tab;
