@@ -2271,7 +2271,7 @@ impl Make5771App {
             ui.horizontal(|ui| {
                 ui.label("到达条件后完成当前对局");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.toggle_value(&mut self.profile.finish_current_round, "开启");
+                    theme::switch(ui, &mut self.profile.finish_current_round);
                 });
             });
         });
@@ -3583,10 +3583,7 @@ impl Make5771App {
             ui.horizontal(|ui| {
                 ui.label("深色模式");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .toggle_value(&mut self.profile.dark_mode, "开启")
-                        .changed()
-                    {
+                    if theme::switch(ui, &mut self.profile.dark_mode).changed() {
                         theme::apply(ui.ctx(), self.profile.dark_mode);
                     }
                 });
@@ -3782,7 +3779,7 @@ impl Make5771App {
             ui.horizontal(|ui| {
                 ui.label("拟人化（点击位置 ±3 px、等待时间 ±20% 随机抖动）");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.toggle_value(&mut self.profile.click_jitter, "开启");
+                    theme::switch(ui, &mut self.profile.click_jitter);
                 });
             });
             ui.add_space(8.0);
@@ -3895,7 +3892,7 @@ impl Make5771App {
             ui.horizontal(|ui| {
                 ui.label("智能 ROI 越界恢复");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.toggle_value(&mut self.profile.adaptive_roi, "开启");
+                    theme::switch(ui, &mut self.profile.adaptive_roi);
                 });
             });
             ui.label(
@@ -3906,7 +3903,7 @@ impl Make5771App {
             ui.horizontal(|ui| {
                 ui.label("点击前二次确认");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.toggle_value(&mut self.profile.stable_confirm, "开启");
+                    theme::switch(ui, &mut self.profile.stable_confirm);
                 });
             });
             ui.label(
@@ -6181,7 +6178,7 @@ fn edit_workflow_branch(
     ui.horizontal(|ui| {
         ui.label("命中后点击触发目标");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.toggle_value(&mut branch.click_trigger, "开启");
+            theme::switch(ui, &mut branch.click_trigger);
         });
     });
     if branch.click_trigger {

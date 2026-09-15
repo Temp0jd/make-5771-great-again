@@ -193,6 +193,102 @@ pub fn red() -> Color32 {
     palette().red
 }
 
+/// Fill for framed controls (buttons, combo boxes, switches). The muted surface
+/// was too close to the glass cards, so controls such as toggles disappeared.
+pub fn control_fill() -> Color32 {
+    if is_dark() {
+        Color32::from_rgb(45, 55, 73)
+    } else {
+        Color32::from_rgb(231, 229, 221)
+    }
+}
+
+/// Outline for framed controls. Keeps at least 3:1 contrast against the card
+/// surface so the control boundary stays visible (WCAG 1.4.11 non-text).
+pub fn control_border() -> Color32 {
+    if is_dark() {
+        Color32::from_rgb(101, 114, 138)
+    } else {
+        Color32::from_rgb(146, 139, 124)
+    }
+}
+
+fn switch_track_off() -> Color32 {
+    if is_dark() {
+        Color32::from_rgb(52, 63, 84)
+    } else {
+        Color32::from_rgb(200, 195, 182)
+    }
+}
+
+/// Always-framed on/off switch.
+///
+/// egui's `toggle_value` paints no frame at all while the value is off, which
+/// made switches such as “深色模式” read as plain text. This variant always
+/// paints a track, an outline and the current state text, and toggles on click.
+pub fn switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
+    let on = *value;
+    let state_text = if on { "开启" } else { "关闭" };
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(state_text.to_owned(), font, label());
+    let track = egui::vec2(40.0, 22.0);
+    let size = egui::vec2(
+        galley.size().x + 10.0 + track.x,
+        track.y.max(galley.size().y),
+    );
+    let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let track_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - track.x / 2.0, rect.center().y),
+            track,
+        );
+        let radius = CornerRadius::same(11);
+        ui.painter().rect_filled(
+            track_rect,
+            radius,
+            if on { blue() } else { switch_track_off() },
+        );
+        ui.painter().rect_stroke(
+            track_rect,
+            radius,
+            Stroke::new(
+                1.0,
+                if on {
+                    blue().gamma_multiply(0.7)
+                } else {
+                    control_border()
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let knob_x = if on {
+            track_rect.right() - 11.0
+        } else {
+            track_rect.left() + 11.0
+        };
+        ui.painter().circle_filled(
+            egui::pos2(knob_x, track_rect.center().y),
+            7.5,
+            Color32::WHITE,
+        );
+        ui.painter().galley(
+            egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0),
+            galley,
+            label(),
+        );
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+    response
+}
+
 /// Paints a very low-contrast circular and constellation ornament behind
 /// opaque content cards. It stays subtle so it never competes with labels,
 /// controls, or recognition previews.
@@ -284,8 +380,9 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     style.visuals.selection.stroke = Stroke::new(1.0, palette.blue);
     style.visuals.widgets.noninteractive.bg_fill = palette.surface;
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.separator);
-    style.visuals.widgets.inactive.bg_fill = palette.surface_muted;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, palette.separator);
+    style.visuals.widgets.inactive.bg_fill = control_fill();
+    style.visuals.widgets.inactive.weak_bg_fill = control_fill();
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, control_border());
     style.visuals.widgets.hovered.bg_fill = if dark {
         Color32::from_rgb(28, 42, 55)
     } else {
@@ -433,6 +530,7 @@ pub fn section_card() -> egui::Frame {
 #[cfg(test)]
 mod tests {
     use super::{DARK, LIGHT, Palette};
+    use eframe::egui;
     use eframe::egui::Color32;
 
     fn relative_luminance(color: Color32) -> f32 {
@@ -470,10 +568,19 @@ mod tests {
         assert_readable(DARK);
     }
 
+    /// Alpha-blends a (premultiplied) `Color32` over an opaque background the
+    /// same way the renderer does, so colour assertions match what users see.
     fn composite(foreground: Color32, background: Color32) -> Color32 {
         let alpha = f32::from(foreground.a()) / 255.0;
+        let straight = |channel: u8| {
+            if alpha <= 0.0 {
+                0.0
+            } else {
+                (f32::from(channel) / alpha).min(255.0)
+            }
+        };
         let mix = |front: u8, back: u8| {
-            (f32::from(front) * alpha + f32::from(back) * (1.0 - alpha)).round() as u8
+            (straight(front) * alpha + f32::from(back) * (1.0 - alpha)).round() as u8
         };
         Color32::from_rgb(
             mix(foreground.r(), background.r()),
@@ -501,6 +608,88 @@ mod tests {
             assert_ne!(frame.shadow, eframe::egui::epaint::Shadow::NONE);
             assert!(frame.shadow.blur > 0);
         }
+    }
+
+    #[test]
+    fn framed_controls_stay_visible_on_glass_cards() {
+        for dark in [false, true] {
+            let palette = if dark { DARK } else { LIGHT };
+            super::PALETTE.with(|current| current.set(palette));
+            super::DARK_MODE.with(|current| current.set(dark));
+            let ornament = composite(palette.blue.gamma_multiply(0.06), palette.background);
+            let card = composite(super::glass_surface(), ornament);
+            assert!(
+                contrast(super::control_border(), card) >= 3.0,
+                "border contrast too low (dark={dark})"
+            );
+            assert!(
+                contrast(super::control_fill(), card) >= 1.10,
+                "control fill does not stand out (dark={dark})"
+            );
+        }
+    }
+
+    #[test]
+    fn switch_paints_a_framed_track_and_toggles_by_click() {
+        let ctx = egui::Context::default();
+        let mut value = false;
+        let mut center = eframe::egui::Pos2::ZERO;
+        let mut track = 0;
+        let mut knob = 0;
+        let frames = vec![
+            Vec::new(),
+            vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            vec![egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ];
+        for events in frames {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(240.0, 60.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let response = super::switch(ui, &mut value);
+                    center = response.rect.center();
+                },
+            );
+            for clipped in &output.shapes {
+                match &clipped.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.corner_radius == egui::CornerRadius::same(11)
+                            && rect.fill.a() == 255 =>
+                    {
+                        track += 1;
+                    }
+                    egui::Shape::Circle(circle)
+                        if (circle.radius - 7.5).abs() < 0.01
+                            && circle.fill == egui::Color32::WHITE =>
+                    {
+                        knob += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(track >= 3, "switch track must be painted every frame");
+        assert!(knob >= 3, "switch knob must be painted every frame");
+        assert!(value, "clicking the switch must toggle it on");
     }
 
     #[test]
