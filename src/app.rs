@@ -14,7 +14,8 @@ use crate::platform::{self, TargetWindow};
 use crate::runner::{RunnerEvent, RunnerHandle};
 use crate::storage;
 use crate::template_editor::{
-    EditorAction, PixelSelection, RoiDraft, RoiEditorAction, TemplateDraft, TemplateTestView,
+    CaptureAction, CaptureDraft, EditorAction, PixelSelection, RoiDraft, RoiEditorAction,
+    TemplateDraft, TemplateTestView,
 };
 use crate::theme;
 use crate::vision::{self, MatchAlgorithm, SearchRegion};
@@ -43,6 +44,8 @@ enum TemplateUseLocator {
 #[derive(Debug, Clone, Copy)]
 enum CapturePurpose {
     NewTemplate(Option<TemplateUseLocator>),
+    /// Screenshot plus search region in one editor.
+    NewTemplateWithRegion(TemplateUseLocator),
     ReplaceTemplate(u64),
     TestUse {
         template_id: u64,
@@ -55,6 +58,7 @@ enum CapturePurpose {
 #[derive(Debug, Clone, Copy)]
 enum WorkflowTemplateAction {
     CaptureNew(TemplateUseLocator),
+    CaptureNewWithRegion(TemplateUseLocator),
     Replace(u64),
     Test {
         template_id: u64,
@@ -184,6 +188,8 @@ pub struct Make5771App {
     template_draft: Option<TemplateDraft>,
     roi_draft: Option<RoiDraft>,
     roi_bind_target: Option<TemplateUseLocator>,
+    capture_draft: Option<CaptureDraft>,
+    capture_bind_target: Option<TemplateUseLocator>,
     hotkey_receiver: Option<std::sync::mpsc::Receiver<platform::GlobalHotkey>>,
     _hotkey_guard: Option<platform::HotkeyGuard>,
     /// The combos currently registered with the OS; used to skip no-op
@@ -200,6 +206,8 @@ pub struct Make5771App {
     countdown_capture_at: Option<std::time::Instant>,
     /// Template currently being renamed in the library: (template id, edit buffer).
     template_rename: Option<(u64, String)>,
+    template_filter: String,
+    template_grid: bool,
     template_roi_draft: Option<TemplateRoiDraft>,
     pending_capture: Option<image::RgbaImage>,
     capture_purpose: CapturePurpose,
@@ -238,8 +246,10 @@ pub struct Make5771App {
     selected_subflow: Option<u64>,
     selected_subflow_step: Option<u64>,
     workflow_step_filter: String,
-    toast_shown_at: Option<std::time::Instant>,
+    /// Newest message written by `self.toast`; compared to detect a new one.
     toast_message: Option<String>,
+    /// Recently shown messages (newest last) so a burst of feedback is not lost.
+    toast_history: std::collections::VecDeque<(String, std::time::Instant)>,
     preflight_cache: Option<(std::time::Instant, WorkflowPreflightReport)>,
     save_status_cache: Option<(std::time::Instant, SaveStatus)>,
     /// Wakes the UI thread from the global-hotkey worker thread.
@@ -255,6 +265,42 @@ pub struct Make5771App {
     step_clipboard: Option<WorkflowStep>,
     /// Logs queued while a mutable borrow of the profile is active.
     pending_logs: Vec<(LogLevel, String)>,
+    settings_section: SettingsSection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    Interface,
+    Flow,
+    Window,
+    Recognition,
+    Recovery,
+    Shortcuts,
+    Local,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 7] = [
+        Self::Interface,
+        Self::Flow,
+        Self::Window,
+        Self::Recognition,
+        Self::Recovery,
+        Self::Shortcuts,
+        Self::Local,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Interface => "界面与外观",
+            Self::Flow => "流程信息",
+            Self::Window => "目标窗口",
+            Self::Recognition => "识别与点击",
+            Self::Recovery => "失败与恢复",
+            Self::Shortcuts => "快捷键与保护",
+            Self::Local => "本地数据",
+        }
+    }
 }
 
 /// Upper bound for the in-memory log list (the on-disk log keeps everything).
@@ -336,8 +382,8 @@ impl Make5771App {
             current_step: "等待开始".to_owned(),
             logs: Vec::new(),
             toast: None,
-            toast_shown_at: None,
             toast_message: None,
+            toast_history: std::collections::VecDeque::new(),
             preflight_cache: None,
             save_status_cache: None,
             repaint_waker,
@@ -348,11 +394,14 @@ impl Make5771App {
             manual_pause: false,
             step_clipboard: None,
             pending_logs: Vec::new(),
+            settings_section: SettingsSection::Interface,
             force_stop_confirm: false,
             target_window,
             template_draft: None,
             roi_draft: None,
             roi_bind_target: None,
+            capture_draft: None,
+            capture_bind_target: None,
             hotkey_receiver,
             _hotkey_guard: hotkey_guard,
             active_hotkeys,
@@ -366,6 +415,8 @@ impl Make5771App {
             thumbs: TemplateThumbs::default(),
             countdown_capture_at: None,
             template_rename: None,
+            template_filter: String::new(),
+            template_grid: false,
             template_roi_draft: None,
             pending_capture: None,
             capture_purpose: CapturePurpose::NewTemplate(None),
@@ -844,6 +895,11 @@ impl Make5771App {
                         CapturePurpose::EditUseRoi(locator) => {
                             self.roi_bind_target = Some(locator);
                             self.roi_draft = Some(RoiDraft::from_image(ctx, image));
+                        }
+                        CapturePurpose::NewTemplateWithRegion(locator) => {
+                            self.capture_bind_target = Some(locator);
+                            self.capture_draft =
+                                Some(CaptureDraft::from_image(ctx, image, "新模板"));
                         }
                     }
                     self.capture_purpose = CapturePurpose::NewTemplate(None);
@@ -3293,6 +3349,12 @@ impl Make5771App {
                         CapturePurpose::NewTemplate(Some(locator)),
                     );
                 }
+                WorkflowTemplateAction::CaptureNewWithRegion(locator) => {
+                    self.begin_countdown_capture(
+                        ui.ctx(),
+                        CapturePurpose::NewTemplateWithRegion(locator),
+                    );
+                }
                 WorkflowTemplateAction::Replace(template_id) => {
                     self.pending_shared_template_replace = Some(template_id);
                 }
@@ -3566,132 +3628,127 @@ impl Make5771App {
                             .color(theme::tertiary_label()),
                     );
                 });
-            } else {
-                let library_paths: std::collections::HashSet<String> = self
+                return;
+            }
+            let library_paths: std::collections::HashSet<String> = self
+                .effective_templates()
+                .iter()
+                .map(|template| template.path.clone())
+                .collect();
+            self.thumbs.retain_paths(&library_paths);
+
+            ui.horizontal(|ui| {
+                ui.label("仅本次测试阈值");
+                let minimum = if self.profile.match_algorithm == MatchAlgorithm::Hybrid {
+                    vision::MIN_HYBRID_THRESHOLD
+                } else {
+                    0.50
+                };
+                ui.add(
+                    egui::Slider::new(&mut self.template_test_threshold, minimum..=1.00)
+                        .fixed_decimals(2),
+                );
+                ui.label(
+                    RichText::new("单帧测试；实际运行还会进行稳定确认和智能 ROI 恢复")
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.template_filter)
+                        .hint_text("搜索模板名称")
+                        .desired_width(220.0),
+                );
+                if !self.template_filter.is_empty() && ui.small_button("清除").clicked() {
+                    self.template_filter.clear();
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.selectable_value(&mut self.template_grid, false, "列表");
+                    ui.selectable_value(&mut self.template_grid, true, "网格");
+                });
+                let total = self.effective_templates().len();
+                let referenced = self
                     .effective_templates()
                     .iter()
-                    .map(|template| template.path.clone())
-                    .collect();
-                self.thumbs.retain_paths(&library_paths);
-                ui.horizontal(|ui| {
-                    ui.label("仅本次测试阈值");
-                    let minimum = if self.profile.match_algorithm == MatchAlgorithm::Hybrid {
-                        vision::MIN_HYBRID_THRESHOLD
-                    } else {
-                        0.50
-                    };
-                    ui.add(
-                        egui::Slider::new(&mut self.template_test_threshold, minimum..=1.00)
-                            .fixed_decimals(2),
-                    );
-                    ui.label(
-                        RichText::new("单帧测试；实际运行还会进行稳定确认和智能 ROI 恢复")
-                            .size(11.0)
-                            .color(theme::tertiary_label()),
-                    );
+                    .filter(|template| count_template_references(&self.profile, &template.path) > 0)
+                    .count();
+                ui.label(
+                    RichText::new(format!(
+                        "共 {} 个模板，其中 {} 个已被引用、{} 个未引用",
+                        total,
+                        referenced,
+                        total - referenced
+                    ))
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+                );
+            });
+            ui.separator();
+
+            let query = self.template_filter.trim().to_lowercase();
+            let listed: Vec<TemplateAsset> = self
+                .effective_templates()
+                .iter()
+                .filter(|template| {
+                    query.is_empty() || template.name.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect();
+            if listed.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(RichText::new("没有符合条件的模板").color(theme::secondary_label()));
+                    if ui.button("清除搜索").clicked() {
+                        self.template_filter.clear();
+                    }
                 });
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .id_salt("template-list")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .max_height(430.0)
+                .show(ui, |ui| {
+                    if self.template_grid {
+                        render_template_grid(
+                            ui,
+                            &listed,
+                            &self.profile,
+                            &mut self.thumbs,
+                            &mut requested_test,
+                            &mut requested_delete,
+                            &mut requested_roi,
+                            &mut requested_rename,
+                        );
+                    } else {
+                        render_template_list(
+                            ui,
+                            &listed,
+                            &self.profile,
+                            &mut self.thumbs,
+                            self.template_rename.as_ref(),
+                            &mut requested_test,
+                            &mut requested_delete,
+                            &mut requested_roi,
+                            &mut requested_rename,
+                        );
+                    }
+                });
+            if let Some((template_id, buffer)) = &mut self.template_rename {
                 ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_salt("template-list")
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .max_height(430.0)
-                    .show(ui, |ui| {
-                        for template in self.effective_templates().clone() {
-                            ui.horizontal(|ui| {
-                                match self
-                                    .thumbs
-                                    .texture(ui.ctx(), &template.path, &template.name)
-                                {
-                                    Some(texture) => {
-                                        let response = ui.add(
-                                            egui::Image::new(texture)
-                                                .fit_to_exact_size(Vec2::new(64.0, 40.0))
-                                                .sense(Sense::click()),
-                                        );
-                                        if response.clicked() {
-                                            self.thumbs.preview = Some(template.id);
-                                        }
-                                        response.on_hover_text("点击预览模板图片");
-                                    }
-                                    None => template_icon(ui, 30.0, theme::blue()),
-                                }
-                                ui.vertical(|ui| {
-                                    let renaming_this = self
-                                        .template_rename
-                                        .as_ref()
-                                        .is_some_and(|(id, _)| *id == template.id);
-                                    if renaming_this {
-                                        ui.horizontal(|ui| {
-                                            if let Some((_, buffer)) = self.template_rename.as_mut()
-                                            {
-                                                ui.add(
-                                                    egui::TextEdit::singleline(buffer)
-                                                        .desired_width(140.0),
-                                                );
-                                            }
-                                            if ui
-                                                .small_button("保存")
-                                                .on_hover_text("确认改名")
-                                                .clicked()
-                                            {
-                                                rename_apply = true;
-                                            }
-                                            if ui.small_button("取消").clicked() {
-                                                rename_cancel = true;
-                                            }
-                                        });
-                                    } else {
-                                        ui.label(RichText::new(&template.name).strong());
-                                    }
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} × {} · {}",
-                                            template.width, template.height, template.path
-                                        ))
-                                        .size(11.0)
-                                        .color(theme::tertiary_label()),
-                                    );
-                                });
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if ui.button("测试").clicked() {
-                                        requested_test = Some(template.id);
-                                    }
-                                    if ui.button("删除").clicked() {
-                                        requested_delete = Some(template.id);
-                                    }
-                                    if ui.button("改名").clicked() {
-                                        requested_rename =
-                                            Some((template.id, template.name.clone()));
-                                    }
-                                    if ui.button("范围").clicked() {
-                                        requested_roi = Some(template.id);
-                                    }
-                                    let references =
-                                        count_template_references(&self.profile, &template.path);
-                                    if references > 0 {
-                                        ui.label(
-                                            RichText::new(format!("{references} 处引用"))
-                                                .size(11.0)
-                                                .color(theme::orange()),
-                                        );
-                                    }
-                                    let region_label = match template.search_region {
-                                        Some(region) => format!(
-                                            "自定义 {}×{}+{},{}",
-                                            region.width, region.height, region.x, region.y
-                                        ),
-                                        None => "全屏".to_owned(),
-                                    };
-                                    ui.label(
-                                        RichText::new(region_label)
-                                            .size(11.0)
-                                            .color(theme::tertiary_label()),
-                                    );
-                                });
-                            });
-                            ui.separator();
-                        }
-                    });
+                ui.horizontal(|ui| {
+                    ui.label("重命名");
+                    ui.add(egui::TextEdit::singleline(buffer).desired_width(200.0));
+                    if ui.small_button("保存").clicked() {
+                        rename_apply = true;
+                    }
+                    if ui.small_button("取消").clicked() {
+                        rename_cancel = true;
+                    }
+                    let _ = template_id;
+                });
             }
         });
         if let Some(template_id) = requested_test {
@@ -3889,540 +3946,573 @@ impl Make5771App {
                 }
             });
         });
-        ui.add_space(12.0);
-
-        theme::card().show(ui, |ui| {
-            ui.label(RichText::new("界面").size(18.0).strong());
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("深色模式");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::switch(ui, &mut self.profile.dark_mode).changed() {
-                        theme::apply(ui.ctx(), self.profile.dark_mode);
-                    }
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.label("界面缩放");
-                if ui
-                    .add(
-                        egui::Slider::new(&mut self.profile.ui_scale, 0.85..=1.50)
-                            .fixed_decimals(2)
-                            .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
-                    )
-                    .changed()
-                {
-                    ui.ctx().set_zoom_factor(self.profile.ui_scale);
-                }
-            });
-            ui.label(
-                RichText::new("高分辨率或高缩放比的显示器可适当放大；切换后立即生效并随配置保存。")
-                    .size(11.0)
-                    .color(theme::tertiary_label()),
-            );
-        });
-
         ui.add_space(10.0);
-        theme::card().show(ui, |ui| {
-            ui.label(RichText::new("基本信息").size(18.0).strong());
-            ui.separator();
+        ui.horizontal_wrapped(|ui| {
             ui.label(
-                RichText::new("流程名称")
+                RichText::new("分类")
                     .size(12.0)
                     .color(theme::secondary_label()),
             );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.profile.name)
-                    .desired_width(ui.available_width()),
-            );
-        });
-
-        ui.add_space(10.0);
-        theme::card().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("分享信息").size(18.0).strong());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add(
-                        egui::Image::new(&self.mascots.erika_ok)
-                            .fit_to_exact_size(Vec2::splat(44.0)),
-                    );
-                });
-            });
-            ui.label(
-                RichText::new("这些信息会随 .m5771pack 一起发布，方便别人判断是否适用。")
-                    .size(11.0)
-                    .color(theme::secondary_label()),
-            );
-            ui.separator();
-            ui.columns(2, |columns| {
-                columns[0].label(
-                    RichText::new("作者")
-                        .size(12.0)
-                        .color(theme::secondary_label()),
-                );
-                columns[0].text_edit_singleline(&mut self.profile.sharing.author);
-                columns[1].label(
-                    RichText::new("游戏版本")
-                        .size(12.0)
-                        .color(theme::secondary_label()),
-                );
-                columns[1].text_edit_singleline(&mut self.profile.sharing.game_version);
-            });
-            ui.columns(2, |columns| {
-                columns[0].label(
-                    RichText::new("游戏语言")
-                        .size(12.0)
-                        .color(theme::secondary_label()),
-                );
-                columns[0].text_edit_singleline(&mut self.profile.sharing.game_language);
-                columns[1].label(
-                    RichText::new("标签（逗号分隔）")
-                        .size(12.0)
-                        .color(theme::secondary_label()),
-                );
-                columns[1].text_edit_singleline(&mut self.profile.sharing.tags);
-            });
-            ui.label(
-                RichText::new("说明")
-                    .size(12.0)
-                    .color(theme::secondary_label()),
-            );
-            ui.add(
-                egui::TextEdit::multiline(&mut self.profile.sharing.description)
-                    .desired_rows(3)
-                    .desired_width(ui.available_width())
-                    .hint_text("说明用途、入口画面、特殊要求和已知限制"),
-            );
-        });
-
-        ui.add_space(10.0);
-        theme::card().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("目标窗口").size(18.0).strong());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let (color, status) = match self.target_window.as_ref() {
-                        Some(target) if platform::is_foreground(target) => {
-                            (theme::green(), "已连接且在前台")
-                        }
-                        Some(_) => (theme::orange(), "已连接，等待前台"),
-                        None => (theme::orange(), "未连接"),
-                    };
-                    ui.label(RichText::new(status).color(theme::secondary_label()));
-                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 4.5, color);
-                });
-            });
-            ui.separator();
-            ui.label(
-                RichText::new("自动匹配的窗口标题")
-                    .size(12.0)
-                    .color(theme::secondary_label()),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.profile.target_window)
-                    .hint_text("输入窗口标题的一部分")
-                    .desired_width(ui.available_width()),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("按标题连接").clicked() {
-                    self.connect_target_window();
-                }
-                if ui.button("从可见窗口选择").clicked() {
-                    self.open_window_picker();
-                }
-            });
-
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("客户区基准尺寸")
-                    .size(12.0)
-                    .color(theme::secondary_label()),
-            );
-            ui.horizontal(|ui| {
-                ui.label("宽");
-                ui.add(
-                    egui::DragValue::new(&mut self.profile.expected_client_width)
-                        .range(320..=7680)
-                        .suffix(" px"),
-                );
-                ui.label("高");
-                ui.add(
-                    egui::DragValue::new(&mut self.profile.expected_client_height)
-                        .range(240..=4320)
-                        .suffix(" px"),
-                );
-                if ui
-                    .add_enabled(
-                        self.target_window.is_some(),
-                        egui::Button::new("使用当前窗口尺寸"),
-                    )
-                    .clicked()
-                    && let Some(target) = &self.target_window
-                {
-                    self.profile.expected_client_width = target.client_width;
-                    self.profile.expected_client_height = target.client_height;
-                }
-            });
-            if !self.effective_templates().is_empty() {
-                ui.label(
-                    RichText::new("改变基准尺寸后，旧模板的局部搜索区可能需要重新截取。")
-                        .size(11.0)
-                        .color(theme::orange()),
-                );
+            for section in SettingsSection::ALL {
+                ui.selectable_value(&mut self.settings_section, section, section.label());
             }
         });
-
         ui.add_space(10.0);
-        theme::card().show(ui, |ui| {
-            ui.label(RichText::new("点击与识别").size(18.0).strong());
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("执行点击");
-                egui::ComboBox::from_id_salt("click-method")
-                    .selected_text(self.profile.click_method.label())
-                    .show_ui(ui, |ui| {
-                        for method in ClickMethod::ALL {
-                            ui.selectable_value(
-                                &mut self.profile.click_method,
-                                method,
-                                method.label(),
-                            );
+
+        if self.settings_section == SettingsSection::Interface {
+            theme::card().show(ui, |ui| {
+                ui.label(RichText::new("界面").size(18.0).strong());
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("深色模式");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::switch(ui, &mut self.profile.dark_mode).changed() {
+                            theme::apply(ui.ctx(), self.profile.dark_mode);
                         }
                     });
-            });
-            ui.horizontal(|ui| {
-                ui.label("拟人化（点击位置 ±3 px、等待时间 ±20% 随机抖动）");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    theme::switch(ui, &mut self.profile.click_jitter);
                 });
-            });
-            ui.add_space(8.0);
-            ui.separator();
-            ui.label(
-                RichText::new("识别与性能")
-                    .size(12.0)
-                    .color(theme::secondary_label()),
-            );
-            ui.horizontal(|ui| {
-                ui.label("识别模式");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let selected = match self.profile.match_algorithm {
-                        MatchAlgorithm::Hybrid => "金字塔模板识别（推荐）",
-                        MatchAlgorithm::Precise => "兼容 RGB 识别",
-                        MatchAlgorithm::Fast => "兼容快速灰度",
-                        MatchAlgorithm::Classic => "兼容经典灰度",
-                    };
-                    egui::ComboBox::from_id_salt("recognition_mode")
-                        .selected_text(selected)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.profile.match_algorithm,
-                                MatchAlgorithm::Hybrid,
-                                "金字塔模板识别（推荐）",
-                            );
-                            ui.selectable_value(
-                                &mut self.profile.match_algorithm,
-                                MatchAlgorithm::Precise,
-                                "兼容 RGB 识别",
-                            );
-                        });
+                ui.horizontal(|ui| {
+                    ui.label("界面缩放");
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.profile.ui_scale, 0.85..=1.50)
+                                .fixed_decimals(2)
+                                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+                        )
+                        .changed()
+                    {
+                        ui.ctx().set_zoom_factor(self.profile.ui_scale);
+                    }
                 });
-            });
-            ui.label(
-                RichText::new(
-                    "旧流程仍沿用原有 RGB 评分；切换到金字塔模式后请先测试关键模板并校准阈值",
-                )
-                .size(11.0)
-                .color(theme::tertiary_label()),
-            );
-            ui.horizontal(|ui| {
-                ui.label("性能模式");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("recognition_performance")
-                        .selected_text(self.profile.recognition_performance.label())
-                        .show_ui(ui, |ui| {
-                            for mode in RecognitionPerformance::ALL {
-                                ui.selectable_value(
-                                    &mut self.profile.recognition_performance,
-                                    mode,
-                                    mode.label(),
-                                );
-                            }
-                        });
-                });
-            });
-            ui.label(
-                RichText::new(self.profile.recognition_performance.description())
-                    .size(11.0)
-                    .color(theme::tertiary_label()),
-            );
-            ui.horizontal(|ui| {
-                ui.label("普通等待扫描频率");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let selected = self
-                        .profile
-                        .idle_scan_secs
-                        .map(|seconds| format!("每 {seconds} 秒"))
-                        .unwrap_or_else(|| "沿用旧设置".to_owned());
-                    egui::ComboBox::from_id_salt("idle_scan_secs")
-                        .selected_text(selected)
-                        .show_ui(ui, |ui| {
-                            for seconds in [1_u8, 3, 5] {
-                                ui.selectable_value(
-                                    &mut self.profile.idle_scan_secs,
-                                    Some(seconds),
-                                    format!("每 {seconds} 秒"),
-                                );
-                            }
-                        });
-                });
-            });
-            ui.label(
-                RichText::new("首次立即扫描；候选确认保持高速。普通推荐 3 秒，长时间战斗推荐 5 秒")
-                    .size(11.0)
-                    .color(theme::tertiary_label()),
-            );
-            ui.horizontal(|ui| {
-                ui.label("跨分辨率模板缩放");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("template_scale_mode")
-                        .selected_text(self.profile.template_scale_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in TemplateScaleMode::ALL {
-                                ui.selectable_value(
-                                    &mut self.profile.template_scale_mode,
-                                    mode,
-                                    mode.label(),
-                                );
-                            }
-                        });
-                });
-            });
-            ui.label(
-                RichText::new(self.profile.template_scale_mode.description())
-                    .size(11.0)
-                    .color(theme::tertiary_label()),
-            );
-            ui.horizontal(|ui| {
-                ui.label("智能 ROI 越界恢复");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    theme::switch(ui, &mut self.profile.adaptive_roi);
-                });
-            });
-            ui.label(
-                RichText::new(
-                    "开启后局部区域连续未命中会全屏恢复；旧流程默认关闭，以保留原来的搜索边界",
-                )
-                .size(11.0)
-                .color(theme::tertiary_label()),
-            );
-            ui.horizontal(|ui| {
-                ui.label("点击前二次确认");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    theme::switch(ui, &mut self.profile.stable_confirm);
-                });
-            });
-            ui.label(
-                RichText::new("同一目标连续两帧识别到才点击，防误触；会增加约 0.3 秒响应延迟")
-                    .size(11.0)
-                    .color(theme::tertiary_label()),
-            );
-            if self.profile.click_method == ClickMethod::Background {
                 ui.label(
                     RichText::new(
-                        "后台点击不移动鼠标；为防误操作，识别和点击仍只在目标窗口处于前台时执行。",
+                        "高分辨率或高缩放比的显示器可适当放大；切换后立即生效并随配置保存。",
                     )
                     .size(11.0)
-                    .color(theme::orange()),
-                );
-            }
-        });
-
-        ui.add_space(10.0);
-        theme::card().show(ui, |ui| {
-            ui.label(RichText::new("失败自动恢复").size(18.0).strong());
-            ui.separator();
-            ui.label(
-                RichText::new(
-                    "步骤超时后先补充扫描；仍失败时探测前后步骤，确定游戏当前进度后从该步继续；\n无法定位时按下方方式处理。恢复过程只识别、不点击。",
-                )
-                .size(11.0)
-                .color(theme::tertiary_label()),
-            );
-            let recovery = &mut self.profile.failure_recovery;
-            ui.horizontal(|ui| {
-                ui.label("超时后补充扫描");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("recovery_extra_scans")
-                        .selected_text(match recovery.extra_scans {
-                            0 => "关闭".to_owned(),
-                            count => format!("{count} 次"),
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut recovery.extra_scans, 0, "关闭");
-                            for count in 1..=3_u8 {
-                                ui.selectable_value(
-                                    &mut recovery.extra_scans,
-                                    count,
-                                    format!("{count} 次"),
-                                );
-                            }
-                        });
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.label("重同步探测范围");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("recovery_window")
-                        .selected_text(format!("前后各 {} 步", recovery.resync_window))
-                        .show_ui(ui, |ui| {
-                            for window in 1..=5_u8 {
-                                ui.selectable_value(
-                                    &mut recovery.resync_window,
-                                    window,
-                                    format!("前后各 {window} 步"),
-                                );
-                            }
-                        });
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.label("最多自动恢复次数");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("recovery_max")
-                        .selected_text(match recovery.max_recoveries {
-                            0 => "不自动恢复".to_owned(),
-                            count => format!("{count} 次"),
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut recovery.max_recoveries, 0, "不自动恢复");
-                            for count in 1..=5_u8 {
-                                ui.selectable_value(
-                                    &mut recovery.max_recoveries,
-                                    count,
-                                    format!("{count} 次"),
-                                );
-                            }
-                        });
-                });
-            });
-            ui.label(
-                RichText::new("设为 0 时超时立即按“停止”处理，不做任何回退。")
-                    .size(11.0)
                     .color(theme::tertiary_label()),
-            );
-            ui.horizontal(|ui| {
-                ui.label("无法定位当前进度时");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("recovery_fallback")
-                        .selected_text(recovery.fallback.label())
-                        .show_ui(ui, |ui| {
-                            for fallback in [RecoveryFallback::Restart, RecoveryFallback::Stop] {
-                                ui.selectable_value(
-                                    &mut recovery.fallback,
-                                    fallback,
-                                    fallback.label(),
-                                );
-                            }
-                        });
-                });
+                );
             });
-        });
 
-        ui.add_space(10.0);
-        ui.columns(2, |columns| {
-            theme::card().show(&mut columns[0], |ui| {
-                ui.label(RichText::new("快捷键").size(18.0).strong());
+            ui.add_space(10.0);
+        }
+
+        if self.settings_section == SettingsSection::Flow {
+            theme::card().show(ui, |ui| {
+                ui.label(RichText::new("基本信息").size(18.0).strong());
                 ui.separator();
+                ui.label(
+                    RichText::new("流程名称")
+                        .size(12.0)
+                        .color(theme::secondary_label()),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.profile.name)
+                        .desired_width(ui.available_width()),
+                );
+            });
+
+            ui.add_space(10.0);
+            theme::card().show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("截图热键");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.profile.capture_hotkey)
-                            .desired_width(140.0)
-                            .hint_text("f6 或 ctrl+f6"),
-                    );
-                });
-                match parse_key_combo(&self.profile.capture_hotkey) {
-                    Ok(combo) => {
-                        ui.label(
-                            RichText::new(format!("将注册：{}", combo.describe()))
-                                .size(11.0)
-                                .color(theme::green()),
+                    ui.label(RichText::new("分享信息").size(18.0).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add(
+                            egui::Image::new(&self.mascots.erika_ok)
+                                .fit_to_exact_size(Vec2::splat(44.0)),
                         );
-                    }
-                    Err(error) => {
-                        ui.label(RichText::new(error).size(11.0).color(theme::red()));
-                    }
-                }
+                    });
+                });
+                ui.label(
+                    RichText::new("这些信息会随 .m5771pack 一起发布，方便别人判断是否适用。")
+                        .size(11.0)
+                        .color(theme::secondary_label()),
+                );
+                ui.separator();
+                ui.columns(2, |columns| {
+                    columns[0].label(
+                        RichText::new("作者")
+                            .size(12.0)
+                            .color(theme::secondary_label()),
+                    );
+                    columns[0].text_edit_singleline(&mut self.profile.sharing.author);
+                    columns[1].label(
+                        RichText::new("游戏版本")
+                            .size(12.0)
+                            .color(theme::secondary_label()),
+                    );
+                    columns[1].text_edit_singleline(&mut self.profile.sharing.game_version);
+                });
+                ui.columns(2, |columns| {
+                    columns[0].label(
+                        RichText::new("游戏语言")
+                            .size(12.0)
+                            .color(theme::secondary_label()),
+                    );
+                    columns[0].text_edit_singleline(&mut self.profile.sharing.game_language);
+                    columns[1].label(
+                        RichText::new("标签（逗号分隔）")
+                            .size(12.0)
+                            .color(theme::secondary_label()),
+                    );
+                    columns[1].text_edit_singleline(&mut self.profile.sharing.tags);
+                });
+                ui.label(
+                    RichText::new("说明")
+                        .size(12.0)
+                        .color(theme::secondary_label()),
+                );
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.profile.sharing.description)
+                        .desired_rows(3)
+                        .desired_width(ui.available_width())
+                        .hint_text("说明用途、入口画面、特殊要求和已知限制"),
+                );
+            });
+
+            ui.add_space(10.0);
+        }
+
+        if self.settings_section == SettingsSection::Window {
+            theme::card().show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("停止热键");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.profile.stop_hotkey)
-                            .desired_width(140.0)
-                            .hint_text("f8 或 ctrl+f8"),
-                    );
+                    ui.label(RichText::new("目标窗口").size(18.0).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (color, status) = match self.target_window.as_ref() {
+                            Some(target) if platform::is_foreground(target) => {
+                                (theme::green(), "已连接且在前台")
+                            }
+                            Some(_) => (theme::orange(), "已连接，等待前台"),
+                            None => (theme::orange(), "未连接"),
+                        };
+                        ui.label(RichText::new(status).color(theme::secondary_label()));
+                        let (dot, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 4.5, color);
+                    });
                 });
-                match parse_key_combo(&self.profile.stop_hotkey) {
-                    Ok(combo) => {
-                        ui.label(
-                            RichText::new(format!("将注册：{}", combo.describe()))
-                                .size(11.0)
-                                .color(theme::green()),
-                        );
+                ui.separator();
+                ui.label(
+                    RichText::new("自动匹配的窗口标题")
+                        .size(12.0)
+                        .color(theme::secondary_label()),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.profile.target_window)
+                        .hint_text("输入窗口标题的一部分")
+                        .desired_width(ui.available_width()),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("按标题连接").clicked() {
+                        self.connect_target_window();
                     }
-                    Err(error) => {
-                        ui.label(RichText::new(error).size(11.0).color(theme::red()));
+                    if ui.button("从可见窗口选择").clicked() {
+                        self.open_window_picker();
                     }
-                }
-                if let (Ok(capture), Ok(stop)) = (
-                    parse_key_combo(&self.profile.capture_hotkey),
-                    parse_key_combo(&self.profile.stop_hotkey),
-                ) && capture == stop
-                {
+                });
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("客户区基准尺寸")
+                        .size(12.0)
+                        .color(theme::secondary_label()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("宽");
+                    ui.add(
+                        egui::DragValue::new(&mut self.profile.expected_client_width)
+                            .range(320..=7680)
+                            .suffix(" px"),
+                    );
+                    ui.label("高");
+                    ui.add(
+                        egui::DragValue::new(&mut self.profile.expected_client_height)
+                            .range(240..=4320)
+                            .suffix(" px"),
+                    );
+                    if ui
+                        .add_enabled(
+                            self.target_window.is_some(),
+                            egui::Button::new("使用当前窗口尺寸"),
+                        )
+                        .clicked()
+                        && let Some(target) = &self.target_window
+                    {
+                        self.profile.expected_client_width = target.client_width;
+                        self.profile.expected_client_height = target.client_height;
+                    }
+                });
+                if !self.effective_templates().is_empty() {
                     ui.label(
-                        RichText::new("截图热键和停止热键不能相同")
+                        RichText::new("改变基准尺寸后，旧模板的局部搜索区可能需要重新截取。")
                             .size(11.0)
-                            .color(theme::red()),
+                            .color(theme::orange()),
                     );
                 }
-                ui.label(
-                    RichText::new("保存流程后生效")
-                        .size(11.0)
-                        .color(theme::tertiary_label()),
-                );
-                ui.label(
-                    RichText::new("快捷键为全局注册；如果被其他软件占用，日志页会显示错误。")
-                        .size(11.0)
-                        .color(theme::tertiary_label()),
-                );
             });
-            theme::card().show(&mut columns[1], |ui| {
-                ui.label(RichText::new("执行保护").size(18.0).strong());
-                ui.separator();
-                safety_status_row(ui, "只在目标窗口处于前台时点击");
-                safety_status_row(ui, "分辨率不符时按比例缩放模板");
-                safety_status_row(ui, "运行中客户区尺寸变化时停止");
-                safety_status_row(ui, "仅使用截图与 Windows 标准输入");
-            });
-        });
 
-        ui.add_space(10.0);
-        theme::card().show(ui, |ui| {
-            ui.label(RichText::new("本地数据").size(18.0).strong());
-            ui.separator();
-            settings_value_row(
-                ui,
-                "流程配置",
-                &self.current_profile_path.display().to_string(),
-            );
-            settings_value_row(ui, "应用版本", env!("CARGO_PKG_VERSION"));
-            ui.label(
-                RichText::new("模板、运行日志与配置均保存在程序当前工作目录，不会上传。")
+            ui.add_space(10.0);
+        }
+
+        if self.settings_section == SettingsSection::Recognition {
+            theme::card().show(ui, |ui| {
+                ui.label(RichText::new("点击与识别").size(18.0).strong());
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("执行点击");
+                    egui::ComboBox::from_id_salt("click-method")
+                        .selected_text(self.profile.click_method.label())
+                        .show_ui(ui, |ui| {
+                            for method in ClickMethod::ALL {
+                                ui.selectable_value(
+                                    &mut self.profile.click_method,
+                                    method,
+                                    method.label(),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("拟人化（点击位置 ±3 px、等待时间 ±20% 随机抖动）");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        theme::switch(ui, &mut self.profile.click_jitter);
+                    });
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(
+                    RichText::new("识别与性能")
+                        .size(12.0)
+                        .color(theme::secondary_label()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("识别模式");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let selected = match self.profile.match_algorithm {
+                            MatchAlgorithm::Hybrid => "金字塔模板识别（推荐）",
+                            MatchAlgorithm::Precise => "兼容 RGB 识别",
+                            MatchAlgorithm::Fast => "兼容快速灰度",
+                            MatchAlgorithm::Classic => "兼容经典灰度",
+                        };
+                        egui::ComboBox::from_id_salt("recognition_mode")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.profile.match_algorithm,
+                                    MatchAlgorithm::Hybrid,
+                                    "金字塔模板识别（推荐）",
+                                );
+                                ui.selectable_value(
+                                    &mut self.profile.match_algorithm,
+                                    MatchAlgorithm::Precise,
+                                    "兼容 RGB 识别",
+                                );
+                            });
+                    });
+                });
+                ui.label(
+                    RichText::new(
+                        "旧流程仍沿用原有 RGB 评分；切换到金字塔模式后请先测试关键模板并校准阈值",
+                    )
                     .size(11.0)
                     .color(theme::tertiary_label()),
-            );
-        });
-        ui.add_space(12.0);
+                );
+                ui.horizontal(|ui| {
+                    ui.label("性能模式");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("recognition_performance")
+                            .selected_text(self.profile.recognition_performance.label())
+                            .show_ui(ui, |ui| {
+                                for mode in RecognitionPerformance::ALL {
+                                    ui.selectable_value(
+                                        &mut self.profile.recognition_performance,
+                                        mode,
+                                        mode.label(),
+                                    );
+                                }
+                            });
+                    });
+                });
+                ui.label(
+                    RichText::new(self.profile.recognition_performance.description())
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("普通等待扫描频率");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let selected = self
+                            .profile
+                            .idle_scan_secs
+                            .map(|seconds| format!("每 {seconds} 秒"))
+                            .unwrap_or_else(|| "沿用旧设置".to_owned());
+                        egui::ComboBox::from_id_salt("idle_scan_secs")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                for seconds in [1_u8, 3, 5] {
+                                    ui.selectable_value(
+                                        &mut self.profile.idle_scan_secs,
+                                        Some(seconds),
+                                        format!("每 {seconds} 秒"),
+                                    );
+                                }
+                            });
+                    });
+                });
+                ui.label(
+                    RichText::new("首次立即扫描；候选确认保持高速。普通推荐 3 秒，长时间战斗推荐 5 秒")
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("跨分辨率模板缩放");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("template_scale_mode")
+                            .selected_text(self.profile.template_scale_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in TemplateScaleMode::ALL {
+                                    ui.selectable_value(
+                                        &mut self.profile.template_scale_mode,
+                                        mode,
+                                        mode.label(),
+                                    );
+                                }
+                            });
+                    });
+                });
+                ui.label(
+                    RichText::new(self.profile.template_scale_mode.description())
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("智能 ROI 越界恢复");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        theme::switch(ui, &mut self.profile.adaptive_roi);
+                    });
+                });
+                ui.label(
+                    RichText::new(
+                        "开启后局部区域连续未命中会全屏恢复；旧流程默认关闭，以保留原来的搜索边界",
+                    )
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("点击前二次确认");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        theme::switch(ui, &mut self.profile.stable_confirm);
+                    });
+                });
+                ui.label(
+                    RichText::new("同一目标连续两帧识别到才点击，防误触；会增加约 0.3 秒响应延迟")
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
+                if self.profile.click_method == ClickMethod::Background {
+                    ui.label(
+                        RichText::new(
+                            "后台点击不移动鼠标；为防误操作，识别和点击仍只在目标窗口处于前台时执行。",
+                        )
+                        .size(11.0)
+                        .color(theme::orange()),
+                    );
+                }
+            });
+
+            ui.add_space(10.0);
+        }
+
+        if self.settings_section == SettingsSection::Recovery {
+            theme::card().show(ui, |ui| {
+                ui.label(RichText::new("失败自动恢复").size(18.0).strong());
+                ui.separator();
+                ui.label(
+                    RichText::new(
+                        "步骤超时后先补充扫描；仍失败时探测前后步骤，确定游戏当前进度后从该步继续；\n无法定位时按下方方式处理。恢复过程只识别、不点击。",
+                    )
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+                );
+                let recovery = &mut self.profile.failure_recovery;
+                ui.horizontal(|ui| {
+                    ui.label("超时后补充扫描");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("recovery_extra_scans")
+                            .selected_text(match recovery.extra_scans {
+                                0 => "关闭".to_owned(),
+                                count => format!("{count} 次"),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut recovery.extra_scans, 0, "关闭");
+                                for count in 1..=3_u8 {
+                                    ui.selectable_value(
+                                        &mut recovery.extra_scans,
+                                        count,
+                                        format!("{count} 次"),
+                                    );
+                                }
+                            });
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("重同步探测范围");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("recovery_window")
+                            .selected_text(format!("前后各 {} 步", recovery.resync_window))
+                            .show_ui(ui, |ui| {
+                                for window in 1..=5_u8 {
+                                    ui.selectable_value(
+                                        &mut recovery.resync_window,
+                                        window,
+                                        format!("前后各 {window} 步"),
+                                    );
+                                }
+                            });
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("最多自动恢复次数");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("recovery_max")
+                            .selected_text(match recovery.max_recoveries {
+                                0 => "不自动恢复".to_owned(),
+                                count => format!("{count} 次"),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut recovery.max_recoveries, 0, "不自动恢复");
+                                for count in 1..=5_u8 {
+                                    ui.selectable_value(
+                                        &mut recovery.max_recoveries,
+                                        count,
+                                        format!("{count} 次"),
+                                    );
+                                }
+                            });
+                    });
+                });
+                ui.label(
+                    RichText::new("设为 0 时超时立即按“停止”处理，不做任何回退。")
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("无法定位当前进度时");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("recovery_fallback")
+                            .selected_text(recovery.fallback.label())
+                            .show_ui(ui, |ui| {
+                                for fallback in [RecoveryFallback::Restart, RecoveryFallback::Stop] {
+                                    ui.selectable_value(
+                                        &mut recovery.fallback,
+                                        fallback,
+                                        fallback.label(),
+                                    );
+                                }
+                            });
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
+        }
+
+        if self.settings_section == SettingsSection::Shortcuts {
+            ui.columns(2, |columns| {
+                theme::card().show(&mut columns[0], |ui| {
+                    ui.label(RichText::new("快捷键").size(18.0).strong());
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("截图热键");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.profile.capture_hotkey)
+                                .desired_width(140.0)
+                                .hint_text("f6 或 ctrl+f6"),
+                        );
+                    });
+                    match parse_key_combo(&self.profile.capture_hotkey) {
+                        Ok(combo) => {
+                            ui.label(
+                                RichText::new(format!("将注册：{}", combo.describe()))
+                                    .size(11.0)
+                                    .color(theme::green()),
+                            );
+                        }
+                        Err(error) => {
+                            ui.label(RichText::new(error).size(11.0).color(theme::red()));
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("停止热键");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.profile.stop_hotkey)
+                                .desired_width(140.0)
+                                .hint_text("f8 或 ctrl+f8"),
+                        );
+                    });
+                    match parse_key_combo(&self.profile.stop_hotkey) {
+                        Ok(combo) => {
+                            ui.label(
+                                RichText::new(format!("将注册：{}", combo.describe()))
+                                    .size(11.0)
+                                    .color(theme::green()),
+                            );
+                        }
+                        Err(error) => {
+                            ui.label(RichText::new(error).size(11.0).color(theme::red()));
+                        }
+                    }
+                    if let (Ok(capture), Ok(stop)) = (
+                        parse_key_combo(&self.profile.capture_hotkey),
+                        parse_key_combo(&self.profile.stop_hotkey),
+                    ) && capture == stop
+                    {
+                        ui.label(
+                            RichText::new("截图热键和停止热键不能相同")
+                                .size(11.0)
+                                .color(theme::red()),
+                        );
+                    }
+                    ui.label(
+                        RichText::new("保存流程后生效")
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                    );
+                    ui.label(
+                        RichText::new("快捷键为全局注册；如果被其他软件占用，日志页会显示错误。")
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                    );
+                });
+                theme::card().show(&mut columns[1], |ui| {
+                    ui.label(RichText::new("执行保护").size(18.0).strong());
+                    ui.separator();
+                    safety_status_row(ui, "只在目标窗口处于前台时点击");
+                    safety_status_row(ui, "分辨率不符时按比例缩放模板");
+                    safety_status_row(ui, "运行中客户区尺寸变化时停止");
+                    safety_status_row(ui, "仅使用截图与 Windows 标准输入");
+                });
+            });
+
+            ui.add_space(10.0);
+        }
+
+        if self.settings_section == SettingsSection::Local {
+            theme::card().show(ui, |ui| {
+                ui.label(RichText::new("本地数据").size(18.0).strong());
+                ui.separator();
+                settings_value_row(
+                    ui,
+                    "流程配置",
+                    &self.current_profile_path.display().to_string(),
+                );
+                settings_value_row(ui, "应用版本", env!("CARGO_PKG_VERSION"));
+                ui.label(
+                    RichText::new("模板、运行日志与配置均保存在程序当前工作目录，不会上传。")
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
+            });
+            ui.add_space(12.0);
+        }
     }
 
     fn show_window_picker(&mut self, ctx: &egui::Context) {
@@ -5116,17 +5206,22 @@ impl Make5771App {
                 } else {
                     theme::secondary_label()
                 };
-                if selected {
+                let selected_progress = ui.ctx().animate_bool_with_time(
+                    egui::Id::new(("nav-selected", tab.label())),
+                    selected,
+                    0.12,
+                );
+                if selected_progress > 0.0 {
                     let selected_rect = rect.shrink2(Vec2::new(4.0, 3.0));
                     ui.painter().rect_filled(
                         selected_rect.expand(2.0),
                         16.0,
-                        theme::blue().gamma_multiply(0.06),
+                        theme::blue().gamma_multiply(0.06 * selected_progress),
                     );
                     ui.painter().rect_filled(
                         selected_rect,
                         14.0,
-                        theme::blue().gamma_multiply(0.12),
+                        theme::blue().gamma_multiply(0.12 * selected_progress),
                     );
                     ui.painter().rect_filled(
                         egui::Rect::from_min_size(
@@ -5134,9 +5229,10 @@ impl Make5771App {
                             Vec2::new((selected_rect.width() - 28.0).max(8.0), 2.0),
                         ),
                         1.0,
-                        theme::gold(),
+                        theme::gold().gamma_multiply(selected_progress),
                     );
-                } else if response.hovered() {
+                }
+                if !selected && response.hovered() {
                     ui.painter().rect_filled(
                         rect.shrink2(Vec2::new(4.0, 3.0)),
                         12.0,
@@ -5575,6 +5671,15 @@ fn render_step_editor_5stages(
                         .clicked()
                     {
                         *workflow_action = Some(WorkflowTemplateAction::CaptureNew(
+                            TemplateUseLocator::Step(step.id),
+                        ));
+                    }
+                    if ui
+                        .button("截图＋识别区")
+                        .on_hover_text("一次框选：蓝框截图成为模板，绿框成为这一步的搜索范围")
+                        .clicked()
+                    {
+                        *workflow_action = Some(WorkflowTemplateAction::CaptureNewWithRegion(
                             TemplateUseLocator::Step(step.id),
                         ));
                     }
@@ -7690,6 +7795,195 @@ fn format_duration_secs(secs: u64) -> String {
     }
 }
 
+/// "引用 N 处" / "未引用" badge used by both template views.
+fn template_reference_badge(ui: &mut egui::Ui, profile: &MacroProfile, template: &TemplateAsset) {
+    let references = count_template_references(profile, &template.path);
+    let (text, color) = if references > 0 {
+        (format!("引用 {references} 处"), theme::orange())
+    } else {
+        ("未引用".to_owned(), theme::tertiary_label())
+    };
+    ui.label(RichText::new(text).size(11.0).color(color));
+}
+
+fn template_region_label(template: &TemplateAsset) -> String {
+    match template.search_region {
+        Some(region) => format!(
+            "自定义 {}×{}+{},{}",
+            region.width, region.height, region.x, region.y
+        ),
+        None => "全屏".to_owned(),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "template rows need the library, the thumb cache and the action sinks"
+)]
+fn render_template_list(
+    ui: &mut egui::Ui,
+    templates: &[TemplateAsset],
+    profile: &MacroProfile,
+    thumbs: &mut TemplateThumbs,
+    renaming: Option<&(u64, String)>,
+    requested_test: &mut Option<u64>,
+    requested_delete: &mut Option<u64>,
+    requested_roi: &mut Option<u64>,
+    requested_rename: &mut Option<(u64, String)>,
+) {
+    for template in templates {
+        ui.horizontal(|ui| {
+            match thumbs.texture(ui.ctx(), &template.path, &template.name) {
+                Some(texture) => {
+                    let response = ui.add(
+                        egui::Image::new(texture)
+                            .fit_to_exact_size(Vec2::new(64.0, 40.0))
+                            .sense(Sense::click()),
+                    );
+                    if response.clicked() {
+                        thumbs.preview = Some(template.id);
+                    }
+                    response.on_hover_text("点击预览模板图片");
+                }
+                None => template_icon(ui, 30.0, theme::blue()),
+            }
+            ui.vertical(|ui| {
+                let renaming_this = renaming.is_some_and(|(id, _)| *id == template.id);
+                ui.label(RichText::new(&template.name).strong());
+                if renaming_this {
+                    ui.label(
+                        RichText::new("在下方输入新名称")
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                    );
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "{} × {} · {}",
+                        template.width, template.height, template.path
+                    ))
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("测试").clicked() {
+                    *requested_test = Some(template.id);
+                }
+                if ui.button("删除").clicked() {
+                    *requested_delete = Some(template.id);
+                }
+                if ui.button("改名").clicked() {
+                    *requested_rename = Some((template.id, template.name.clone()));
+                }
+                if ui.button("范围").clicked() {
+                    *requested_roi = Some(template.id);
+                }
+                template_reference_badge(ui, profile, template);
+                ui.label(
+                    RichText::new(template_region_label(template))
+                        .size(11.0)
+                        .color(theme::tertiary_label()),
+                );
+            });
+        });
+        ui.separator();
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "template cells need the library, the thumb cache and the action sinks"
+)]
+fn render_template_grid(
+    ui: &mut egui::Ui,
+    templates: &[TemplateAsset],
+    profile: &MacroProfile,
+    thumbs: &mut TemplateThumbs,
+    requested_test: &mut Option<u64>,
+    requested_delete: &mut Option<u64>,
+    requested_roi: &mut Option<u64>,
+    requested_rename: &mut Option<(u64, String)>,
+) {
+    const CELL_WIDTH: f32 = 190.0;
+    const PREVIEW_HEIGHT: f32 = 96.0;
+    let columns = ((ui.available_width() / CELL_WIDTH).floor() as usize).clamp(1, 6);
+    egui::Grid::new("template-grid")
+        .num_columns(columns)
+        .spacing([14.0, 14.0])
+        .show(ui, |ui| {
+            for (index, template) in templates.iter().enumerate() {
+                let preview = thumbs
+                    .texture(ui.ctx(), &template.path, &template.name)
+                    .map(|texture| (texture.id(), texture.size_vec2()));
+                ui.vertical(|ui| {
+                    ui.set_width(CELL_WIDTH - 14.0);
+                    let (rect, response) = ui.allocate_exact_size(
+                        Vec2::new(CELL_WIDTH - 14.0, PREVIEW_HEIGHT),
+                        Sense::click(),
+                    );
+                    match preview {
+                        Some((id, size)) => {
+                            let scale = (rect.width() / size.x).min(rect.height() / size.y);
+                            let draw = egui::Rect::from_center_size(rect.center(), size * scale);
+                            ui.painter().image(
+                                id,
+                                draw,
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                        None => {
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "无预览",
+                                egui::FontId::proportional(12.0),
+                                theme::tertiary_label(),
+                            );
+                        }
+                    }
+                    ui.painter().rect_stroke(
+                        rect,
+                        10.0,
+                        Stroke::new(1.0, theme::separator()),
+                        egui::StrokeKind::Inside,
+                    );
+                    if response.clicked() {
+                        thumbs.preview = Some(template.id);
+                    }
+                    response.on_hover_text("点击预览模板图片");
+                    ui.label(RichText::new(&template.name).strong().size(13.0));
+                    // The reference state sits directly under the preview, as
+                    // requested for the grid view.
+                    template_reference_badge(ui, profile, template);
+                    ui.label(
+                        RichText::new(format!("{} × {}", template.width, template.height))
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.small_button("测试").clicked() {
+                            *requested_test = Some(template.id);
+                        }
+                        if ui.small_button("范围").clicked() {
+                            *requested_roi = Some(template.id);
+                        }
+                        if ui.small_button("改名").clicked() {
+                            *requested_rename = Some((template.id, template.name.clone()));
+                        }
+                        if ui.small_button("删除").clicked() {
+                            *requested_delete = Some(template.id);
+                        }
+                    });
+                });
+                if (index + 1) % columns == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+}
+
 fn log_level_color(level: LogLevel) -> Color32 {
     match level {
         LogLevel::Info => theme::blue(),
@@ -8238,11 +8532,23 @@ impl eframe::App for Make5771App {
             }
         }
 
-        if let Some(message) = self.toast.clone() {
-            if self.toast_message.as_deref() != Some(message.as_str()) {
-                self.toast_message = Some(message.clone());
-                self.toast_shown_at = Some(std::time::Instant::now());
+        if self.toast.as_deref() != self.toast_message.as_deref() {
+            self.toast_message = self.toast.clone();
+            if let Some(message) = self.toast.clone() {
+                self.toast_history
+                    .push_back((message, std::time::Instant::now()));
+                while self.toast_history.len() > 3 {
+                    self.toast_history.pop_front();
+                }
             }
+        }
+        if !self.toast_history.is_empty() {
+            let messages: Vec<String> = self
+                .toast_history
+                .iter()
+                .rev()
+                .map(|(message, _)| message.clone())
+                .collect();
             let mut dismiss = false;
             let response = egui::Window::new("提示")
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 78.0])
@@ -8250,28 +8556,48 @@ impl eframe::App for Make5771App {
                 .resizable(false)
                 .title_bar(false)
                 .show(&ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(&message);
-                        if ui.small_button("关闭").clicked() {
-                            dismiss = true;
-                        }
-                    });
+                    for (index, message) in messages.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let color = if index == 0 {
+                                theme::label()
+                            } else {
+                                theme::secondary_label()
+                            };
+                            ui.label(RichText::new(message).color(color));
+                        });
+                    }
+                    if ui.small_button("关闭").clicked() {
+                        dismiss = true;
+                    }
                     if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                         dismiss = true;
                     }
                 })
                 .map(|inner| inner.response);
-            // Hovering pauses the timer so long warnings stay readable.
-            if response.is_some_and(|response| response.hovered()) {
-                self.toast_shown_at = Some(std::time::Instant::now());
+            // Hovering pauses the timer so long messages stay readable.
+            let hovered = response.is_some_and(|response| response.hovered());
+            let now = std::time::Instant::now();
+            if hovered {
+                for entry in &mut self.toast_history {
+                    entry.1 = now;
+                }
+            } else {
+                self.toast_history
+                    .retain(|(_, shown)| shown.elapsed() < std::time::Duration::from_secs(7));
             }
-            let expired = self
-                .toast_shown_at
-                .is_some_and(|shown| shown.elapsed() >= std::time::Duration::from_secs(7));
-            if dismiss || expired {
+            if dismiss || self.toast_history.is_empty() {
+                self.toast_history.clear();
                 self.toast = None;
                 self.toast_message = None;
-                self.toast_shown_at = None;
+            } else if self.toast.is_some()
+                && self
+                    .toast_history
+                    .front()
+                    .is_some_and(|(_, shown)| shown.elapsed() >= std::time::Duration::from_secs(7))
+            {
+                // The newest message expired: release the slot for the next one.
+                self.toast = None;
+                self.toast_message = None;
             }
         }
 
@@ -8333,6 +8659,63 @@ impl eframe::App for Make5771App {
             }
         }
 
+        let capture_action = self
+            .capture_draft
+            .as_mut()
+            .map(|draft| draft.show(&ctx))
+            .unwrap_or(CaptureAction::None);
+        match capture_action {
+            CaptureAction::None => {}
+            CaptureAction::Cancel => {
+                self.capture_draft = None;
+                self.capture_bind_target = None;
+            }
+            CaptureAction::Apply { template, region } => {
+                if let Some(draft) = self.capture_draft.take() {
+                    let reference_size = (draft.image.width(), draft.image.height());
+                    let name = draft.name().to_owned();
+                    let cropped = image::imageops::crop_imm(
+                        &draft.image,
+                        template.x,
+                        template.y,
+                        template.width,
+                        template.height,
+                    )
+                    .to_image();
+                    let selection = PixelSelection {
+                        x: 0,
+                        y: 0,
+                        width: cropped.width(),
+                        height: cropped.height(),
+                    };
+                    let bind_target = self.capture_bind_target.take();
+                    self.draft_replacement_id = None;
+                    self.draft_bind_target = bind_target;
+                    self.template_draft = Some(
+                        TemplateDraft::from_image(&ctx, cropped, "截图", name.clone())
+                            .with_selection(selection),
+                    );
+                    self.save_template_from_draft(name, selection);
+                    if let (Some(locator), Some(region)) = (bind_target, region) {
+                        self.apply_visual_roi(locator, region, reference_size);
+                        match storage::save_profile(&self.current_profile_path, &self.profile) {
+                            Ok(()) => {
+                                self.save_tracker.record_saved(&self.profile);
+                                self.invalidate_ui_caches();
+                            }
+                            Err(error) => {
+                                self.save_tracker.record_failed(error.to_string());
+                                self.push_log(
+                                    LogLevel::Warning,
+                                    format!("识别区保存失败：{error}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let editor_action = self
             .template_draft
             .as_mut()
@@ -8378,6 +8761,67 @@ mod tests {
             reference_height: 100,
             search_region: None,
         }
+    }
+
+    #[test]
+    fn template_grid_marks_referenced_and_unused_templates() {
+        fn collect_text(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push_str(&text.galley.job.text);
+                    out.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut profile = MacroProfile::default();
+        profile.steps[0].template = Some("assets/a.png".to_owned());
+        let templates = vec![
+            asset(1, "已引用", "assets/a.png"),
+            asset(2, "未引用", "assets/b.png"),
+        ];
+        let mut thumbs = TemplateThumbs::default();
+        let mut requested_test = None;
+        let mut requested_delete = None;
+        let mut requested_roi = None;
+        let mut requested_rename = None;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                render_template_grid(
+                    ui,
+                    &templates,
+                    &profile,
+                    &mut thumbs,
+                    &mut requested_test,
+                    &mut requested_delete,
+                    &mut requested_roi,
+                    &mut requested_rename,
+                );
+            },
+        );
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut text);
+        }
+        assert!(
+            text.contains("引用 1 处"),
+            "grid must mark referenced templates"
+        );
+        assert!(text.contains("未引用"), "grid must mark unused templates");
+        assert!(text.contains("已引用") && text.contains("未引用"));
     }
 
     /// Simulates actual egui pointer frames, including the production drop zone.

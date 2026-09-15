@@ -226,6 +226,15 @@ fn switch_track_off() -> Color32 {
 /// egui's `toggle_value` paints no frame at all while the value is off, which
 /// made switches such as “深色模式” read as plain text. This variant always
 /// paints a track, an outline and the current state text, and toggles on click.
+fn blend(from: Color32, to: Color32, t: f32) -> Color32 {
+    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    Color32::from_rgb(
+        mix(from.r(), to.r()),
+        mix(from.g(), to.g()),
+        mix(from.b(), to.b()),
+    )
+}
+
 pub fn switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
     let on = *value;
     let state_text = if on { "开启" } else { "关闭" };
@@ -245,10 +254,13 @@ pub fn switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
             track,
         );
         let radius = CornerRadius::same(11);
+        let progress = ui
+            .ctx()
+            .animate_bool_with_time(response.id.with("switch-anim"), on, 0.10);
         ui.painter().rect_filled(
             track_rect,
             radius,
-            if on { blue() } else { switch_track_off() },
+            blend(switch_track_off(), blue(), progress),
         );
         ui.painter().rect_stroke(
             track_rect,
@@ -263,11 +275,7 @@ pub fn switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
             ),
             egui::StrokeKind::Inside,
         );
-        let knob_x = if on {
-            track_rect.right() - 11.0
-        } else {
-            track_rect.left() + 11.0
-        };
+        let knob_x = track_rect.left() + 11.0 + (track_rect.width() - 22.0) * progress;
         ui.painter().circle_filled(
             egui::pos2(knob_x, track_rect.center().y),
             7.5,
@@ -377,7 +385,8 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     style.visuals.faint_bg_color = palette.surface_muted;
     style.visuals.override_text_color = Some(palette.label);
     style.visuals.selection.bg_fill = palette.blue.gamma_multiply(0.25);
-    style.visuals.selection.stroke = Stroke::new(1.0, palette.blue);
+    // Also used as the keyboard focus ring, so keep it clearly visible.
+    style.visuals.selection.stroke = Stroke::new(2.0, palette.blue);
     style.visuals.widgets.noninteractive.bg_fill = palette.surface;
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.separator);
     style.visuals.widgets.inactive.bg_fill = control_fill();
