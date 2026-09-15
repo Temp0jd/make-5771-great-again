@@ -217,6 +217,10 @@ pub struct Make5771App {
     selected_subflow: Option<u64>,
     selected_subflow_step: Option<u64>,
     workflow_step_filter: String,
+    toast_shown_at: Option<std::time::Instant>,
+    toast_message: Option<String>,
+    preflight_cache: Option<(std::time::Instant, WorkflowPreflightReport)>,
+    save_status_cache: Option<(std::time::Instant, SaveStatus)>,
 }
 
 impl Make5771App {
@@ -285,6 +289,10 @@ impl Make5771App {
             current_step: "等待开始".to_owned(),
             logs: Vec::new(),
             toast: None,
+            toast_shown_at: None,
+            toast_message: None,
+            preflight_cache: None,
+            save_status_cache: None,
             force_stop_confirm: false,
             target_window,
             template_draft: None,
@@ -631,6 +639,7 @@ impl Make5771App {
                 );
                 self.toast = Some(message);
                 self.target_window = Some(target);
+                self.invalidate_ui_caches();
             }
             Err(error) => {
                 let message = error.to_string();
@@ -665,6 +674,7 @@ impl Make5771App {
             && target.client_height == self.profile.expected_client_height;
         self.target_window = Some(target.clone());
         self.window_picker_open = false;
+        self.invalidate_ui_caches();
         let message = if size_matches {
             format!(
                 "已选择窗口：{}（{} × {}）",
@@ -946,6 +956,42 @@ impl Make5771App {
         workflow_ui::evaluate_preflight(&profile, self.target_window.as_ref(), check_files)
     }
 
+    /// Drops display caches after a profile or target change.
+    fn invalidate_ui_caches(&mut self) {
+        self.preflight_cache = None;
+        self.save_status_cache = None;
+    }
+
+    /// Display-only cache for the idle pages. Actions that start a run, save,
+    /// or close the app always recompute synchronously, so a cached verdict is
+    /// never used to authorise input or discard unsaved work.
+    fn cached_preflight(&mut self, check_files: bool) -> WorkflowPreflightReport {
+        const TTL: std::time::Duration = std::time::Duration::from_millis(250);
+        if !check_files
+            && let Some((computed_at, report)) = &self.preflight_cache
+            && computed_at.elapsed() < TTL
+        {
+            return report.clone();
+        }
+        let report = self.workflow_preflight(check_files);
+        self.preflight_cache = Some((std::time::Instant::now(), report.clone()));
+        report
+    }
+
+    /// Same contract as [`Self::cached_preflight`]; the exit guard and Ctrl+S
+    /// read [`Self::save_tracker`] directly.
+    fn cached_save_status(&mut self) -> SaveStatus {
+        const TTL: std::time::Duration = std::time::Duration::from_millis(250);
+        if let Some((computed_at, status)) = &self.save_status_cache
+            && computed_at.elapsed() < TTL
+        {
+            return status.clone();
+        }
+        let status = self.save_tracker.status(&self.profile);
+        self.save_status_cache = Some((std::time::Instant::now(), status.clone()));
+        status
+    }
+
     fn toggle_runner(&mut self) {
         if self.workflow_runner.is_some() {
             if let Some(runner) = &self.workflow_runner {
@@ -958,6 +1004,7 @@ impl Make5771App {
         }
 
         let preflight = self.workflow_preflight(true);
+        self.preflight_cache = Some((std::time::Instant::now(), preflight.clone()));
         if let Some(error) = preflight.first_blocker_message() {
             self.toast = Some(format!("运行检查未通过：{error}"));
             self.push_log(LogLevel::Warning, format!("运行检查未通过：{error}"));
@@ -1330,6 +1377,7 @@ impl Make5771App {
         match result {
             Ok(()) => {
                 self.save_tracker.record_saved(&self.profile);
+                self.invalidate_ui_caches();
                 self.toast = Some("流程已保存".to_owned());
                 self.push_log(
                     LogLevel::Success,
@@ -1371,6 +1419,7 @@ impl Make5771App {
         self.subflow_library = false;
         self.selected_subflow = None;
         self.selected_subflow_step = None;
+        self.invalidate_ui_caches();
     }
 
     fn undo_workflow_edit(&mut self) {
@@ -1387,6 +1436,7 @@ impl Make5771App {
         ));
         self.profile.steps = steps;
         self.profile.subflows = subflows;
+        self.invalidate_ui_caches();
         if self
             .selected_step
             .is_none_or(|id| !self.profile.steps.iter().any(|step| step.id == id))
@@ -1408,6 +1458,7 @@ impl Make5771App {
             .push(std::mem::replace(&mut self.workflow_history_snapshot, next));
         self.profile.steps = steps;
         self.profile.subflows = subflows;
+        self.invalidate_ui_caches();
         if self
             .selected_step
             .is_none_or(|id| !self.profile.steps.iter().any(|step| step.id == id))
@@ -1519,6 +1570,7 @@ impl Make5771App {
         match storage::save_profile(&path, &self.profile) {
             Ok(()) => {
                 self.save_tracker.record_saved(&self.profile);
+                self.invalidate_ui_caches();
                 self.current_profile_path = path.clone();
                 self.selected_profile = Some(path);
                 self.refresh_profiles();
@@ -2014,9 +2066,6 @@ impl Make5771App {
                     }
                 }
                 ui.add_space(8.0);
-                if ui.button("设置").clicked() {
-                    self.active_tab = AppTab::Settings;
-                }
                 if ui.button("选择窗口").clicked() {
                     self.open_window_picker();
                 }
@@ -2037,9 +2086,10 @@ impl Make5771App {
 
     fn run_hero(&self, ui: &mut egui::Ui) {
         egui::Frame::new()
-            .fill(theme::surface_muted())
+            .fill(theme::glass_muted())
             .stroke(Stroke::new(1.0, theme::gold().gamma_multiply(0.52)))
-            .corner_radius(16.0)
+            .corner_radius(20.0)
+            .shadow(theme::card_shadow())
             .inner_margin(egui::Margin::symmetric(24, 14))
             .show(ui, |ui| {
                 ui.set_min_height(104.0);
@@ -2053,12 +2103,6 @@ impl Make5771App {
                         );
                         ui.add_space(3.0);
                         ui.label(RichText::new("准备执行视觉流程").size(25.0).strong());
-                        ui.add_space(5.0);
-                        ui.label(
-                            RichText::new(&self.profile.name)
-                                .size(12.0)
-                                .color(theme::secondary_label()),
-                        );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add(
@@ -2100,12 +2144,6 @@ impl Make5771App {
                     );
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("编辑流程").clicked() {
-                        self.active_tab = AppTab::Flow;
-                    }
-                    if ui.button("选择窗口").clicked() {
-                        self.open_window_picker();
-                    }
                     if ui
                         .button(if self.target_window.is_some() {
                             "重新连接"
@@ -2300,7 +2338,7 @@ impl Make5771App {
         });
 
         let preflight =
-            (self.runner_status == RunnerStatus::Ready).then(|| self.workflow_preflight(false));
+            (self.runner_status == RunnerStatus::Ready).then(|| self.cached_preflight(false));
         let start_blocked = preflight
             .as_ref()
             .is_some_and(|report| report.has_blockers());
@@ -2419,6 +2457,7 @@ impl Make5771App {
                             self.push_log(LogLevel::Warning, err);
                         }
                     }
+                    self.invalidate_ui_caches();
                 }
             });
         }
@@ -2531,7 +2570,7 @@ impl Make5771App {
                     }
                 });
                 ui.add_space(8.0);
-                match self.save_tracker.status(&self.profile) {
+                match self.cached_save_status() {
                     SaveStatus::Saved => {
                         ui.label(RichText::new("已保存").size(12.0).color(theme::green()))
                             .on_hover_text("所有修改已保存至磁盘");
@@ -2651,7 +2690,7 @@ impl Make5771App {
             .iter()
             .map(|flow| (flow.id, flow.name.clone()))
             .collect();
-        let flow_preflight = self.workflow_preflight(false);
+        let flow_preflight = self.cached_preflight(false);
         if flow_preflight.has_blockers() || flow_preflight.warnings().next().is_some() {
             theme::section_card().show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2797,9 +2836,6 @@ impl Make5771App {
                                         if ui.button("添加等待").clicked() {
                                             list_command =
                                                 Some(StepListCommand::Add(StepKind::Delay));
-                                        }
-                                        if ui.button("导入流程").clicked() {
-                                            self.request_import_flow(None);
                                         }
                                     });
                                 } else if filtered_indices.is_empty() {
@@ -3463,7 +3499,11 @@ impl Make5771App {
                 ui.label(RichText::new("查看识别、点击与异常记录").color(theme::secondary_label()));
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("清空").clicked() {
+                if ui
+                    .add_enabled(!self.logs.is_empty(), egui::Button::new("清空"))
+                    .on_disabled_hover_text("当前没有日志")
+                    .clicked()
+                {
                     self.logs.clear();
                 }
                 ui.add(
@@ -3971,11 +4011,9 @@ impl Make5771App {
                 "流程配置",
                 &self.current_profile_path.display().to_string(),
             );
-            settings_value_row(ui, "图片模板", "templates/");
-            settings_value_row(ui, "运行日志", "logs/");
             settings_value_row(ui, "应用版本", env!("CARGO_PKG_VERSION"));
             ui.label(
-                RichText::new("所有配置和模板均保存在程序当前工作目录，不会上传。")
+                RichText::new("模板、运行日志与配置均保存在程序当前工作目录，不会上传。")
                     .size(11.0)
                     .color(theme::tertiary_label()),
             );
@@ -4677,8 +4715,13 @@ impl Make5771App {
                 if selected {
                     let selected_rect = rect.shrink2(Vec2::new(4.0, 3.0));
                     ui.painter().rect_filled(
+                        selected_rect.expand(2.0),
+                        16.0,
+                        theme::blue().gamma_multiply(0.06),
+                    );
+                    ui.painter().rect_filled(
                         selected_rect,
-                        12.0,
+                        14.0,
                         theme::blue().gamma_multiply(0.12),
                     );
                     ui.painter().rect_filled(
@@ -7749,22 +7792,39 @@ impl eframe::App for Make5771App {
         }
 
         if let Some(message) = self.toast.clone() {
+            if self.toast_message.as_deref() != Some(message.as_str()) {
+                self.toast_message = Some(message.clone());
+                self.toast_shown_at = Some(std::time::Instant::now());
+            }
             let mut dismiss = false;
-            egui::Window::new("提示")
+            let response = egui::Window::new("提示")
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 78.0])
                 .collapsible(false)
                 .resizable(false)
                 .title_bar(false)
                 .show(&ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(message);
+                        ui.label(&message);
                         if ui.small_button("关闭").clicked() {
                             dismiss = true;
                         }
                     });
-                });
-            if dismiss {
+                    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                        dismiss = true;
+                    }
+                })
+                .map(|inner| inner.response);
+            // Hovering pauses the timer so long warnings stay readable.
+            if response.is_some_and(|response| response.hovered()) {
+                self.toast_shown_at = Some(std::time::Instant::now());
+            }
+            let expired = self
+                .toast_shown_at
+                .is_some_and(|shown| shown.elapsed() >= std::time::Duration::from_secs(7));
+            if dismiss || expired {
                 self.toast = None;
+                self.toast_message = None;
+                self.toast_shown_at = None;
             }
         }
 

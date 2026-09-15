@@ -56,10 +56,89 @@ const DARK: Palette = Palette {
 
 thread_local! {
     static PALETTE: Cell<Palette> = const { Cell::new(LIGHT) };
+    static DARK_MODE: Cell<bool> = const { Cell::new(false) };
 }
 
 fn palette() -> Palette {
     PALETTE.with(Cell::get)
+}
+
+pub fn is_dark() -> bool {
+    DARK_MODE.with(Cell::get)
+}
+
+/// Translucent card surface. The alpha stays high enough that labels keep
+/// their contrast even when a background ornament shows through the card.
+pub fn glass_surface() -> Color32 {
+    if is_dark() {
+        Color32::from_rgba_unmultiplied(24, 31, 47, 236)
+    } else {
+        Color32::from_rgba_unmultiplied(253, 252, 248, 242)
+    }
+}
+
+pub fn glass_muted() -> Color32 {
+    if is_dark() {
+        Color32::from_rgba_unmultiplied(18, 24, 38, 232)
+    } else {
+        Color32::from_rgba_unmultiplied(246, 244, 238, 238)
+    }
+}
+
+/// Soft elevation used by content cards. Dark themes need a stronger shadow to
+/// read against the near-black background.
+pub fn card_shadow() -> egui::epaint::Shadow {
+    if is_dark() {
+        egui::epaint::Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(96),
+        }
+    } else {
+        egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: Color32::from_black_alpha(26),
+        }
+    }
+}
+
+pub fn subtle_shadow() -> egui::epaint::Shadow {
+    if is_dark() {
+        egui::epaint::Shadow {
+            offset: [0, 5],
+            blur: 14,
+            spread: 0,
+            color: Color32::from_black_alpha(64),
+        }
+    } else {
+        egui::epaint::Shadow {
+            offset: [0, 4],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_black_alpha(16),
+        }
+    }
+}
+
+pub fn window_shadow() -> egui::epaint::Shadow {
+    if is_dark() {
+        egui::epaint::Shadow {
+            offset: [0, 10],
+            blur: 30,
+            spread: 0,
+            color: Color32::from_black_alpha(150),
+        }
+    } else {
+        egui::epaint::Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(36),
+        }
+    }
 }
 
 pub fn background() -> Color32 {
@@ -118,6 +197,19 @@ pub fn red() -> Color32 {
 /// opaque content cards. It stays subtle so it never competes with labels,
 /// controls, or recognition previews.
 pub fn paint_background(painter: &egui::Painter, rect: egui::Rect) {
+    // Very faint brand-colour glows sit under the existing ornaments and the
+    // translucent cards, which is what makes the glass surfaces read as layered.
+    painter.circle_filled(
+        rect.right_top() + egui::vec2(-150.0, 40.0),
+        300.0,
+        blue().gamma_multiply(0.055),
+    );
+    painter.circle_filled(
+        rect.left_bottom() + egui::vec2(120.0, -50.0),
+        260.0,
+        gold().gamma_multiply(0.05),
+    );
+
     let center = rect.right_top() + egui::vec2(-42.0, 38.0);
     let gold = gold().gamma_multiply(0.055);
     let teal = blue().gamma_multiply(0.045);
@@ -166,6 +258,7 @@ pub fn install(ctx: &egui::Context, dark: bool) {
 pub fn apply(ctx: &egui::Context, dark: bool) {
     let palette = if dark { DARK } else { LIGHT };
     PALETTE.with(|current| current.set(palette));
+    DARK_MODE.with(|current| current.set(dark));
 
     ctx.set_theme(if dark {
         egui::Theme::Dark
@@ -206,8 +299,10 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     };
     style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, palette.blue);
     style.visuals.widgets.open.bg_fill = palette.surface;
-    style.visuals.window_corner_radius = CornerRadius::same(16);
-    style.visuals.menu_corner_radius = CornerRadius::same(12);
+    style.visuals.window_corner_radius = CornerRadius::same(18);
+    style.visuals.menu_corner_radius = CornerRadius::same(14);
+    style.visuals.window_shadow = window_shadow();
+    style.visuals.popup_shadow = subtle_shadow();
 
     for visuals in [
         &mut style.visuals.widgets.noninteractive,
@@ -284,18 +379,20 @@ fn install_system_font(ctx: &egui::Context) {
 
 pub fn card() -> egui::Frame {
     egui::Frame::new()
-        .fill(surface())
+        .fill(glass_surface())
         .stroke(Stroke::new(1.0, separator()))
-        .corner_radius(CornerRadius::same(14))
-        .inner_margin(egui::Margin::same(14))
+        .corner_radius(CornerRadius::same(18))
+        .shadow(card_shadow())
+        .inner_margin(egui::Margin::same(16))
 }
 
 pub fn subtle_card() -> egui::Frame {
     egui::Frame::new()
-        .fill(surface_muted())
+        .fill(glass_muted())
         .stroke(Stroke::new(1.0, separator()))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(10))
+        .corner_radius(CornerRadius::same(12))
+        .shadow(subtle_shadow())
+        .inner_margin(egui::Margin::same(11))
 }
 
 pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
@@ -306,30 +403,31 @@ pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
     )
     .fill(blue())
     .stroke(Stroke::NONE)
-    .corner_radius(CornerRadius::same(12))
+    .corner_radius(CornerRadius::same(14))
     .min_size(egui::vec2(160.0, 40.0))
 }
 
 pub fn secondary_button(text: impl Into<String>) -> egui::Button<'static> {
     egui::Button::new(egui::RichText::new(text.into()).color(label()))
-        .fill(surface_muted())
+        .fill(glass_muted())
         .stroke(Stroke::new(1.0, separator()))
-        .corner_radius(CornerRadius::same(10))
+        .corner_radius(CornerRadius::same(12))
 }
 
 pub fn small_danger_button(text: impl Into<String>) -> egui::Button<'static> {
     egui::Button::new(egui::RichText::new(text.into()).color(red()).size(12.0))
         .fill(red().gamma_multiply(0.08))
         .stroke(Stroke::new(1.0, red().gamma_multiply(0.30)))
-        .corner_radius(CornerRadius::same(8))
+        .corner_radius(CornerRadius::same(10))
 }
 
 pub fn section_card() -> egui::Frame {
     egui::Frame::new()
-        .fill(surface_muted())
+        .fill(glass_muted())
         .stroke(Stroke::new(1.0, separator()))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(12, 10))
+        .corner_radius(CornerRadius::same(13))
+        .shadow(subtle_shadow())
+        .inner_margin(egui::Margin::symmetric(13, 11))
 }
 
 #[cfg(test)]
@@ -370,6 +468,39 @@ mod tests {
     fn themed_palettes_keep_primary_text_and_actions_readable() {
         assert_readable(LIGHT);
         assert_readable(DARK);
+    }
+
+    fn composite(foreground: Color32, background: Color32) -> Color32 {
+        let alpha = f32::from(foreground.a()) / 255.0;
+        let mix = |front: u8, back: u8| {
+            (f32::from(front) * alpha + f32::from(back) * (1.0 - alpha)).round() as u8
+        };
+        Color32::from_rgb(
+            mix(foreground.r(), background.r()),
+            mix(foreground.g(), background.g()),
+            mix(foreground.b(), background.b()),
+        )
+    }
+
+    #[test]
+    fn translucent_cards_keep_labels_readable_over_background_ornaments() {
+        for dark in [false, true] {
+            let palette = if dark { DARK } else { LIGHT };
+            super::PALETTE.with(|current| current.set(palette));
+            super::DARK_MODE.with(|current| current.set(dark));
+            // Worst case: a card sits on top of the strongest ornament colour.
+            let ornament = composite(palette.blue.gamma_multiply(0.06), palette.background);
+            let card = composite(super::glass_surface(), ornament);
+            assert!(contrast(palette.label, card) >= 7.0, "dark={dark}");
+            assert!(
+                contrast(palette.secondary_label, card) >= 4.5,
+                "dark={dark}"
+            );
+            let frame = super::card();
+            assert_eq!(frame.corner_radius, eframe::egui::CornerRadius::same(18));
+            assert_ne!(frame.shadow, eframe::egui::epaint::Shadow::NONE);
+            assert!(frame.shadow.blur > 0);
+        }
     }
 
     #[test]
