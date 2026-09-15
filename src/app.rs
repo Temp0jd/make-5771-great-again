@@ -9210,7 +9210,12 @@ mod tests {
                 .iter()
                 .any(|(id, label, flow)| *id == 1 && label.contains("主流程") && flow.is_none())
         );
-        assert!(locations.iter().any(|(_, label, _)| label.contains("分支")));
+        // The branch lives on step 2, so that step is listed for the same template.
+        assert!(
+            locations
+                .iter()
+                .any(|(id, label, flow)| *id == 2 && label.contains("主流程") && flow.is_none())
+        );
         assert!(
             locations
                 .iter()
