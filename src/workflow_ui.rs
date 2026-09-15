@@ -85,7 +85,7 @@ fn scan_summary(step: &WorkflowStep) -> String {
 
 fn search_summary(strategy: SearchStrategy) -> &'static str {
     match strategy {
-        SearchStrategy::Inherit => "继承搜索范围",
+        SearchStrategy::Inherit => "沿用当前范围",
         SearchStrategy::FullFrame => "全屏搜索",
         SearchStrategy::FixedRoi => "限定区域",
         SearchStrategy::RoiThenFullFrame => "区域优先",
@@ -162,7 +162,7 @@ pub fn step_summary(step: &WorkflowStep, templates: &[(u64, String, String)]) ->
             }
         },
         StepKind::RoundEnd => "结算本局并开始下一轮".to_owned(),
-        StepKind::Branch => "条件分支（旧版占位）".to_owned(),
+        StepKind::Branch => "条件分支（暂不支持）".to_owned(),
     };
     if step.kind == StepKind::WaitAndClick
         && let Some(point) = step.relative_click

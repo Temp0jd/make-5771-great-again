@@ -28,7 +28,7 @@ const LIGHT: Palette = Palette {
     surface_muted: Color32::from_rgb(246, 244, 238),
     label: Color32::from_rgb(31, 35, 43),
     secondary_label: Color32::from_rgb(91, 98, 108),
-    tertiary_label: Color32::from_rgb(128, 133, 140),
+    tertiary_label: Color32::from_rgb(109, 115, 124),
     separator: Color32::from_rgb(217, 211, 198),
     blue: Color32::from_rgb(31, 126, 126),
     gold: Color32::from_rgb(162, 119, 48),
@@ -44,7 +44,7 @@ const DARK: Palette = Palette {
     surface_muted: Color32::from_rgb(16, 21, 34),
     label: Color32::from_rgb(238, 240, 244),
     secondary_label: Color32::from_rgb(172, 180, 194),
-    tertiary_label: Color32::from_rgb(111, 122, 142),
+    tertiary_label: Color32::from_rgb(131, 141, 160),
     separator: Color32::from_rgb(45, 55, 74),
     blue: Color32::from_rgb(36, 130, 130),
     gold: Color32::from_rgb(202, 164, 91),
@@ -559,6 +559,7 @@ mod tests {
     fn assert_readable(palette: Palette) {
         assert!(contrast(palette.label, palette.surface) >= 7.0);
         assert!(contrast(palette.secondary_label, palette.surface) >= 4.5);
+        assert!(contrast(palette.tertiary_label, palette.surface) >= 4.5);
         assert!(contrast(Color32::WHITE, palette.blue) >= 4.5);
     }
 

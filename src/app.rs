@@ -103,6 +103,9 @@ impl TemplateThumbs {
     ) -> Option<&egui::TextureHandle> {
         if !self.cache.contains_key(path) {
             let image = image::open(path).ok()?.into_rgba8();
+            // Thumbnails are display-only; matching always reads the original
+            // PNG, so the uploaded texture can be downscaled to a preview size.
+            let image = downscale_thumbnail(image, THUMBNAIL_MAX_WIDTH);
             let size = [image.width() as usize, image.height() as usize];
             let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
             let handle = ctx.load_texture(
@@ -114,6 +117,23 @@ impl TemplateThumbs {
         }
         self.cache.get(path)
     }
+
+    /// Drops textures for templates that are no longer in the library.
+    fn retain_paths(&mut self, paths: &std::collections::HashSet<String>) {
+        self.cache.retain(|path, _| paths.contains(path));
+    }
+}
+
+/// Preview width for the template library. Recognition never uses this size.
+const THUMBNAIL_MAX_WIDTH: u32 = 160;
+
+fn downscale_thumbnail(image: image::RgbaImage, max_width: u32) -> image::RgbaImage {
+    if image.width() <= max_width || image.width() == 0 {
+        return image;
+    }
+    let height = ((u64::from(image.height()) * u64::from(max_width)) / u64::from(image.width()))
+        .max(1) as u32;
+    image::imageops::thumbnail(&image, max_width, height)
 }
 
 /// Result of a template recognition test produced on a worker thread; the
@@ -221,7 +241,14 @@ pub struct Make5771App {
     toast_message: Option<String>,
     preflight_cache: Option<(std::time::Instant, WorkflowPreflightReport)>,
     save_status_cache: Option<(std::time::Instant, SaveStatus)>,
+    /// Wakes the UI thread from the global-hotkey worker thread.
+    repaint_waker: platform::RepaintWaker,
+    log_level_filter: Option<LogLevel>,
+    log_query: String,
 }
+
+/// Upper bound for the in-memory log list (the on-disk log keeps everything).
+const MAX_IN_MEMORY_LOGS: usize = 2000;
 
 impl Make5771App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -244,19 +271,29 @@ impl Make5771App {
             profile.expected_client_width = target.client_width;
             profile.expected_client_height = target.client_height;
         }
+        let repaint_waker: platform::RepaintWaker = {
+            let ctx = cc.egui_ctx.clone();
+            std::sync::Arc::new(move || ctx.request_repaint())
+        };
         let (hotkey_receiver, hotkey_guard, active_hotkeys, hotkey_error) =
             match parse_hotkeys(&profile.capture_hotkey, &profile.stop_hotkey) {
-                Ok((capture, stop)) => match platform::install_global_hotkeys(&capture, &stop) {
-                    Ok((receiver, guard)) => {
-                        (Some(receiver), Some(guard), Some((capture, stop)), None)
+                Ok((capture, stop)) => {
+                    match platform::install_global_hotkeys(&capture, &stop, repaint_waker.clone()) {
+                        Ok((receiver, guard)) => {
+                            (Some(receiver), Some(guard), Some((capture, stop)), None)
+                        }
+                        Err(error) => (None, None, None, Some(error.to_string())),
                     }
-                    Err(error) => (None, None, None, Some(error.to_string())),
-                },
+                }
                 Err(error) => {
                     let fallback_capture = parse_key_combo("f6").expect("内置默认截图热键必须合法");
                     let fallback_stop = parse_key_combo("f8").expect("内置默认停止热键必须合法");
                     let warning = format!("{error}，已回退为默认热键 F6 / F8");
-                    match platform::install_global_hotkeys(&fallback_capture, &fallback_stop) {
+                    match platform::install_global_hotkeys(
+                        &fallback_capture,
+                        &fallback_stop,
+                        repaint_waker.clone(),
+                    ) {
                         Ok((receiver, guard)) => (
                             Some(receiver),
                             Some(guard),
@@ -293,6 +330,9 @@ impl Make5771App {
             toast_message: None,
             preflight_cache: None,
             save_status_cache: None,
+            repaint_waker,
+            log_level_filter: None,
+            log_query: String::new(),
             force_stop_confirm: false,
             target_window,
             template_draft: None,
@@ -923,7 +963,16 @@ impl Make5771App {
             self.countdown_capture_at = None;
             self.capture_game_frame(ctx, "倒计时");
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // Global hotkeys and the runner wake the UI directly, so the idle
+        // cadence only has to cover status text and tray feedback.
+        let busy = self.workflow_runner.is_some()
+            || self.countdown_capture_at.is_some()
+            || self.template_test_pending.is_some();
+        ctx.request_repaint_after(std::time::Duration::from_millis(if busy {
+            120
+        } else {
+            600
+        }));
     }
 
     /// Immediately abandons the running workflow without waiting for the
@@ -1348,6 +1397,12 @@ impl Make5771App {
         };
         let _ = storage::append_log(&entry);
         self.logs.push(entry);
+        // The file log stays complete; the in-memory list is capped so the UI
+        // never has to lay out an unbounded history.
+        if self.logs.len() > MAX_IN_MEMORY_LOGS {
+            let excess = self.logs.len() - MAX_IN_MEMORY_LOGS;
+            self.logs.drain(..excess);
+        }
     }
 
     /// Flashes the taskbar button and shows a tray balloon when a run ends.
@@ -1490,7 +1545,7 @@ impl Make5771App {
         self._hotkey_guard = None;
         self.hotkey_receiver = None;
         let description = format!("截图={}，停止={}", capture.describe(), stop.describe());
-        match platform::install_global_hotkeys(&capture, &stop) {
+        match platform::install_global_hotkeys(&capture, &stop, self.repaint_waker.clone()) {
             Ok((receiver, guard)) => {
                 self.hotkey_receiver = Some(receiver);
                 self._hotkey_guard = Some(guard);
@@ -1499,7 +1554,11 @@ impl Make5771App {
             }
             Err(error) => {
                 let restored = previous.and_then(|(old_capture, old_stop)| {
-                    match platform::install_global_hotkeys(&old_capture, &old_stop) {
+                    match platform::install_global_hotkeys(
+                        &old_capture,
+                        &old_stop,
+                        self.repaint_waker.clone(),
+                    ) {
                         Ok((receiver, guard)) => {
                             self.hotkey_receiver = Some(receiver);
                             self._hotkey_guard = Some(guard);
@@ -3315,7 +3374,7 @@ impl Make5771App {
                 ui.label(if self.profile.shared_templates {
                     "公共模板库"
                 } else {
-                    "当前流程独立模板（兼容旧流程）"
+                    "仅当前流程使用"
                 });
             });
             ui.label(
@@ -3344,6 +3403,12 @@ impl Make5771App {
                     );
                 });
             } else {
+                let library_paths: std::collections::HashSet<String> = self
+                    .effective_templates()
+                    .iter()
+                    .map(|template| template.path.clone())
+                    .collect();
+                self.thumbs.retain_paths(&library_paths);
                 ui.horizontal(|ui| {
                     ui.label("仅本次测试阈值");
                     let minimum = if self.profile.match_algorithm == MatchAlgorithm::Hybrid {
@@ -3531,30 +3596,115 @@ impl Make5771App {
                 });
                 return;
             }
+
+            // Level legend doubles as the filter, so the dot colours below are
+            // always explained without a separate legend row.
+            let counts = [
+                (None, self.logs.len()),
+                (
+                    Some(LogLevel::Info),
+                    self.logs
+                        .iter()
+                        .filter(|entry| entry.level == LogLevel::Info)
+                        .count(),
+                ),
+                (
+                    Some(LogLevel::Success),
+                    self.logs
+                        .iter()
+                        .filter(|entry| entry.level == LogLevel::Success)
+                        .count(),
+                ),
+                (
+                    Some(LogLevel::Warning),
+                    self.logs
+                        .iter()
+                        .filter(|entry| entry.level == LogLevel::Warning)
+                        .count(),
+                ),
+            ];
+            ui.horizontal_wrapped(|ui| {
+                for (level, count) in counts {
+                    let label = match level {
+                        None => format!("全部 {count}"),
+                        Some(LogLevel::Info) => format!("信息 {count}"),
+                        Some(LogLevel::Success) => format!("成功 {count}"),
+                        Some(LogLevel::Warning) => format!("警告 {count}"),
+                    };
+                    if let Some(level) = level {
+                        let color = log_level_color(level);
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 4.0, color);
+                    }
+                    ui.selectable_value(&mut self.log_level_filter, level, label);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.log_query)
+                        .hint_text("搜索日志内容")
+                        .desired_width(260.0),
+                );
+                if !self.log_query.is_empty() && ui.small_button("清除").clicked() {
+                    self.log_query.clear();
+                }
+            });
+            ui.separator();
+
+            let query = self.log_query.trim().to_lowercase();
+            let visible: Vec<usize> = self
+                .logs
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    self.log_level_filter
+                        .is_none_or(|level| level == entry.level)
+                        && (query.is_empty() || entry.message.to_lowercase().contains(&query))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if visible.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(60.0);
+                    ui.label(RichText::new("没有符合条件的日志").color(theme::secondary_label()));
+                });
+                return;
+            }
+
+            // Rows are drawn from a fixed height so the list can be virtualised:
+            // only the visible slice is laid out, and long messages are
+            // truncated with the full text available on hover.
+            const ROW_HEIGHT: f32 = 24.0;
+            let logs = &self.logs;
             egui::ScrollArea::vertical()
                 .id_salt("log-list")
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .max_height(430.0)
                 .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for entry in &self.logs {
-                        let color = match entry.level {
-                            LogLevel::Info => theme::blue(),
-                            LogLevel::Success => theme::green(),
-                            LogLevel::Warning => theme::orange(),
-                        };
+                .show_rows(ui, ROW_HEIGHT, visible.len(), |ui, range| {
+                    for index in &visible[range] {
+                        let entry = &logs[*index];
                         ui.horizontal(|ui| {
+                            ui.set_min_height(ROW_HEIGHT - 2.0);
                             ui.label(
                                 RichText::new(&entry.time)
                                     .monospace()
+                                    .size(12.0)
                                     .color(theme::tertiary_label()),
                             );
                             let (rect, _) =
                                 ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
-                            ui.painter().circle_filled(rect.center(), 3.5, color);
-                            ui.label(&entry.message);
+                            ui.painter().circle_filled(
+                                rect.center(),
+                                3.5,
+                                log_level_color(entry.level),
+                            );
+                            ui.add(
+                                egui::Label::new(RichText::new(&entry.message).size(13.0))
+                                    .truncate(),
+                            )
+                            .on_hover_text(&entry.message);
                         });
-                        ui.separator();
                     }
                 });
         });
@@ -3816,7 +3966,7 @@ impl Make5771App {
             });
             ui.label(
                 RichText::new(
-                    "旧流程保留原 RGB 分数语义；切换金字塔模式后请测试关键模板并校准阈值",
+                    "旧流程仍沿用原有 RGB 评分；切换到金字塔模式后请先测试关键模板并校准阈值",
                 )
                 .size(11.0)
                 .color(theme::tertiary_label()),
@@ -3849,7 +3999,7 @@ impl Make5771App {
                         .profile
                         .idle_scan_secs
                         .map(|seconds| format!("每 {seconds} 秒"))
-                        .unwrap_or_else(|| "旧版兼容频率".to_owned());
+                        .unwrap_or_else(|| "沿用旧设置".to_owned());
                     egui::ComboBox::from_id_salt("idle_scan_secs")
                         .selected_text(selected)
                         .show_ui(ui, |ui| {
@@ -3896,9 +4046,11 @@ impl Make5771App {
                 });
             });
             ui.label(
-                RichText::new("开启后局部区域连续未命中会全屏恢复；旧流程默认关闭以保留原空间边界")
-                    .size(11.0)
-                    .color(theme::tertiary_label()),
+                RichText::new(
+                    "开启后局部区域连续未命中会全屏恢复；旧流程默认关闭，以保留原来的搜索边界",
+                )
+                .size(11.0)
+                .color(theme::tertiary_label()),
             );
             ui.horizontal(|ui| {
                 ui.label("点击前二次确认");
@@ -5265,7 +5417,7 @@ fn render_step_editor_5stages(
                 if step.search.strategy == SearchStrategy::Inherit {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            RichText::new("当前沿用模板内保存的旧版范围")
+                            RichText::new("沿用模板内保存的范围")
                                 .size(11.0)
                                 .color(theme::tertiary_label()),
                         );
@@ -5376,14 +5528,14 @@ fn render_step_editor_5stages(
                             }
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
-                                    RichText::new("范围兼容:")
+                                    RichText::new("范围设置:")
                                         .size(11.0)
                                         .color(theme::secondary_label()),
                                 );
                                 ui.selectable_value(
                                     &mut step.search.strategy,
                                     SearchStrategy::Inherit,
-                                    "使用模板旧版范围",
+                                    "使用模板已有范围",
                                 );
                             });
                         });
@@ -6158,7 +6310,7 @@ fn edit_workflow_branch(
     if expert_mode && branch.search.strategy == SearchStrategy::Inherit {
         ui.horizontal_wrapped(|ui| {
             ui.label(
-                RichText::new("使用模板旧版范围")
+                RichText::new("使用模板已有范围")
                     .size(11.0)
                     .color(theme::tertiary_label()),
             );
@@ -6753,7 +6905,7 @@ fn scan_interval_editor(ui: &mut egui::Ui, value: &mut Option<u8>, profile_defau
             .map(|seconds| format!("{seconds} 秒"))
             .unwrap_or_else(|| match profile_default {
                 Some(seconds) => format!("继承（{seconds} 秒）"),
-                None => "继承旧版频率".to_owned(),
+                None => "沿用流程设置".to_owned(),
             });
         egui::ComboBox::from_id_salt(ui.next_auto_id())
             .selected_text(selected)
@@ -7248,6 +7400,14 @@ fn format_duration_secs(secs: u64) -> String {
         format!("{} 分 {} 秒", secs / 60, secs % 60)
     } else {
         format!("{secs} 秒")
+    }
+}
+
+fn log_level_color(level: LogLevel) -> Color32 {
+    match level {
+        LogLevel::Info => theme::blue(),
+        LogLevel::Success => theme::green(),
+        LogLevel::Warning => theme::orange(),
     }
 }
 

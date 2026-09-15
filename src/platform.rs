@@ -94,18 +94,25 @@ impl std::fmt::Display for PlatformError {
 
 impl std::error::Error for PlatformError {}
 
+/// Wakes the UI thread when a background event arrives. Global hotkeys are
+/// delivered by a worker thread, so without this the UI would only notice them
+/// on its next scheduled repaint (which is throttled while idle).
+pub type RepaintWaker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 #[cfg(windows)]
 pub fn install_global_hotkeys(
     capture: &crate::model::KeyCombo,
     stop: &crate::model::KeyCombo,
+    waker: RepaintWaker,
 ) -> Result<(std::sync::mpsc::Receiver<GlobalHotkey>, HotkeyGuard), PlatformError> {
-    windows_impl::install_global_hotkeys(capture, stop)
+    windows_impl::install_global_hotkeys(capture, stop, waker)
 }
 
 #[cfg(not(windows))]
 pub fn install_global_hotkeys(
     _capture: &crate::model::KeyCombo,
     _stop: &crate::model::KeyCombo,
+    _waker: RepaintWaker,
 ) -> Result<(std::sync::mpsc::Receiver<GlobalHotkey>, HotkeyGuard), PlatformError> {
     Err(PlatformError::Unsupported)
 }
@@ -342,6 +349,7 @@ mod windows_impl {
     pub fn install_global_hotkeys(
         capture: &KeyCombo,
         stop: &KeyCombo,
+        waker: crate::platform::RepaintWaker,
     ) -> Result<(std::sync::mpsc::Receiver<GlobalHotkey>, HotkeyGuard), PlatformError> {
         if capture == stop {
             return Err(PlatformError::WindowsApi(
@@ -396,8 +404,11 @@ mod windows_impl {
                         STOP_HOTKEY_ID => Some(GlobalHotkey::Stop),
                         _ => None,
                     };
-                    if hotkey.is_some_and(|event| event_sender.send(event).is_err()) {
-                        break;
+                    if let Some(event) = hotkey {
+                        if event_sender.send(event).is_err() {
+                            break;
+                        }
+                        waker();
                     }
                 }
             }
