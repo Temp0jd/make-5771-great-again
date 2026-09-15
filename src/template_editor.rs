@@ -28,6 +28,8 @@ pub enum RoiEditorAction {
     None,
     Cancel,
     Apply(PixelSelection),
+    /// Skip the region entirely: search the whole client area.
+    FullFrame,
 }
 
 /// Full-frame visual ROI picker used directly by workflow template uses.
@@ -358,6 +360,33 @@ impl RoiDraft {
                     {
                         action = RoiEditorAction::Apply(selection);
                     }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if ui
+                            .add(theme::secondary_button("全屏"))
+                            .on_hover_text("不做区域限制：在整个画面里搜索（懒得框选时用这个）")
+                            .clicked()
+                        {
+                            action = RoiEditorAction::FullFrame;
+                        }
+                        if ui
+                            .add(theme::secondary_button("铺满画面"))
+                            .on_hover_text("把当前画面整块设成识别范围，仍保存为区域")
+                            .clicked()
+                        {
+                            self.selection = Some(PixelSelection {
+                                x: 0,
+                                y: 0,
+                                width: self.image.width(),
+                                height: self.image.height(),
+                            });
+                        }
+                        if ui
+                            .add_enabled(self.selection.is_some(), egui::Button::new("清除选择"))
+                            .clicked()
+                        {
+                            self.selection = None;
+                        }
+                    });
                 });
             });
         if !open {

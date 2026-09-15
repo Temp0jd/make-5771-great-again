@@ -493,28 +493,13 @@ impl Make5771App {
         }
     }
 
-    fn apply_visual_roi(
+    /// Applies a change to the template use addressed by `locator` (a step,
+    /// branch, branch action or visual-condition term).
+    fn update_visual_search(
         &mut self,
         locator: TemplateUseLocator,
-        selection: PixelSelection,
-        reference_size: (u32, u32),
+        update: impl Fn(&mut TemplateUseSearch),
     ) {
-        let update = |search: &mut TemplateUseSearch| {
-            if !matches!(
-                search.strategy,
-                SearchStrategy::FixedRoi | SearchStrategy::RoiThenFullFrame
-            ) {
-                search.strategy = SearchStrategy::FixedRoi;
-            }
-            search.region = Some(SearchRegionSpec {
-                x: selection.x,
-                y: selection.y,
-                width: selection.width,
-                height: selection.height,
-            });
-            search.reference_width = reference_size.0.max(1);
-            search.reference_height = reference_size.1.max(1);
-        };
         match locator {
             TemplateUseLocator::Step(step_id) => {
                 if let Some(step) = self.profile.all_steps_mut().find(|step| step.id == step_id) {
@@ -575,6 +560,39 @@ impl Make5771App {
                 }
             }
         }
+    }
+
+    fn apply_visual_roi(
+        &mut self,
+        locator: TemplateUseLocator,
+        selection: PixelSelection,
+        reference_size: (u32, u32),
+    ) {
+        self.update_visual_search(locator, |search| {
+            if !matches!(
+                search.strategy,
+                SearchStrategy::FixedRoi | SearchStrategy::RoiThenFullFrame
+            ) {
+                search.strategy = SearchStrategy::FixedRoi;
+            }
+            search.region = Some(SearchRegionSpec {
+                x: selection.x,
+                y: selection.y,
+                width: selection.width,
+                height: selection.height,
+            });
+            search.reference_width = reference_size.0.max(1);
+            search.reference_height = reference_size.1.max(1);
+        });
+    }
+
+    /// Clears the region and searches the whole client area instead, so users
+    /// can skip framing an ROI entirely.
+    fn apply_visual_full_frame(&mut self, locator: TemplateUseLocator) {
+        self.update_visual_search(locator, |search| {
+            search.strategy = SearchStrategy::FullFrame;
+            search.region = None;
+        });
     }
 
     fn open_template_roi_editor(&mut self, template_id: u64) {
@@ -8019,6 +8037,26 @@ impl eframe::App for Make5771App {
             RoiEditorAction::Cancel => {
                 self.roi_draft = None;
                 self.roi_bind_target = None;
+            }
+            RoiEditorAction::FullFrame => {
+                self.roi_draft = None;
+                if let Some(locator) = self.roi_bind_target.take() {
+                    let old_profile = self.profile.clone();
+                    self.apply_visual_full_frame(locator);
+                    match storage::save_profile(&self.current_profile_path, &self.profile) {
+                        Ok(()) => {
+                            self.save_tracker.record_saved(&self.profile);
+                            self.toast = Some("已改为全屏搜索，不再限制识别范围".to_owned());
+                            self.push_log(LogLevel::Success, "已清除步骤级识别范围");
+                        }
+                        Err(error) => {
+                            self.profile = old_profile;
+                            self.save_tracker.record_failed(error.to_string());
+                            self.toast = Some(format!("识别范围保存失败：{error}"));
+                            self.push_log(LogLevel::Warning, format!("识别范围保存失败：{error}"));
+                        }
+                    }
+                }
             }
             RoiEditorAction::Apply(selection) => {
                 let reference_size = self
