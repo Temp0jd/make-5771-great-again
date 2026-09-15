@@ -302,6 +302,38 @@ fn run_workflow(
     } else {
         None
     };
+    if let Some(start_at) = profile
+        .start_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match resolve_deadline(start_at) {
+            Ok(when) => {
+                if Local::now() < when {
+                    let _ = events.send(RunnerEvent::Notice(format!(
+                        "已按计划等待到 {start_at} 开始；期间可随时停止"
+                    )));
+                    while Local::now() < when {
+                        if stop.load(Ordering::Acquire) {
+                            let _ = events.send(RunnerEvent::Stopped("用户停止".to_owned()));
+                            return;
+                        }
+                        interruptible_wait(Duration::from_secs(5), &stop, Some(&pause))
+                            .map_err(|error| {
+                                let _ = events.send(RunnerEvent::Stopped(error));
+                            })
+                            .ok();
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = events.send(RunnerEvent::Failed(error));
+                return;
+            }
+        }
+    }
+
     let _ = events.send(RunnerEvent::Started);
     let _ = events.send(RunnerEvent::Notice(format!(
         "截图方式：{}（{} × {}）",
@@ -363,6 +395,17 @@ fn run_workflow(
             }
 
             let step = steps[index];
+            let current_round = completed_rounds.saturating_add(1);
+            if !step_runs_in_round(step, current_round) {
+                let _ = events.send(RunnerEvent::Notice(format!(
+                    "跳过“{}”：设置为第 {} 轮起执行（当前第 {} 轮）",
+                    step.name,
+                    step.run_after_round.unwrap_or(1).max(1),
+                    current_round
+                )));
+                index += 1;
+                continue;
+            }
             let _ = events.send(RunnerEvent::StepChanged(step.name.clone()));
             match execute_step(&mut ctx, step, false) {
                 Ok(StepControl::Continue) => {
@@ -671,7 +714,18 @@ fn load_templates(
 ) -> Result<(HashMap<String, LoadedTemplate>, Vec<String>), String> {
     let mut templates = HashMap::new();
     let mut warnings = Vec::new();
-    for asset in &profile.templates {
+    // Only templates reachable from executable steps are decoded: a large
+    // library often keeps hundreds of unused images, and preparing them all
+    // delayed every run start.
+    let referenced: std::collections::HashSet<&String> = profile
+        .execution_steps()
+        .flat_map(WorkflowStep::template_paths)
+        .collect();
+    for asset in profile
+        .templates
+        .iter()
+        .filter(|asset| referenced.contains(&asset.path))
+    {
         // Both a grayscale and an RGB copy are kept: the matching algorithm
         // chosen in the profile decides which one is scanned.
         let image_rgb = image::open(&asset.path)
@@ -1034,6 +1088,15 @@ impl FrameSnapshot {
         let hybrid =
             (algorithm == MatchAlgorithm::Hybrid).then(|| vision::PreparedFrame::new(&rgba));
         Ok(Self { rgba, gray, hybrid })
+    }
+}
+
+/// Whether a step is due in the given 1-based round. `run_after_round = None`
+/// (or 1) means every round.
+fn step_runs_in_round(step: &WorkflowStep, round: u32) -> bool {
+    match step.run_after_round {
+        None => true,
+        Some(first_round) => round >= first_round.max(1),
     }
 }
 
@@ -2080,6 +2143,20 @@ mod wait_tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn round_gated_steps_run_only_from_their_round() {
+        let mut step = WorkflowStep::new(1, "只在第 3 轮起", StepKind::Delay, 0);
+        assert!(super::step_runs_in_round(&step, 1));
+        step.run_after_round = Some(3);
+        assert!(!super::step_runs_in_round(&step, 1));
+        assert!(!super::step_runs_in_round(&step, 2));
+        assert!(super::step_runs_in_round(&step, 3));
+        assert!(super::step_runs_in_round(&step, 9));
+        // A meaningless gate is treated as "every round".
+        step.run_after_round = Some(0);
+        assert!(super::step_runs_in_round(&step, 1));
+    }
+
+    #[test]
     fn debug_start_index_falls_back_to_the_first_step() {
         let first = WorkflowStep::new(1, "一", StepKind::Delay, 0);
         let second = WorkflowStep::new(2, "二", StepKind::Delay, 0);
@@ -2516,6 +2593,10 @@ mod tests {
                 height: 180,
             }),
         });
+
+        // Only templates referenced by an executable step are decoded, so bind
+        // this one to step 1 before loading.
+        profile.steps[0].template = Some(image_path.to_string_lossy().into_owned());
 
         // 1280×720 into 640×400 must remain 0.5× and be vertically centered;
         // independent stretching would incorrectly enlarge only the height.

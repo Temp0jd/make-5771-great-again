@@ -172,6 +172,9 @@ pub fn step_summary(step: &WorkflowStep, templates: &[(u64, String, String)]) ->
             point.x_percent, point.y_percent
         ));
     }
+    if let Some(first_round) = step.run_after_round.filter(|round| *round > 1) {
+        summary.push_str(&format!(" · 第 {first_round} 轮起"));
+    }
     if !step.enabled {
         summary.push_str(" · 已停用");
     }

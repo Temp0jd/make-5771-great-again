@@ -2544,6 +2544,28 @@ impl Make5771App {
                     theme::switch(ui, &mut self.profile.finish_current_round);
                 });
             });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("计划开始时间");
+                let mut enabled = self.profile.start_at.is_some();
+                if theme::switch(ui, &mut enabled).changed() {
+                    self.profile.start_at = enabled.then(|| "08:00".to_owned());
+                }
+                if let Some(start_at) = &mut self.profile.start_at {
+                    ui.add(
+                        egui::TextEdit::singleline(start_at)
+                            .desired_width(90.0)
+                            .hint_text("08:00"),
+                    );
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "填写 HH:MM 后，点击「开始运行」会先等待到该时间再执行（已过今天则等到明天）；等待期间可随时停止。",
+                )
+                .size(11.0)
+                .color(theme::tertiary_label()),
+            );
         });
 
         ui.add_space(8.0);
@@ -5907,15 +5929,34 @@ fn render_step_editor_5stages(
                     ui.selectable_value(&mut step.kind, kind, label);
                 }
             });
-        let enabled_label = if step.enabled {
-            "已启用"
-        } else {
-            "已停用"
-        };
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.toggle_value(&mut step.enabled, enabled_label);
+            let mut enabled = step.enabled;
+            if theme::switch(ui, &mut enabled).changed() {
+                step.enabled = enabled;
+            }
         });
     });
+    if !in_subflow {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("从第几轮开始执行")
+                    .size(12.0)
+                    .color(theme::secondary_label()),
+            );
+            let mut first_round = step.run_after_round.unwrap_or(1).max(1);
+            if ui
+                .add(egui::DragValue::new(&mut first_round).range(1..=99))
+                .changed()
+            {
+                step.run_after_round = (first_round > 1).then_some(first_round);
+            }
+            ui.label(
+                RichText::new("1 = 每轮都执行；例如填 3 表示前两轮跳过这一步")
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+            );
+        });
+    }
     ui.label(
         RichText::new(workflow_ui::step_summary(step, template_options))
             .size(11.5)

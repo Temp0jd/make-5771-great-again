@@ -936,6 +936,10 @@ pub struct WorkflowStep {
     /// Legacy layout field retained only for profile/package compatibility.
     pub indent: u8,
     pub enabled: bool,
+    /// Skip this step until the given round (1-based). `None` runs it every
+    /// round; the first round is round 1.
+    #[serde(default)]
+    pub run_after_round: Option<u32>,
     pub template: Option<String>,
     pub threshold: f32,
     pub timeout_secs: u32,
@@ -1018,6 +1022,7 @@ impl WorkflowStep {
             kind,
             indent,
             enabled: true,
+            run_after_round: None,
             template: None,
             threshold: 0.90,
             timeout_secs: 60,
@@ -1107,6 +1112,10 @@ pub struct MacroProfile {
     pub loop_mode: LoopMode,
     pub loop_count: u32,
     pub deadline: String,
+    /// Optional HH:MM time at which the run starts waiting is skipped until
+    /// then. `None` starts immediately.
+    #[serde(default)]
+    pub start_at: Option<String>,
     pub finish_current_round: bool,
     pub steps: Vec<WorkflowStep>,
     #[serde(default)]
@@ -1259,6 +1268,7 @@ impl Default for MacroProfile {
             loop_mode: LoopMode::Count,
             loop_count: 20,
             deadline: "23:30".to_owned(),
+            start_at: None,
             finish_current_round: true,
             subflows: Vec::new(),
             failure_recovery: FailureRecovery::default(),
@@ -1344,6 +1354,13 @@ impl MacroProfile {
         }
         if self.loop_mode == LoopMode::Deadline && !valid_deadline(&self.deadline) {
             issues.push("截止时间必须使用 HH:MM 格式".to_owned());
+        }
+        if self
+            .start_at
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty() && !valid_deadline(value))
+        {
+            issues.push("计划开始时间必须使用 HH:MM 格式".to_owned());
         }
         if !(0.75..=2.0).contains(&self.ui_scale) {
             issues.push("界面缩放必须在 75% - 200% 之间".to_owned());
@@ -1655,6 +1672,37 @@ pub enum LogLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_start_and_round_gate_validation() {
+        let mut profile = MacroProfile::default();
+        assert!(profile.start_at.is_none());
+        assert!(profile.validate().is_ok());
+
+        profile.start_at = Some("08:30".to_owned());
+        assert!(profile.validate().is_ok());
+        profile.start_at = Some("8点半".to_owned());
+        assert!(profile.validate().is_err());
+        // Blank means "no schedule" and stays valid.
+        profile.start_at = Some("  ".to_owned());
+        assert!(profile.validate().is_ok());
+
+        // Legacy packages keep starting immediately.
+        let mut value = serde_json::to_value(MacroProfile::default()).unwrap();
+        value.as_object_mut().unwrap().remove("start_at");
+        let legacy: MacroProfile = serde_json::from_value(value).unwrap();
+        assert!(legacy.start_at.is_none());
+
+        // Legacy steps run every round.
+        let mut step_value =
+            serde_json::to_value(WorkflowStep::new(1, "s", StepKind::Delay, 0)).unwrap();
+        step_value
+            .as_object_mut()
+            .unwrap()
+            .remove("run_after_round");
+        let legacy_step: WorkflowStep = serde_json::from_value(step_value).unwrap();
+        assert!(legacy_step.run_after_round.is_none());
+    }
 
     #[test]
     fn background_click_methods_and_unfocused_opt_in() {
