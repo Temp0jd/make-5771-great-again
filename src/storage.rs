@@ -120,24 +120,73 @@ fn save_shared_templates_to(path: &Path, templates: &[TemplateAsset]) -> Result<
         fs::create_dir_all(parent).map_err(StorageError::Write)?;
     }
     let contents = serde_json::to_string_pretty(templates).map_err(StorageError::Encode)?;
-    fs::write(path, contents).map_err(StorageError::Write)
+    write_atomic(path, contents.as_bytes())
 }
+
+/// Buffered log writer: reopening the file per line dominated IO while a
+/// workflow was running, so lines are batched and flushed on a cadence, and
+/// immediately for warnings.
+struct LogWriter {
+    date: String,
+    writer: std::io::BufWriter<std::fs::File>,
+    pending: u32,
+}
+
+static LOG_WRITER: std::sync::Mutex<Option<LogWriter>> = std::sync::Mutex::new(None);
 
 /// Appends one log line to `logs/<date>.log`; failures are non-fatal.
 pub fn append_log(entry: &LogEntry) -> io::Result<()> {
     use std::io::Write;
-    fs::create_dir_all("logs")?;
-    let file_name = format!("logs/{}.log", chrono::Local::now().format("%Y-%m-%d"));
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let level = match entry.level {
         LogLevel::Info => "信息",
         LogLevel::Success => "成功",
         LogLevel::Warning => "警告",
     };
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(file_name)?;
-    writeln!(file, "{} [{}] {}", entry.time, level, entry.message)
+    let Ok(mut guard) = LOG_WRITER.lock() else {
+        return Ok(());
+    };
+    if guard.as_ref().is_none_or(|writer| writer.date != date) {
+        if let Some(mut writer) = guard.take() {
+            let _ = writer.writer.flush();
+        }
+        fs::create_dir_all("logs")?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("logs/{date}.log"))?;
+        *guard = Some(LogWriter {
+            date,
+            writer: std::io::BufWriter::new(file),
+            pending: 0,
+        });
+    }
+    let Some(writer) = guard.as_mut() else {
+        return Ok(());
+    };
+    writeln!(
+        writer.writer,
+        "{} [{}] {}",
+        entry.time, level, entry.message
+    )?;
+    writer.pending += 1;
+    // Warnings flush immediately so a crash never hides them.
+    if writer.pending >= 32 || entry.level != LogLevel::Info {
+        writer.writer.flush()?;
+        writer.pending = 0;
+    }
+    Ok(())
+}
+
+/// Flushes buffered log lines; called when a run ends and when the app exits.
+pub fn flush_logs() {
+    use std::io::Write;
+    if let Ok(mut guard) = LOG_WRITER.lock()
+        && let Some(writer) = guard.as_mut()
+    {
+        let _ = writer.writer.flush();
+        writer.pending = 0;
+    }
 }
 
 /// Metadata written next to a failed-step frame.
@@ -234,7 +283,79 @@ pub fn save_profile(path: &Path, profile: &MacroProfile) -> Result<(), StorageEr
         fs::create_dir_all(parent).map_err(StorageError::Write)?;
     }
     let contents = serde_json::to_string_pretty(profile).map_err(StorageError::Encode)?;
-    fs::write(path, contents).map_err(StorageError::Write)
+    // Keep the previous revision before replacing the file so a bad edit can be
+    // rolled back from the settings page.
+    if path.exists() {
+        let _ = keep_profile_backup(path);
+    }
+    write_atomic(path, contents.as_bytes())
+}
+
+/// Keeps the newest `KEEP_PROFILE_BACKUPS` revisions of each profile.
+const KEEP_PROFILE_BACKUPS: usize = 5;
+
+fn backup_directory(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("profile");
+    PathBuf::from("profiles/backups").join(stem)
+}
+
+fn keep_profile_backup(path: &Path) -> io::Result<()> {
+    let directory = backup_directory(path);
+    fs::create_dir_all(&directory)?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
+    fs::copy(path, directory.join(format!("{stamp}.json")))?;
+    let mut entries: Vec<PathBuf> = fs::read_dir(&directory)?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    if entries.len() > KEEP_PROFILE_BACKUPS {
+        entries.sort();
+        let excess = entries.len() - KEEP_PROFILE_BACKUPS;
+        for path in entries.into_iter().take(excess) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+/// Newest-first list of saved revisions for a profile.
+pub fn profile_backups(path: &Path) -> Vec<PathBuf> {
+    let directory = backup_directory(path);
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let mut backups: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    backups.sort();
+    backups.reverse();
+    backups
+}
+
+/// Restores a revision, keeping the current file as another backup first.
+pub fn restore_profile_backup(current: &Path, backup: &Path) -> Result<MacroProfile, StorageError> {
+    let contents = fs::read_to_string(backup).map_err(StorageError::Read)?;
+    let profile: MacroProfile = serde_json::from_str(&contents).map_err(StorageError::Decode)?;
+    profile.validate().map_err(StorageError::Validation)?;
+    if current.exists() {
+        let _ = keep_profile_backup(current);
+    }
+    write_atomic(current, contents.as_bytes())?;
+    Ok(profile)
+}
+
+/// Writes through a temporary file so a crash cannot leave a half-written file.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StorageError> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, contents).map_err(StorageError::Write)?;
+    fs::rename(&temporary, path).map_err(StorageError::Write)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

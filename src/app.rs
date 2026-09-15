@@ -1043,6 +1043,7 @@ impl Make5771App {
         }
         if runner_finished {
             self.workflow_runner = None;
+            storage::flush_logs();
         }
 
         if self
@@ -4042,6 +4043,56 @@ impl Make5771App {
                     egui::TextEdit::singleline(&mut self.profile.name)
                         .desired_width(ui.available_width()),
                 );
+                ui.separator();
+                ui.label(
+                    RichText::new("配置备份")
+                        .size(12.0)
+                        .color(theme::secondary_label()),
+                );
+                let backups = storage::profile_backups(&self.current_profile_path);
+                if backups.is_empty() {
+                    ui.label(
+                        RichText::new("还没有备份：每次保存流程时会自动保留上一版，最多 5 版。")
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                    );
+                } else {
+                    let mut restore = None;
+                    for backup in backups.iter().take(5) {
+                        let label = backup
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or("备份")
+                            .to_owned();
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(label)
+                                    .size(11.0)
+                                    .color(theme::tertiary_label()),
+                            );
+                            if ui.small_button("恢复此版本").clicked() {
+                                restore = Some(backup.clone());
+                            }
+                        });
+                    }
+                    if let Some(backup) = restore {
+                        match storage::restore_profile_backup(&self.current_profile_path, &backup) {
+                            Ok(profile) => {
+                                self.profile = profile;
+                                self.save_tracker.record_saved(&self.profile);
+                                self.reset_workflow_history();
+                                self.invalidate_ui_caches();
+                                self.toast = Some("已恢复所选备份".to_owned());
+                                self.push_log(LogLevel::Success, "已恢复流程备份");
+                            }
+                            Err(error) => {
+                                let message = format!("恢复备份失败：{error}");
+                                self.toast = Some(message.clone());
+                                self.push_log(LogLevel::Warning, message);
+                            }
+                        }
+                    }
+                }
             });
 
             ui.add_space(10.0);
@@ -8412,6 +8463,7 @@ impl eframe::App for Make5771App {
         if ctx.input(|input| input.viewport().close_requested()) {
             if self.allow_close_once {
                 self.allow_close_once = false;
+                storage::flush_logs();
             } else if self.save_tracker.is_dirty(&self.profile) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.exit_confirm_open = true;
