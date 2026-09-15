@@ -1118,6 +1118,10 @@ pub struct MacroProfile {
     pub click_jitter: bool,
     #[serde(default)]
     pub dark_mode: bool,
+    /// When set, the light/dark choice follows the Windows app theme instead of
+    /// `dark_mode`.
+    #[serde(default)]
+    pub follow_system_dark: bool,
     /// Colour scheme id; unknown ids fall back to the default skin.
     #[serde(default = "default_skin_id")]
     pub skin_id: String,
@@ -1269,6 +1273,7 @@ impl Default for MacroProfile {
             click_method: ClickMethod::default(),
             click_jitter: default_click_jitter(),
             dark_mode: false,
+            follow_system_dark: false,
             skin_id: default_skin_id(),
             ui_scale: default_ui_scale(),
             capture_hotkey: default_capture_hotkey(),

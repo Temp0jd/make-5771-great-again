@@ -208,6 +208,10 @@ pub struct Make5771App {
     template_rename: Option<(u64, String)>,
     template_filter: String,
     template_grid: bool,
+    /// Template whose reference locations are being inspected.
+    template_reference_view: Option<String>,
+    /// Which dark mode the theme was last applied with (system-follow support).
+    applied_dark: bool,
     template_roi_draft: Option<TemplateRoiDraft>,
     pending_capture: Option<image::RgbaImage>,
     capture_purpose: CapturePurpose,
@@ -237,6 +241,7 @@ pub struct Make5771App {
     save_as_name: String,
     save_tracker: workflow_ui::SaveTracker,
     workflow_history_snapshot: String,
+    history_checked_at: Option<std::time::Instant>,
     workflow_undo: Vec<String>,
     workflow_redo: Vec<String>,
     exit_confirm_open: bool,
@@ -316,7 +321,12 @@ impl Make5771App {
         let mut profile =
             storage::load_profile(&storage::default_profile_path()).unwrap_or_default();
         let shared_templates = storage::load_shared_templates();
-        theme::install(&cc.egui_ctx, &profile.skin_id, profile.dark_mode);
+        let applied_dark = if profile.follow_system_dark {
+            cc.egui_ctx.system_theme() == Some(egui::Theme::Dark)
+        } else {
+            profile.dark_mode
+        };
+        theme::install(&cc.egui_ctx, &profile.skin_id, applied_dark);
         cc.egui_ctx.set_zoom_factor(profile.ui_scale);
         let target_window = platform::find_target_window(&profile.target_window).ok();
         let has_templates = if profile.shared_templates {
@@ -374,6 +384,7 @@ impl Make5771App {
             Ok((receiver, guard)) => (Some(receiver), Some(guard), None),
             Err(error) => (None, None, Some(error.to_string())),
         };
+        storage::prune_logs();
         let save_tracker = workflow_ui::SaveTracker::new(&profile);
         let workflow_history_snapshot = serde_json::to_string(&(&profile.steps, &profile.subflows))
             .unwrap_or_else(|_| "[]".to_owned());
@@ -400,6 +411,7 @@ impl Make5771App {
             step_clipboard: None,
             pending_logs: Vec::new(),
             settings_section: SettingsSection::Interface,
+            applied_dark,
             report_failures: std::collections::BTreeMap::new(),
             report_matches: std::collections::BTreeMap::new(),
             report_score_sum: 0.0,
@@ -426,6 +438,7 @@ impl Make5771App {
             template_rename: None,
             template_filter: String::new(),
             template_grid: false,
+            template_reference_view: None,
             template_roi_draft: None,
             pending_capture: None,
             capture_purpose: CapturePurpose::NewTemplate(None),
@@ -455,6 +468,7 @@ impl Make5771App {
             save_as_name: String::new(),
             save_tracker,
             workflow_history_snapshot,
+            history_checked_at: None,
             workflow_undo: Vec::new(),
             workflow_redo: Vec::new(),
             exit_confirm_open: false,
@@ -1624,7 +1638,21 @@ impl Make5771App {
         }
     }
 
-    fn observe_workflow_history(&mut self) {
+    /// Records a new undo step when the workflow changed.
+    ///
+    /// Serialising the whole workflow on every frame was wasteful, so ordinary
+    /// calls are throttled; explicit callers (undo/redo) pass `force` so the
+    /// edit made just before the shortcut is never lost.
+    fn observe_workflow_history(&mut self, force: bool) {
+        const THROTTLE: std::time::Duration = std::time::Duration::from_millis(250);
+        if !force
+            && self
+                .history_checked_at
+                .is_some_and(|checked| checked.elapsed() < THROTTLE)
+        {
+            return;
+        }
+        self.history_checked_at = Some(std::time::Instant::now());
         let Ok(current) = serde_json::to_string(&(&self.profile.steps, &self.profile.subflows))
         else {
             return;
@@ -1634,7 +1662,14 @@ impl Make5771App {
         }
         let previous = std::mem::replace(&mut self.workflow_history_snapshot, current);
         self.workflow_undo.push(previous);
-        if self.workflow_undo.len() > 64 {
+        // Cap by count and by total size: large workflows would otherwise keep
+        // tens of megabytes of snapshots alive.
+        const MAX_ENTRIES: usize = 64;
+        const MAX_BYTES: usize = 4 * 1024 * 1024;
+        while self.workflow_undo.len() > MAX_ENTRIES
+            || (self.workflow_undo.len() > 1
+                && self.workflow_undo.iter().map(String::len).sum::<usize>() > MAX_BYTES)
+        {
             self.workflow_undo.remove(0);
         }
         self.workflow_redo.clear();
@@ -1654,7 +1689,7 @@ impl Make5771App {
     }
 
     fn undo_workflow_edit(&mut self) {
-        self.observe_workflow_history();
+        self.observe_workflow_history(true);
         let Some(previous) = self.workflow_undo.pop() else {
             return;
         };
@@ -1678,7 +1713,7 @@ impl Make5771App {
     }
 
     fn redo_workflow_edit(&mut self) {
-        self.observe_workflow_history();
+        self.observe_workflow_history(true);
         let Some(next) = self.workflow_redo.pop() else {
             return;
         };
@@ -3747,6 +3782,7 @@ impl Make5771App {
         let mut requested_delete = None;
         let mut requested_roi = None;
         let mut requested_rename: Option<(u64, String)> = None;
+        let mut requested_refs: Option<String> = None;
         let mut rename_apply = false;
         let mut rename_cancel = false;
         theme::card().show(ui, |ui| {
@@ -3877,6 +3913,7 @@ impl Make5771App {
                             &mut requested_delete,
                             &mut requested_roi,
                             &mut requested_rename,
+                            &mut requested_refs,
                         );
                     } else {
                         render_template_list(
@@ -3889,6 +3926,7 @@ impl Make5771App {
                             &mut requested_delete,
                             &mut requested_roi,
                             &mut requested_rename,
+                            &mut requested_refs,
                         );
                     }
                 });
@@ -3922,6 +3960,9 @@ impl Make5771App {
         }
         if let Some(template_id) = requested_roi {
             self.open_template_roi_editor(template_id);
+        }
+        if let Some(path) = requested_refs {
+            self.template_reference_view = Some(path);
         }
         if rename_cancel {
             self.template_rename = None;
@@ -4122,8 +4163,27 @@ impl Make5771App {
                 ui.horizontal(|ui| {
                     ui.label("深色模式");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if theme::switch(ui, &mut self.profile.dark_mode).changed() {
-                            theme::apply(ui.ctx(), &self.profile.skin_id, self.profile.dark_mode);
+                        let mut value = self.profile.dark_mode;
+                        let enabled = !self.profile.follow_system_dark;
+                        let response = ui
+                            .add_enabled_ui(enabled, |ui| theme::switch(ui, &mut value))
+                            .inner;
+                        if response.changed() {
+                            self.profile.dark_mode = value;
+                            self.profile.follow_system_dark = false;
+                            self.applied_dark = value;
+                            theme::apply(ui.ctx(), &self.profile.skin_id, value);
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("跟随系统深色");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::switch(ui, &mut self.profile.follow_system_dark).changed() {
+                            let dark = self.profile.follow_system_dark
+                                && ui.ctx().system_theme() == Some(egui::Theme::Dark);
+                            self.applied_dark = dark;
+                            theme::apply(ui.ctx(), &self.profile.skin_id, dark);
                         }
                     });
                 });
@@ -5509,7 +5569,7 @@ impl Make5771App {
                     egui::FontId::proportional(11.0),
                     color,
                 );
-                if response.clicked() {
+                if widget_activated(ui, &response) {
                     self.active_tab = tab;
                     if tab == AppTab::Run {
                         self.refresh_profiles();
@@ -5696,7 +5756,8 @@ fn render_step_list_row(
         })
         .wrap()
         .min_size(Vec2::new(button_width, 52.0));
-        if ui.add(button).clicked() {
+        let card = ui.add(button);
+        if widget_activated(ui, &card) {
             selected_id = Some(step.id);
         }
         ui.menu_button(RichText::new("操作").size(11.0), |ui| {
@@ -8052,15 +8113,32 @@ fn format_duration_secs(secs: u64) -> String {
     }
 }
 
-/// "引用 N 处" / "未引用" badge used by both template views.
-fn template_reference_badge(ui: &mut egui::Ui, profile: &MacroProfile, template: &TemplateAsset) {
+/// "引用 N 处" / "未引用" badge used by both template views. A referenced badge
+/// is clickable and opens the list of steps that use the template.
+fn template_reference_badge(
+    ui: &mut egui::Ui,
+    profile: &MacroProfile,
+    template: &TemplateAsset,
+    requested_refs: &mut Option<String>,
+) {
     let references = count_template_references(profile, &template.path);
-    let (text, color) = if references > 0 {
-        (format!("引用 {references} 处"), theme::orange())
-    } else {
-        ("未引用".to_owned(), theme::tertiary_label())
-    };
-    ui.label(RichText::new(text).size(11.0).color(color));
+    if references == 0 {
+        ui.label(
+            RichText::new("未引用")
+                .size(11.0)
+                .color(theme::tertiary_label()),
+        );
+        return;
+    }
+    let text = format!("引用 {references} 处");
+    let response = ui.add(
+        egui::Label::new(RichText::new(text).size(11.0).color(theme::orange()))
+            .sense(Sense::click()),
+    );
+    if widget_activated(ui, &response) {
+        *requested_refs = Some(template.path.clone());
+    }
+    response.on_hover_text("点击查看被哪些步骤引用");
 }
 
 fn template_region_label(template: &TemplateAsset) -> String {
@@ -8087,6 +8165,7 @@ fn render_template_list(
     requested_delete: &mut Option<u64>,
     requested_roi: &mut Option<u64>,
     requested_rename: &mut Option<(u64, String)>,
+    requested_refs: &mut Option<String>,
 ) {
     for template in templates {
         ui.horizontal(|ui| {
@@ -8097,7 +8176,7 @@ fn render_template_list(
                             .fit_to_exact_size(Vec2::new(64.0, 40.0))
                             .sense(Sense::click()),
                     );
-                    if response.clicked() {
+                    if widget_activated(ui, &response) {
                         thumbs.preview = Some(template.id);
                     }
                     response.on_hover_text("点击预览模板图片");
@@ -8136,7 +8215,7 @@ fn render_template_list(
                 if ui.button("范围").clicked() {
                     *requested_roi = Some(template.id);
                 }
-                template_reference_badge(ui, profile, template);
+                template_reference_badge(ui, profile, template, requested_refs);
                 ui.label(
                     RichText::new(template_region_label(template))
                         .size(11.0)
@@ -8161,6 +8240,7 @@ fn render_template_grid(
     requested_delete: &mut Option<u64>,
     requested_roi: &mut Option<u64>,
     requested_rename: &mut Option<(u64, String)>,
+    requested_refs: &mut Option<String>,
 ) {
     const CELL_WIDTH: f32 = 190.0;
     const PREVIEW_HEIGHT: f32 = 96.0;
@@ -8206,14 +8286,14 @@ fn render_template_grid(
                         Stroke::new(1.0, theme::separator()),
                         egui::StrokeKind::Inside,
                     );
-                    if response.clicked() {
+                    if widget_activated(ui, &response) {
                         thumbs.preview = Some(template.id);
                     }
                     response.on_hover_text("点击预览模板图片");
                     ui.label(RichText::new(&template.name).strong().size(13.0));
                     // The reference state sits directly under the preview, as
                     // requested for the grid view.
-                    template_reference_badge(ui, profile, template);
+                    template_reference_badge(ui, profile, template, requested_refs);
                     ui.label(
                         RichText::new(format!("{} × {}", template.width, template.height))
                             .size(11.0)
@@ -8239,6 +8319,16 @@ fn render_template_grid(
                 }
             }
         });
+}
+
+/// Pointer click or keyboard activation (Enter / Space) for widgets painted by
+/// hand, which egui cannot activate on its own.
+fn widget_activated(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.clicked()
+        || (response.has_focus()
+            && ui.input(|input| {
+                input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+            }))
 }
 
 fn log_level_color(level: LogLevel) -> Color32 {
@@ -8292,6 +8382,31 @@ fn referenced_template_paths(profile: &MacroProfile) -> std::collections::HashSe
         .flat_map(WorkflowStep::template_paths)
         .cloned()
         .collect()
+}
+
+/// Every step that uses `path`, with a label and the owning subflow (if any).
+fn template_reference_locations(
+    profile: &MacroProfile,
+    path: &str,
+) -> Vec<(u64, String, Option<u64>)> {
+    let mut locations = Vec::new();
+    for step in &profile.steps {
+        if step.template_paths().any(|candidate| candidate == path) {
+            locations.push((step.id, format!("主流程 · {}", step.name), None));
+        }
+    }
+    for flow in &profile.subflows {
+        for step in &flow.steps {
+            if step.template_paths().any(|candidate| candidate == path) {
+                locations.push((
+                    step.id,
+                    format!("子流程 {} · {}", flow.name, step.name),
+                    Some(flow.id),
+                ));
+            }
+        }
+    }
+    locations
 }
 
 fn count_template_references(profile: &MacroProfile, path: &str) -> usize {
@@ -8606,6 +8721,13 @@ fn window_resize_borders(ui: &mut egui::Ui) {
 
 impl eframe::App for Make5771App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.profile.follow_system_dark {
+            let dark = ctx.system_theme() == Some(egui::Theme::Dark);
+            if dark != self.applied_dark {
+                self.applied_dark = dark;
+                theme::apply(ctx, &self.profile.skin_id, dark);
+            }
+        }
         for (level, message) in std::mem::take(&mut self.pending_logs) {
             self.push_log(level, message);
         }
@@ -8628,7 +8750,7 @@ impl eframe::App for Make5771App {
         // Observe edits made during the previous frame before handling history shortcuts.
         // History intentionally covers workflow steps only; template files and global settings
         // remain transactional and are never partially replayed.
-        self.observe_workflow_history();
+        self.observe_workflow_history(false);
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
             self.undo_workflow_edit();
         }
@@ -8859,6 +8981,50 @@ impl eframe::App for Make5771App {
             }
         }
 
+        if let Some(path) = self.template_reference_view.clone() {
+            let locations = template_reference_locations(&self.profile, &path);
+            let mut open = true;
+            let mut jump: Option<(u64, Option<u64>)> = None;
+            egui::Window::new("模板引用位置")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(420.0)
+                .show(&ctx, |ui| {
+                    ui.label(
+                        RichText::new(&path)
+                            .size(11.0)
+                            .color(theme::tertiary_label()),
+                    );
+                    ui.separator();
+                    if locations.is_empty() {
+                        ui.label("当前流程没有引用这个模板。");
+                    }
+                    for (step_id, label, subflow) in &locations {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            if ui.small_button("跳转").clicked() {
+                                jump = Some((*step_id, *subflow));
+                            }
+                        });
+                    }
+                });
+            if let Some((step_id, subflow)) = jump {
+                self.active_tab = AppTab::Flow;
+                if let Some(flow_id) = subflow {
+                    self.subflow_library = true;
+                    self.selected_subflow = Some(flow_id);
+                    self.selected_subflow_step = Some(step_id);
+                } else {
+                    self.subflow_library = false;
+                    self.selected_step = Some(step_id);
+                }
+            }
+            if !open || jump.is_some() {
+                self.template_reference_view = None;
+            }
+        }
+
         let roi_action = self
             .roi_draft
             .as_mut()
@@ -8999,7 +9165,7 @@ impl eframe::App for Make5771App {
             self.template_test_view = None;
         }
 
-        self.observe_workflow_history();
+        self.observe_workflow_history(false);
         window_resize_borders(ui);
     }
 }
@@ -9019,6 +9185,38 @@ mod tests {
             reference_height: 100,
             search_region: None,
         }
+    }
+
+    #[test]
+    fn template_reference_locations_list_steps_including_subflows() {
+        let mut profile = MacroProfile::default();
+        profile.steps[0].template = Some("assets/shared.png".to_owned());
+        let mut branch = WorkflowBranch::new(9, "分支");
+        branch.trigger_template = Some("assets/shared.png".to_owned());
+        profile.steps[1].branches.push(branch);
+        profile.subflows.push(crate::subflow::Subflow {
+            id: 3,
+            name: "商店".to_owned(),
+            steps: vec![{
+                let mut step = WorkflowStep::new(20, "买药", StepKind::WaitAndClick, 0);
+                step.template = Some("assets/shared.png".to_owned());
+                step
+            }],
+        });
+        let locations = template_reference_locations(&profile, "assets/shared.png");
+        assert_eq!(locations.len(), 3);
+        assert!(
+            locations
+                .iter()
+                .any(|(id, label, flow)| *id == 1 && label.contains("主流程") && flow.is_none())
+        );
+        assert!(locations.iter().any(|(_, label, _)| label.contains("分支")));
+        assert!(
+            locations
+                .iter()
+                .any(|(id, label, flow)| *id == 20 && label.contains("商店") && *flow == Some(3))
+        );
+        assert!(template_reference_locations(&profile, "assets/other.png").is_empty());
     }
 
     #[test]
@@ -9049,6 +9247,7 @@ mod tests {
         let mut requested_delete = None;
         let mut requested_roi = None;
         let mut requested_rename = None;
+        let mut requested_refs = None;
         let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -9067,6 +9266,7 @@ mod tests {
                     &mut requested_delete,
                     &mut requested_roi,
                     &mut requested_rename,
+                    &mut requested_refs,
                 );
             },
         );

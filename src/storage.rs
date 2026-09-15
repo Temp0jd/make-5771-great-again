@@ -270,6 +270,54 @@ fn prune_failure_snapshots() {
     }
 }
 
+/// Housekeeping at startup: removes date logs older than `LOG_RETENTION_DAYS`
+/// and keeps only the newest `KEEP_REPORTS` CSV reports. Failure snapshots have
+/// their own cap.
+const LOG_RETENTION_DAYS: i64 = 30;
+const KEEP_REPORTS: usize = 20;
+
+pub fn prune_logs() {
+    if let Ok(entries) = fs::read_dir("logs") {
+        let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(LOG_RETENTION_DAYS);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            if extension != "log" {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Ok(date) = chrono::NaiveDate::parse_from_str(stem, "%Y-%m-%d") else {
+                continue;
+            };
+            if date < cutoff {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir("logs") {
+        let mut reports: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("report-") && name.ends_with(".csv"))
+            })
+            .collect();
+        if reports.len() > KEEP_REPORTS {
+            reports.sort();
+            let excess = reports.len() - KEEP_REPORTS;
+            for path in reports.into_iter().take(excess) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// One row of the run report CSV.
 #[derive(Debug, Clone)]
 pub struct ReportRow {
