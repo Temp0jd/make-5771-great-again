@@ -1192,7 +1192,7 @@ impl FailureRecovery {
 
     /// Clamps values to the ranges the UI offers (hand-edited packages).
     pub fn sanitised(mut self) -> Self {
-        self.extra_scans = self.extra_scans.min(5);
+        self.extra_scans = self.extra_scans.min(3);
         self.resync_window = self.resync_window.min(5);
         self.max_recoveries = self.max_recoveries.min(10);
         self
@@ -1640,7 +1640,7 @@ mod tests {
             fallback: RecoveryFallback::Stop,
         }
         .sanitised();
-        assert_eq!(clamped.extra_scans, 5);
+        assert_eq!(clamped.extra_scans, 3);
         assert_eq!(clamped.resync_window, 5);
         assert_eq!(clamped.max_recoveries, 10);
 
