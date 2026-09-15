@@ -303,6 +303,18 @@ fn run_workflow(
         None
     };
     let _ = events.send(RunnerEvent::Started);
+    let _ = events.send(RunnerEvent::Notice(format!(
+        "截图方式：{}（{} × {}）",
+        platform::last_capture_source().label(),
+        startup_frame.width(),
+        startup_frame.height()
+    )));
+    if profile.run_when_unfocused {
+        let _ = events.send(RunnerEvent::Notice(format!(
+            "已启用非前台运行：识别使用后台截图，点击方式为“{}”",
+            profile.click_method.label()
+        )));
+    }
     let mut completed_rounds = 0_u32;
     let mut ctx = StepContext {
         profile: &profile,
@@ -882,6 +894,7 @@ impl StepContext<'_> {
         match self.profile.click_method {
             ClickMethod::Foreground => platform::click_client(&self.target, x, y),
             ClickMethod::Background => platform::click_client_background(&self.target, x, y),
+            ClickMethod::BackgroundFocus => platform::click_client_focus_inject(&self.target, x, y),
         }
         .map_err(|error| error.to_string())
     }
@@ -963,7 +976,7 @@ impl StepContext<'_> {
                 }
             }
         }
-        if !platform::is_foreground(&self.target) {
+        if !self.profile.run_when_unfocused && !platform::is_foreground(&self.target) {
             if !state.paused {
                 let _ = self.events.send(RunnerEvent::Paused(
                     "游戏失去前台，已暂停识别和点击".to_owned(),

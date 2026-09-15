@@ -6,6 +6,29 @@ pub struct TargetWindow {
     pub client_height: u32,
 }
 
+/// Which Windows route produced the last captured frame; logged by the runner
+/// so background problems are diagnosable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only Windows builds record it")
+)]
+pub enum CaptureSource {
+    Screen,
+    Window,
+    PrintWindow,
+}
+
+impl CaptureSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Screen => "屏幕拷贝",
+            Self::Window => "窗口拷贝",
+            Self::PrintWindow => "PrintWindow 渲染",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub enum GlobalHotkey {
@@ -227,6 +250,36 @@ pub fn click_client_background(target: &TargetWindow, x: u32, y: u32) -> Result<
     windows_impl::click_client_background(target, x, y)
 }
 
+#[cfg(windows)]
+pub fn click_client_focus_inject(
+    target: &TargetWindow,
+    x: u32,
+    y: u32,
+) -> Result<(), PlatformError> {
+    windows_impl::click_client_focus_inject(target, x, y)
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code, reason = "used by the Windows workflow executor")]
+pub fn click_client_focus_inject(
+    _target: &TargetWindow,
+    _x: u32,
+    _y: u32,
+) -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported)
+}
+
+#[cfg(windows)]
+pub fn last_capture_source() -> CaptureSource {
+    windows_impl::last_capture_source()
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code, reason = "used by the Windows workflow executor")]
+pub fn last_capture_source() -> CaptureSource {
+    CaptureSource::Screen
+}
+
 #[cfg(not(windows))]
 #[allow(dead_code, reason = "used by the Windows workflow executor")]
 pub fn click_client_background(
@@ -318,18 +371,43 @@ mod windows_impl {
         NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+        AppendMenuW, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, ChildWindowFromPointEx,
+        CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
         DispatchMessageW, EnumWindows, FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FindWindowW,
         FlashWindowEx, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
         GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HWND_MESSAGE,
-        IDI_APPLICATION, IsWindow, IsWindowVisible, MF_STRING, MSG, PostMessageW, RegisterClassW,
-        SetCursorPos, SetForegroundWindow, SetWindowLongPtrW, TPM_NONOTIFY, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CREATE,
-        WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NULL,
-        WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+        IDI_APPLICATION, IsIconic, IsWindow, IsWindowVisible, MF_STRING, MSG, PW_RENDERFULLCONTENT,
+        PostMessageW, RegisterClassW, SetCursorPos, SetForegroundWindow, SetWindowLongPtrW,
+        TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+        WINDOW_EX_STYLE, WM_APP, WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+        WS_OVERLAPPED,
     };
     use windows::Win32::UI::WindowsAndMessaging::{CREATESTRUCTW, LoadIconW};
     use windows::core::{BOOL, PCWSTR, PWSTR};
+
+    // `PrintWindow` is not part of the crate's generated Gdi bindings, so it is
+    // declared here. `PW_RENDERFULLCONTENT` asks DirectX/Unity windows to render
+    // themselves, which is what makes occluded-window capture work.
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn PrintWindow(window: HWND, dc: windows::Win32::Graphics::Gdi::HDC, flags: u32) -> BOOL;
+    }
+
+    const SOURCE_SCREEN: u8 = 0;
+    const SOURCE_WINDOW: u8 = 1;
+    const SOURCE_PRINT_WINDOW: u8 = 2;
+
+    static LAST_CAPTURE_SOURCE: std::sync::atomic::AtomicU8 =
+        std::sync::atomic::AtomicU8::new(SOURCE_SCREEN);
+
+    pub fn last_capture_source() -> super::CaptureSource {
+        match LAST_CAPTURE_SOURCE.load(std::sync::atomic::Ordering::Relaxed) {
+            SOURCE_WINDOW => super::CaptureSource::Window,
+            SOURCE_PRINT_WINDOW => super::CaptureSource::PrintWindow,
+            _ => super::CaptureSource::Screen,
+        }
+    }
 
     use super::{GlobalHotkey, HotkeyGuard, PlatformError, TargetWindow, TrayEvent, TrayGuard};
     use crate::model::{KeyCode, KeyCombo};
@@ -849,6 +927,34 @@ mod windows_impl {
         unsafe { IsWindow(Some(HWND(target.handle as *mut c_void))).as_bool() }
     }
 
+    /// Deepest visible child window containing the client point. Games usually
+    /// render into a child HWND, and posted messages must reach that surface.
+    fn child_window_at(window: HWND, x: i32, y: i32) -> HWND {
+        let mut current = window;
+        let mut point = POINT { x, y };
+        for _ in 0..8 {
+            let child = unsafe {
+                ChildWindowFromPointEx(current, point, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT)
+            };
+            if child.is_invalid() || child == current {
+                break;
+            }
+            let mut current_origin = POINT::default();
+            let mut child_origin = POINT::default();
+            let ok = unsafe { ClientToScreen(current, &mut current_origin).as_bool() }
+                && unsafe { ClientToScreen(child, &mut child_origin).as_bool() };
+            if !ok {
+                break;
+            }
+            point = POINT {
+                x: point.x + current_origin.x - child_origin.x,
+                y: point.y + current_origin.y - child_origin.y,
+            };
+            current = child;
+        }
+        current
+    }
+
     pub fn click_client_background(
         target: &TargetWindow,
         x: u32,
@@ -871,15 +977,84 @@ mod windows_impl {
             )));
         }
 
-        let lparam = LPARAM((((y as i32) << 16) | ((x as i32) & 0xFFFF)) as isize);
+        // Post to the deepest child at the point, with a hover move first and a
+        // real press duration, which is what most message-driven UIs need.
+        let surface = child_window_at(window, x as i32, y as i32);
+        let local = if surface == window {
+            POINT {
+                x: x as i32,
+                y: y as i32,
+            }
+        } else {
+            let mut window_origin = POINT::default();
+            let mut surface_origin = POINT::default();
+            let ok = unsafe { ClientToScreen(window, &mut window_origin).as_bool() }
+                && unsafe { ClientToScreen(surface, &mut surface_origin).as_bool() };
+            if ok {
+                POINT {
+                    x: x as i32 + window_origin.x - surface_origin.x,
+                    y: y as i32 + window_origin.y - surface_origin.y,
+                }
+            } else {
+                POINT {
+                    x: x as i32,
+                    y: y as i32,
+                }
+            }
+        };
+        let lparam = LPARAM((((local.y as i32) << 16) | ((local.x as i32) & 0xFFFF)) as isize);
         unsafe {
-            // wParam = MK_LBUTTON (1) signals the left button being held.
-            PostMessageW(Some(window), WM_LBUTTONDOWN, WPARAM(1), lparam)
+            PostMessageW(Some(surface), WM_MOUSEMOVE, WPARAM(0), lparam)
                 .map_err(|error| PlatformError::WindowsApi(error.to_string()))?;
-            PostMessageW(Some(window), WM_LBUTTONUP, WPARAM(0), lparam)
+            // wParam = MK_LBUTTON (1) signals the left button being held.
+            PostMessageW(Some(surface), WM_LBUTTONDOWN, WPARAM(1), lparam)
+                .map_err(|error| PlatformError::WindowsApi(error.to_string()))?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        unsafe {
+            PostMessageW(Some(surface), WM_LBUTTONUP, WPARAM(0), lparam)
                 .map_err(|error| PlatformError::WindowsApi(error.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Focus the game just for this click, inject real input, then hand the
+    /// foreground and cursor back. Needed by games that read raw input and
+    /// ignore posted window messages.
+    pub fn click_client_focus_inject(
+        target: &TargetWindow,
+        x: u32,
+        y: u32,
+    ) -> Result<(), PlatformError> {
+        let window = HWND(target.handle as *mut c_void);
+        if !is_window_alive(target) {
+            return Err(PlatformError::WindowsApi("目标窗口已不存在".to_owned()));
+        }
+        if unsafe { IsIconic(window).as_bool() } {
+            return Err(PlatformError::WindowsApi(
+                "游戏窗口已最小化，无法临时切前台注入点击".to_owned(),
+            ));
+        }
+        let previous = unsafe { GetForegroundWindow() };
+        let mut cursor = POINT::default();
+        let had_cursor = unsafe { GetCursorPos(&mut cursor).is_ok() };
+        unsafe {
+            let _ = SetForegroundWindow(window);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let result = click_client(target, x, y);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        if had_cursor {
+            unsafe {
+                let _ = SetCursorPos(cursor.x, cursor.y);
+            }
+        }
+        if !previous.is_invalid() && previous != window {
+            unsafe {
+                let _ = SetForegroundWindow(previous);
+            }
+        }
+        result
     }
 
     pub fn click_client(target: &TargetWindow, x: u32, y: u32) -> Result<(), PlatformError> {
@@ -1049,6 +1224,177 @@ mod windows_impl {
         }
     }
 
+    /// Reads a 32-bit top-down DIB out of `memory_dc` and converts BGRA to RGBA.
+    unsafe fn read_dc_pixels(
+        memory_dc: windows::Win32::Graphics::Gdi::HDC,
+        bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+        width: i32,
+        height: i32,
+        copied_lines: i32,
+    ) -> Result<RgbaImage, PlatformError> {
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+        let copied = if copied_lines > 0 {
+            unsafe {
+                GetDIBits(
+                    memory_dc,
+                    bitmap,
+                    0,
+                    height as u32,
+                    Some(pixels.as_mut_ptr().cast()),
+                    &mut info,
+                    DIB_RGB_COLORS,
+                )
+            }
+        } else {
+            0
+        };
+        if copied != height {
+            return Err(PlatformError::WindowsApi("截图像素读取不完整".to_owned()));
+        }
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+            pixel[3] = 255;
+        }
+        ImageBuffer::from_raw(width as u32, height as u32, pixels)
+            .ok_or_else(|| PlatformError::WindowsApi("无法构造截图图像".to_owned()))
+    }
+
+    /// Copies from a DC that is already positioned at the wanted region.
+    unsafe fn copy_dc_region(
+        source_dc: windows::Win32::Graphics::Gdi::HDC,
+        source_x: i32,
+        source_y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<RgbaImage, PlatformError> {
+        let memory_dc = unsafe { CreateCompatibleDC(Some(source_dc)) };
+        if memory_dc.is_invalid() {
+            return Err(PlatformError::WindowsApi("无法创建内存 DC".to_owned()));
+        }
+        let bitmap = unsafe { CreateCompatibleBitmap(source_dc, width, height) };
+        if bitmap.is_invalid() {
+            unsafe {
+                let _ = DeleteDC(memory_dc);
+            }
+            return Err(PlatformError::WindowsApi("无法创建截图位图".to_owned()));
+        }
+        let previous = unsafe { SelectObject(memory_dc, HGDIOBJ(bitmap.0)) };
+        let copied = unsafe {
+            BitBlt(
+                memory_dc,
+                0,
+                0,
+                width,
+                height,
+                Some(source_dc),
+                source_x,
+                source_y,
+                SRCCOPY,
+            )
+        };
+        let copied_lines = if copied.is_ok() { height } else { 0 };
+        let frame = unsafe { read_dc_pixels(memory_dc, bitmap, width, height, copied_lines) };
+        unsafe {
+            SelectObject(memory_dc, previous);
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(memory_dc);
+        }
+        frame
+    }
+
+    /// Screen copy: exact but fails while the game is covered by another window.
+    unsafe fn capture_from_screen(
+        origin: POINT,
+        width: i32,
+        height: i32,
+    ) -> Result<RgbaImage, PlatformError> {
+        let screen_dc = unsafe { GetDC(None) };
+        if screen_dc.is_invalid() {
+            return Err(PlatformError::WindowsApi("无法获取屏幕 DC".to_owned()));
+        }
+        let frame = unsafe { copy_dc_region(screen_dc, origin.x, origin.y, width, height) };
+        unsafe { ReleaseDC(None, screen_dc) };
+        frame
+    }
+
+    /// Window DC copy: works while the window is covered by the desktop but not
+    /// by another window drawn over it.
+    unsafe fn capture_from_window(
+        window: HWND,
+        width: i32,
+        height: i32,
+    ) -> Result<RgbaImage, PlatformError> {
+        let window_dc = unsafe { GetDC(Some(window)) };
+        if window_dc.is_invalid() {
+            return Err(PlatformError::WindowsApi("无法获取窗口 DC".to_owned()));
+        }
+        let frame = unsafe { copy_dc_region(window_dc, 0, 0, width, height) };
+        unsafe { ReleaseDC(Some(window), window_dc) };
+        frame
+    }
+
+    /// Asks the window to render itself; the fallback that works for occluded
+    /// DirectX/Unity windows.
+    unsafe fn capture_with_print_window(
+        window: HWND,
+        width: i32,
+        height: i32,
+    ) -> Result<RgbaImage, PlatformError> {
+        let screen_dc = unsafe { GetDC(None) };
+        if screen_dc.is_invalid() {
+            return Err(PlatformError::WindowsApi("无法获取屏幕 DC".to_owned()));
+        }
+        let memory_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
+        if memory_dc.is_invalid() {
+            unsafe { ReleaseDC(None, screen_dc) };
+            return Err(PlatformError::WindowsApi("无法创建内存 DC".to_owned()));
+        }
+        let bitmap = unsafe { CreateCompatibleBitmap(screen_dc, width, height) };
+        if bitmap.is_invalid() {
+            unsafe {
+                let _ = DeleteDC(memory_dc);
+                ReleaseDC(None, screen_dc);
+            }
+            return Err(PlatformError::WindowsApi("无法创建截图位图".to_owned()));
+        }
+        let previous = unsafe { SelectObject(memory_dc, HGDIOBJ(bitmap.0)) };
+        let rendered = unsafe { PrintWindow(window, memory_dc, PW_RENDERFULLCONTENT) };
+        let copied_lines = if rendered.as_bool() { height } else { 0 };
+        let frame = unsafe { read_dc_pixels(memory_dc, bitmap, width, height, copied_lines) };
+        unsafe {
+            SelectObject(memory_dc, previous);
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(memory_dc);
+            ReleaseDC(None, screen_dc);
+        }
+        frame
+    }
+
+    /// A frame that is a single flat colour means the window did not render.
+    fn frame_looks_blank(frame: &RgbaImage) -> bool {
+        let mut minimum = [255_u8; 3];
+        let mut maximum = [0_u8; 3];
+        for pixel in frame.pixels().step_by(97) {
+            for channel in 0..3 {
+                minimum[channel] = minimum[channel].min(pixel.0[channel]);
+                maximum[channel] = maximum[channel].max(pixel.0[channel]);
+            }
+        }
+        (0..3).all(|channel| maximum[channel].saturating_sub(minimum[channel]) <= 6)
+    }
+
     pub fn capture_client(target: &TargetWindow) -> Result<RgbaImage, PlatformError> {
         let window = HWND(target.handle as *mut c_void);
         let mut rect = RECT::default();
@@ -1071,88 +1417,33 @@ mod windows_impl {
             ));
         }
 
-        let screen_dc = unsafe { GetDC(None) };
-        if screen_dc.is_invalid() {
-            return Err(PlatformError::WindowsApi("无法获取屏幕 DC".to_owned()));
-        }
-        let memory_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
-        if memory_dc.is_invalid() {
-            unsafe { ReleaseDC(None, screen_dc) };
-            return Err(PlatformError::WindowsApi("无法创建内存 DC".to_owned()));
-        }
-        let bitmap = unsafe { CreateCompatibleBitmap(screen_dc, width, height) };
-        if bitmap.is_invalid() {
-            unsafe {
-                let _ = DeleteDC(memory_dc);
-                ReleaseDC(None, screen_dc);
-            }
-            return Err(PlatformError::WindowsApi("无法创建截图位图".to_owned()));
+        // 1) Screen copy is exact whenever the game is visible on screen.
+        let screen = unsafe { capture_from_screen(origin, width, height) };
+        if let Ok(frame) = &screen
+            && !frame_looks_blank(frame)
+        {
+            LAST_CAPTURE_SOURCE.store(SOURCE_SCREEN, std::sync::atomic::Ordering::Relaxed);
+            return screen;
         }
 
-        let previous = unsafe { SelectObject(memory_dc, HGDIOBJ(bitmap.0)) };
-        let copy_result = unsafe {
-            BitBlt(
-                memory_dc,
-                0,
-                0,
-                width,
-                height,
-                Some(screen_dc),
-                origin.x,
-                origin.y,
-                SRCCOPY,
-            )
-        };
-
-        let mut info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width,
-                biHeight: -height,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut pixels = vec![0_u8; width as usize * height as usize * 4];
-        let copied_lines = if copy_result.is_ok() {
-            unsafe {
-                GetDIBits(
-                    memory_dc,
-                    bitmap,
-                    0,
-                    height as u32,
-                    Some(pixels.as_mut_ptr().cast()),
-                    &mut info,
-                    DIB_RGB_COLORS,
-                )
-            }
-        } else {
-            0
-        };
-
-        unsafe {
-            SelectObject(memory_dc, previous);
-            let _ = DeleteObject(HGDIOBJ(bitmap.0));
-            let _ = DeleteDC(memory_dc);
-            ReleaseDC(None, screen_dc);
+        // 2) Window copy covers the "another window is on top" case.
+        if let Ok(frame) = unsafe { capture_from_window(window, width, height) }
+            && !frame_looks_blank(&frame)
+        {
+            LAST_CAPTURE_SOURCE.store(SOURCE_WINDOW, std::sync::atomic::Ordering::Relaxed);
+            return Ok(frame);
         }
 
-        if let Err(error) = copy_result {
-            return Err(PlatformError::WindowsApi(error.to_string()));
-        }
-        if copied_lines != height {
-            return Err(PlatformError::WindowsApi("截图像素读取不完整".to_owned()));
+        // 3) PrintWindow asks the game to render itself, which works for many
+        // DirectX/Unity windows that return black through BitBlt.
+        if let Ok(frame) = unsafe { capture_with_print_window(window, width, height) }
+            && !frame_looks_blank(&frame)
+        {
+            LAST_CAPTURE_SOURCE.store(SOURCE_PRINT_WINDOW, std::sync::atomic::Ordering::Relaxed);
+            return Ok(frame);
         }
 
-        for pixel in pixels.as_chunks_mut::<4>().0 {
-            pixel.swap(0, 2);
-            pixel[3] = 255;
-        }
-        ImageBuffer::from_raw(width as u32, height as u32, pixels)
-            .ok_or_else(|| PlatformError::WindowsApi("无法构造截图图像".to_owned()))
+        screen
     }
 
     unsafe extern "system" fn collect_window(window: HWND, parameter: LPARAM) -> BOOL {

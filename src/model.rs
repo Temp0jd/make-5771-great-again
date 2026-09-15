@@ -43,16 +43,26 @@ pub enum ClickMethod {
     #[default]
     Foreground,
     Background,
+    /// Brings the game to the foreground just for the injected click, then
+    /// restores the previous window. Works for games that read raw input and
+    /// therefore ignore posted window messages.
+    BackgroundFocus,
 }
 
 impl ClickMethod {
-    pub const ALL: [Self; 2] = [Self::Foreground, Self::Background];
+    pub const ALL: [Self; 3] = [Self::Foreground, Self::Background, Self::BackgroundFocus];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Foreground => "前台点击（移动鼠标，兼容性最好）",
-            Self::Background => "后台点击（不动鼠标，部分游戏不响应）",
+            Self::Background => "后台点击（消息注入，不动鼠标；部分游戏不响应）",
+            Self::BackgroundFocus => "后台点击＋临时前台注入（会短暂抢焦点，兼容直读输入的游戏）",
         }
+    }
+
+    /// True for the methods that try to keep the game in the background.
+    pub fn is_background(self) -> bool {
+        matches!(self, Self::Background | Self::BackgroundFocus)
     }
 }
 
@@ -1132,6 +1142,10 @@ pub struct MacroProfile {
     pub adaptive_roi: bool,
     #[serde(default = "default_stable_confirm")]
     pub stable_confirm: bool,
+    /// Keeps recognising and clicking while the game is not the foreground
+    /// window. Background capture needs the window to stay visible on screen.
+    #[serde(default)]
+    pub run_when_unfocused: bool,
     /// Automatic recovery when a step times out (see [`FailureRecovery`]).
     #[serde(default)]
     pub failure_recovery: FailureRecovery,
@@ -1253,6 +1267,7 @@ impl Default for MacroProfile {
             template_scale_mode: TemplateScaleMode::UniformFit,
             adaptive_roi: true,
             stable_confirm: default_stable_confirm(),
+            run_when_unfocused: false,
             sharing: SharingMetadata::default(),
         }
     }
@@ -1622,6 +1637,21 @@ pub enum LogLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_click_methods_and_unfocused_opt_in() {
+        assert_eq!(ClickMethod::ALL.len(), 3);
+        assert!(!ClickMethod::Foreground.is_background());
+        assert!(ClickMethod::Background.is_background());
+        assert!(ClickMethod::BackgroundFocus.is_background());
+        assert!(ClickMethod::BackgroundFocus.label().contains("临时前台"));
+
+        // Legacy packages keep the safe default: stop when the game loses focus.
+        let mut value = serde_json::to_value(MacroProfile::default()).unwrap();
+        value.as_object_mut().unwrap().remove("run_when_unfocused");
+        let legacy: MacroProfile = serde_json::from_value(value).unwrap();
+        assert!(!legacy.run_when_unfocused);
+    }
 
     #[test]
     fn failure_recovery_defaults_and_sanitising() {

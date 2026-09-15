@@ -4307,15 +4307,33 @@ impl Make5771App {
                         .size(11.0)
                         .color(theme::tertiary_label()),
                 );
-                if self.profile.click_method == ClickMethod::Background {
+                if self.profile.click_method.is_background() {
                     ui.label(
-                        RichText::new(
-                            "后台点击不移动鼠标；为防误操作，识别和点击仍只在目标窗口处于前台时执行。",
-                        )
+                        RichText::new(match self.profile.click_method {
+                            ClickMethod::Background => {
+                                "后台点击用消息注入、不移动鼠标；部分游戏（直读输入的类型）不响应，可改用下面的“后台点击＋临时前台注入”。"
+                            }
+                            _ => {
+                                "临时前台注入会短暂把游戏切到前台并移动鼠标，点击后自动还原原来的前台窗口与鼠标位置。"
+                            }
+                        })
                         .size(11.0)
                         .color(theme::orange()),
                     );
                 }
+                ui.horizontal(|ui| {
+                    ui.label("游戏不在前台时也继续识别与点击");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        theme::switch(ui, &mut self.profile.run_when_unfocused);
+                    });
+                });
+                ui.label(
+                    RichText::new(
+                        "默认关闭：失去前台会自动暂停。开启后后台也会识别与点击；后台截图需要窗口保持可见，被其它窗口完全遮住时可能只能截到黑屏。",
+                    )
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+                );
             });
 
             ui.add_space(10.0);
