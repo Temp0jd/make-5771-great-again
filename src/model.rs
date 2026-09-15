@@ -333,6 +333,10 @@ fn default_stop_hotkey() -> String {
     "f8".to_owned()
 }
 
+fn default_skin_id() -> String {
+    crate::theme::DEFAULT_SKIN_ID.to_owned()
+}
+
 fn default_stable_confirm() -> bool {
     true
 }
@@ -1114,6 +1118,9 @@ pub struct MacroProfile {
     pub click_jitter: bool,
     #[serde(default)]
     pub dark_mode: bool,
+    /// Colour scheme id; unknown ids fall back to the default skin.
+    #[serde(default = "default_skin_id")]
+    pub skin_id: String,
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
     #[serde(default = "default_capture_hotkey")]
@@ -1257,6 +1264,7 @@ impl Default for MacroProfile {
             click_method: ClickMethod::default(),
             click_jitter: default_click_jitter(),
             dark_mode: false,
+            skin_id: default_skin_id(),
             ui_scale: default_ui_scale(),
             capture_hotkey: default_capture_hotkey(),
             stop_hotkey: default_stop_hotkey(),

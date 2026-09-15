@@ -311,7 +311,7 @@ impl Make5771App {
         let mut profile =
             storage::load_profile(&storage::default_profile_path()).unwrap_or_default();
         let shared_templates = storage::load_shared_templates();
-        theme::install(&cc.egui_ctx, profile.dark_mode);
+        theme::install(&cc.egui_ctx, &profile.skin_id, profile.dark_mode);
         cc.egui_ctx.set_zoom_factor(profile.ui_scale);
         let target_window = platform::find_target_window(&profile.target_window).ok();
         let has_templates = if profile.shared_templates {
@@ -3967,10 +3967,43 @@ impl Make5771App {
                     ui.label("深色模式");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if theme::switch(ui, &mut self.profile.dark_mode).changed() {
-                            theme::apply(ui.ctx(), self.profile.dark_mode);
+                            theme::apply(ui.ctx(), &self.profile.skin_id, self.profile.dark_mode);
                         }
                     });
                 });
+                ui.horizontal(|ui| {
+                    ui.label("配色皮肤");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let selected = theme::skin(&self.profile.skin_id).name;
+                        egui::ComboBox::from_id_salt("skin-picker")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                for skin in theme::SKINS.iter() {
+                                    let changed = ui
+                                        .selectable_value(
+                                            &mut self.profile.skin_id,
+                                            skin.id.to_owned(),
+                                            skin.name,
+                                        )
+                                        .changed();
+                                    if changed {
+                                        theme::apply(
+                                            ui.ctx(),
+                                            &self.profile.skin_id,
+                                            self.profile.dark_mode,
+                                        );
+                                    }
+                                }
+                            });
+                    });
+                });
+                ui.label(
+                    RichText::new(
+                        "皮肤只改变配色，不会改动角色表情与装饰图；浅色 / 深色开关对每套皮肤都生效。",
+                    )
+                    .size(11.0)
+                    .color(theme::tertiary_label()),
+                );
                 ui.horizontal(|ui| {
                     ui.label("界面缩放");
                     if ui

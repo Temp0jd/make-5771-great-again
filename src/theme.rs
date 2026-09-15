@@ -54,6 +54,144 @@ const DARK: Palette = Palette {
     red: Color32::from_rgb(224, 91, 88),
 };
 
+const ABYSS_LIGHT: Palette = Palette {
+    background: Color32::from_rgb(233, 238, 240),
+    surface: Color32::from_rgb(250, 253, 254),
+    surface_muted: Color32::from_rgb(238, 243, 245),
+    label: Color32::from_rgb(24, 34, 40),
+    secondary_label: Color32::from_rgb(82, 96, 104),
+    tertiary_label: Color32::from_rgb(104, 116, 124),
+    separator: Color32::from_rgb(205, 215, 220),
+    blue: Color32::from_rgb(20, 110, 120),
+    gold: Color32::from_rgb(150, 120, 60),
+    green: Color32::from_rgb(32, 140, 96),
+    orange: Color32::from_rgb(185, 110, 40),
+    purple: Color32::from_rgb(90, 80, 140),
+    red: Color32::from_rgb(185, 60, 60),
+};
+
+const ABYSS_DARK: Palette = Palette {
+    background: Color32::from_rgb(8, 16, 22),
+    surface: Color32::from_rgb(16, 28, 36),
+    surface_muted: Color32::from_rgb(13, 23, 30),
+    label: Color32::from_rgb(235, 242, 244),
+    secondary_label: Color32::from_rgb(168, 182, 190),
+    tertiary_label: Color32::from_rgb(128, 142, 150),
+    separator: Color32::from_rgb(40, 56, 66),
+    blue: Color32::from_rgb(32, 120, 132),
+    gold: Color32::from_rgb(200, 165, 95),
+    green: Color32::from_rgb(60, 180, 120),
+    orange: Color32::from_rgb(215, 140, 70),
+    purple: Color32::from_rgb(135, 120, 185),
+    red: Color32::from_rgb(220, 88, 86),
+};
+
+const APRICOT_LIGHT: Palette = Palette {
+    background: Color32::from_rgb(243, 238, 230),
+    surface: Color32::from_rgb(255, 252, 246),
+    surface_muted: Color32::from_rgb(248, 242, 234),
+    label: Color32::from_rgb(38, 32, 26),
+    secondary_label: Color32::from_rgb(88, 78, 66),
+    tertiary_label: Color32::from_rgb(112, 102, 90),
+    separator: Color32::from_rgb(222, 212, 198),
+    blue: Color32::from_rgb(150, 92, 38),
+    gold: Color32::from_rgb(160, 120, 50),
+    green: Color32::from_rgb(60, 130, 70),
+    orange: Color32::from_rgb(190, 110, 40),
+    purple: Color32::from_rgb(120, 85, 130),
+    red: Color32::from_rgb(180, 70, 60),
+};
+
+const APRICOT_DARK: Palette = Palette {
+    background: Color32::from_rgb(24, 18, 14),
+    surface: Color32::from_rgb(36, 28, 22),
+    surface_muted: Color32::from_rgb(30, 23, 18),
+    label: Color32::from_rgb(245, 238, 230),
+    secondary_label: Color32::from_rgb(186, 174, 160),
+    tertiary_label: Color32::from_rgb(150, 138, 124),
+    separator: Color32::from_rgb(70, 58, 48),
+    blue: Color32::from_rgb(150, 100, 44),
+    gold: Color32::from_rgb(215, 175, 105),
+    green: Color32::from_rgb(110, 170, 90),
+    orange: Color32::from_rgb(215, 140, 70),
+    purple: Color32::from_rgb(165, 130, 175),
+    red: Color32::from_rgb(215, 95, 80),
+};
+
+const CRIMSON_LIGHT: Palette = Palette {
+    background: Color32::from_rgb(240, 235, 237),
+    surface: Color32::from_rgb(253, 250, 251),
+    surface_muted: Color32::from_rgb(246, 240, 242),
+    label: Color32::from_rgb(34, 26, 30),
+    secondary_label: Color32::from_rgb(90, 80, 86),
+    tertiary_label: Color32::from_rgb(114, 102, 108),
+    separator: Color32::from_rgb(218, 206, 211),
+    blue: Color32::from_rgb(150, 50, 60),
+    gold: Color32::from_rgb(165, 120, 55),
+    green: Color32::from_rgb(40, 140, 95),
+    orange: Color32::from_rgb(190, 110, 40),
+    purple: Color32::from_rgb(100, 80, 140),
+    red: Color32::from_rgb(185, 55, 58),
+};
+
+const CRIMSON_DARK: Palette = Palette {
+    background: Color32::from_rgb(16, 10, 14),
+    surface: Color32::from_rgb(28, 18, 24),
+    surface_muted: Color32::from_rgb(22, 14, 19),
+    label: Color32::from_rgb(240, 232, 236),
+    secondary_label: Color32::from_rgb(176, 162, 168),
+    tertiary_label: Color32::from_rgb(152, 138, 146),
+    separator: Color32::from_rgb(58, 42, 50),
+    blue: Color32::from_rgb(190, 70, 80),
+    gold: Color32::from_rgb(205, 165, 95),
+    green: Color32::from_rgb(80, 180, 130),
+    orange: Color32::from_rgb(220, 140, 75),
+    purple: Color32::from_rgb(150, 120, 190),
+    red: Color32::from_rgb(230, 90, 90),
+};
+
+/// A colour scheme. Light and dark are both provided so the appearance switch
+/// keeps working for every skin.
+pub struct Skin {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub light: Palette,
+    pub dark: Palette,
+}
+
+pub const SKINS: [Skin; 4] = [
+    Skin {
+        id: "morimens",
+        name: "弥萨格金（默认）",
+        light: LIGHT,
+        dark: DARK,
+    },
+    Skin {
+        id: "abyss",
+        name: "深海青",
+        light: ABYSS_LIGHT,
+        dark: ABYSS_DARK,
+    },
+    Skin {
+        id: "apricot",
+        name: "杏白暖",
+        light: APRICOT_LIGHT,
+        dark: APRICOT_DARK,
+    },
+    Skin {
+        id: "crimson",
+        name: "暗夜红",
+        light: CRIMSON_LIGHT,
+        dark: CRIMSON_DARK,
+    },
+];
+
+pub const DEFAULT_SKIN_ID: &str = "morimens";
+
+pub fn skin(id: &str) -> &'static Skin {
+    SKINS.iter().find(|skin| skin.id == id).unwrap_or(&SKINS[0])
+}
+
 thread_local! {
     static PALETTE: Cell<Palette> = const { Cell::new(LIGHT) };
     static DARK_MODE: Cell<bool> = const { Cell::new(false) };
@@ -69,20 +207,30 @@ pub fn is_dark() -> bool {
 
 /// Translucent card surface. The alpha stays high enough that labels keep
 /// their contrast even when a background ornament shows through the card.
+fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+fn blend(from: Color32, to: Color32, t: f32) -> Color32 {
+    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    Color32::from_rgb(
+        mix(from.r(), to.r()),
+        mix(from.g(), to.g()),
+        mix(from.b(), to.b()),
+    )
+}
+
+/// Translucent card surface derived from the skin, so every skin keeps the
+/// same glass look while the contrast tests still verify readability.
 pub fn glass_surface() -> Color32 {
-    if is_dark() {
-        Color32::from_rgba_unmultiplied(24, 31, 47, 236)
-    } else {
-        Color32::from_rgba_unmultiplied(253, 252, 248, 242)
-    }
+    with_alpha(palette().surface, if is_dark() { 236 } else { 242 })
 }
 
 pub fn glass_muted() -> Color32 {
-    if is_dark() {
-        Color32::from_rgba_unmultiplied(18, 24, 38, 232)
-    } else {
-        Color32::from_rgba_unmultiplied(246, 244, 238, 238)
-    }
+    with_alpha(
+        blend(palette().surface, palette().background, 0.35),
+        if is_dark() { 234 } else { 238 },
+    )
 }
 
 /// Soft elevation used by content cards. Dark themes need a stronger shadow to
@@ -196,29 +344,28 @@ pub fn red() -> Color32 {
 /// Fill for framed controls (buttons, combo boxes, switches). The muted surface
 /// was too close to the glass cards, so controls such as toggles disappeared.
 pub fn control_fill() -> Color32 {
-    if is_dark() {
-        Color32::from_rgb(45, 55, 73)
-    } else {
-        Color32::from_rgb(231, 229, 221)
-    }
+    let palette = palette();
+    blend(
+        palette.background,
+        palette.label,
+        if is_dark() { 0.10 } else { 0.08 },
+    )
 }
 
 /// Outline for framed controls. Keeps at least 3:1 contrast against the card
 /// surface so the control boundary stays visible (WCAG 1.4.11 non-text).
 pub fn control_border() -> Color32 {
-    if is_dark() {
-        Color32::from_rgb(101, 114, 138)
-    } else {
-        Color32::from_rgb(146, 139, 124)
-    }
+    let palette = palette();
+    blend(palette.separator, palette.label, 0.45)
 }
 
 fn switch_track_off() -> Color32 {
-    if is_dark() {
-        Color32::from_rgb(52, 63, 84)
-    } else {
-        Color32::from_rgb(200, 195, 182)
-    }
+    let palette = palette();
+    blend(
+        palette.background,
+        palette.label,
+        if is_dark() { 0.18 } else { 0.16 },
+    )
 }
 
 /// Always-framed on/off switch.
@@ -226,15 +373,6 @@ fn switch_track_off() -> Color32 {
 /// egui's `toggle_value` paints no frame at all while the value is off, which
 /// made switches such as “深色模式” read as plain text. This variant always
 /// paints a track, an outline and the current state text, and toggles on click.
-fn blend(from: Color32, to: Color32, t: f32) -> Color32 {
-    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
-    Color32::from_rgb(
-        mix(from.r(), to.r()),
-        mix(from.g(), to.g()),
-        mix(from.b(), to.b()),
-    )
-}
-
 pub fn switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
     let on = *value;
     let state_text = if on { "开启" } else { "关闭" };
@@ -354,13 +492,14 @@ pub fn paint_background(painter: &egui::Painter, rect: egui::Rect) {
     }
 }
 
-pub fn install(ctx: &egui::Context, dark: bool) {
+pub fn install(ctx: &egui::Context, skin_id: &str, dark: bool) {
     install_system_font(ctx);
-    apply(ctx, dark);
+    apply(ctx, skin_id, dark);
 }
 
-pub fn apply(ctx: &egui::Context, dark: bool) {
-    let palette = if dark { DARK } else { LIGHT };
+pub fn apply(ctx: &egui::Context, skin_id: &str, dark: bool) {
+    let skin = skin(skin_id);
+    let palette = if dark { skin.dark } else { skin.light };
     PALETTE.with(|current| current.set(palette));
     DARK_MODE.with(|current| current.set(dark));
 
@@ -617,6 +756,49 @@ mod tests {
             assert_eq!(frame.corner_radius, eframe::egui::CornerRadius::same(18));
             assert_ne!(frame.shadow, eframe::egui::epaint::Shadow::NONE);
             assert!(frame.shadow.blur > 0);
+        }
+    }
+
+    #[test]
+    fn every_skin_keeps_text_and_controls_readable() {
+        for skin in super::SKINS.iter() {
+            for dark in [false, true] {
+                let palette = if dark { skin.dark } else { skin.light };
+                super::PALETTE.with(|current| current.set(palette));
+                super::DARK_MODE.with(|current| current.set(dark));
+                let ornament = composite(palette.blue.gamma_multiply(0.06), palette.background);
+                let card = composite(super::glass_surface(), ornament);
+                assert!(
+                    contrast(palette.label, card) >= 7.0,
+                    "skin {} dark={dark}: label",
+                    skin.id
+                );
+                assert!(
+                    contrast(palette.secondary_label, card) >= 4.5,
+                    "skin {} dark={dark}: secondary",
+                    skin.id
+                );
+                assert!(
+                    contrast(palette.tertiary_label, card) >= 4.5,
+                    "skin {} dark={dark}: tertiary",
+                    skin.id
+                );
+                assert!(
+                    contrast(Color32::WHITE, palette.blue) >= 4.5,
+                    "skin {} dark={dark}: action button",
+                    skin.id
+                );
+                assert!(
+                    contrast(super::control_border(), card) >= 3.0,
+                    "skin {} dark={dark}: control border",
+                    skin.id
+                );
+                assert!(
+                    contrast(super::control_fill(), card) >= 1.10,
+                    "skin {} dark={dark}: control fill",
+                    skin.id
+                );
+            }
         }
     }
 
