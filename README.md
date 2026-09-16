@@ -277,6 +277,11 @@ cargo clippy --all-targets
 
 推送 `v*` 标签会自动触发 CI（fmt / clippy / test / 发布构建）并发布 GitHub Release。
 
+## 界面预览
+
+开发时用的无头渲染器会输出程序真实界面的截图（见 [docs/previews/](docs/previews/)：运行页浅色/深色、流程页、设置页），
+用于在无法启动 Windows 程序时核对装饰与排版；`cargo test writes_headless_page_previews` 即可重新生成。
+
 ## 美术素材与版权声明
 
 界面背景会随机显示一张《忘却前夜》角色立绘（半透明、仅左下/右下角，可在「设置 → 界面与外观」关闭或换一张）。

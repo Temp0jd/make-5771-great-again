@@ -321,16 +321,24 @@ const MAX_IN_MEMORY_LOGS: usize = 2000;
 
 impl Make5771App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_context(&cc.egui_ctx)
+    }
+
+    /// Builds the app against a plain egui context.
+    ///
+    /// `new` only ever needs the context, so this is also what the headless
+    /// preview tests drive.
+    pub(crate) fn with_context(ctx: &egui::Context) -> Self {
         let mut profile =
             storage::load_profile(&storage::default_profile_path()).unwrap_or_default();
         let shared_templates = storage::load_shared_templates();
         let applied_dark = if profile.follow_system_dark {
-            cc.egui_ctx.system_theme() == Some(egui::Theme::Dark)
+            ctx.system_theme() == Some(egui::Theme::Dark)
         } else {
             profile.dark_mode
         };
-        theme::install(&cc.egui_ctx, &profile.skin_id, applied_dark);
-        cc.egui_ctx.set_zoom_factor(profile.ui_scale);
+        theme::install(ctx, &profile.skin_id, applied_dark);
+        ctx.set_zoom_factor(profile.ui_scale);
         let target_window = platform::find_target_window(&profile.target_window).ok();
         let has_templates = if profile.shared_templates {
             !shared_templates.is_empty()
@@ -345,11 +353,11 @@ impl Make5771App {
             profile.expected_client_width = target.client_width;
             profile.expected_client_height = target.client_height;
         }
-        let background_art = crate::art::BackgroundArt::load(&cc.egui_ctx);
+        let background_art = crate::art::BackgroundArt::load(ctx);
         let (background_portrait_index, background_portrait_left) =
             pick_background_portrait(&background_art, &profile);
         let repaint_waker: platform::RepaintWaker = {
-            let ctx = cc.egui_ctx.clone();
+            let ctx = ctx.clone();
             std::sync::Arc::new(move || ctx.request_repaint())
         };
         let (hotkey_receiver, hotkey_guard, active_hotkeys, hotkey_error) =
@@ -441,7 +449,7 @@ impl Make5771App {
             last_round_at: None,
             round_durations: std::collections::VecDeque::new(),
             last_run_outcome: RunOutcome::None,
-            mascots: Mascots::new(&cc.egui_ctx),
+            mascots: Mascots::new(ctx),
             thumbs: TemplateThumbs::default(),
             countdown_capture_at: None,
             template_rename: None,
@@ -8892,6 +8900,14 @@ impl eframe::App for Make5771App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render(ui);
+    }
+}
+
+impl Make5771App {
+    /// Paints one full frame; shared by the eframe entry point and the headless
+    /// preview tests.
+    pub(crate) fn render(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
         if ctx.input(|input| input.viewport().close_requested()) {
@@ -9007,34 +9023,54 @@ impl eframe::App for Make5771App {
                     .inner_margin(egui::Margin::symmetric(14, 12)),
             )
             .show(ui, |ui| {
-                theme::paint_background(ui.painter(), ui.max_rect());
-                if self.profile.background_portrait
+                let panel = ui.max_rect();
+                theme::paint_background(ui.painter(), panel);
+                // The portrait gets its own band on one side; the page content is
+                // laid out beside it so the art is never hidden behind cards.
+                let band = crate::art::portrait_band(
+                    panel,
+                    self.background_portrait_left,
+                    self.profile.background_portrait,
+                );
+                if band.width() > 0.0
                     && let Some(portrait) =
                         self.background_art.portrait(self.background_portrait_index)
                 {
                     crate::art::paint_portrait(
                         ui.painter(),
-                        ui.max_rect(),
                         &portrait.texture,
                         self.background_portrait_left,
                         self.profile.background_portrait_strength.alpha(),
+                        band,
                     );
                 }
+                let mut content = panel;
+                if band.width() > 0.0 {
+                    if self.background_portrait_left {
+                        content.min.x = band.max.x + 8.0;
+                    } else {
+                        content.max.x = band.min.x - 8.0;
+                    }
+                }
                 let active_tab = self.active_tab;
-                egui::ScrollArea::vertical()
-                    .id_salt(("main-page", active_tab.label()))
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        match active_tab {
-                            AppTab::Run => self.run_page(ui),
-                            AppTab::Flow => self.flow_page(ui),
-                            AppTab::Templates => self.templates_page(ui),
-                            AppTab::Logs => self.logs_page(ui),
-                            AppTab::Settings => self.settings_page(ui),
-                        }
-                    });
+                ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("main-page", active_tab.label()))
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            match active_tab {
+                                AppTab::Run => self.run_page(ui),
+                                AppTab::Flow => self.flow_page(ui),
+                                AppTab::Templates => self.templates_page(ui),
+                                AppTab::Logs => self.logs_page(ui),
+                                AppTab::Settings => self.settings_page(ui),
+                            }
+                        });
+                });
             });
 
         self.show_window_picker(&ctx);
@@ -9597,6 +9633,149 @@ mod tests {
             egui::DragAndDrop::payload::<usize>(&ctx).as_deref(),
             Some(&0)
         );
+    }
+
+    /// Renders each page of the real UI headlessly and writes a PNG, so the
+    /// decoration and transparency can be reviewed (and handed to the user)
+    /// without a Windows build.
+    /// Renders the portrait as a solid probe colour and checks that it lands in
+    /// the reserved band: this is what proves the art is neither hidden behind
+    /// the page cards nor painted over the content or the navigation bar.
+    #[test]
+    fn portrait_is_painted_inside_its_band() {
+        let ctx = egui::Context::default();
+        let mut app = Make5771App::with_context(&ctx);
+        app.profile.background_portrait = true;
+        app.profile.background_portrait_strength = crate::art::PortraitStrength::Strong;
+        app.background_portrait_left = true;
+        app.background_art
+            .make_solid(&ctx, egui::Color32::from_rgb(255, 0, 255), "probe");
+        app.active_tab = AppTab::Run;
+        let size = [1280usize, 860usize];
+        let mut renderer = crate::preview_render::FrameRenderer::new();
+        let mut image = None;
+        for _ in 0..3 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(size[0] as f32, size[1] as f32),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.render(ui),
+            );
+            image = Some(renderer.draw(&ctx, &output, size));
+        }
+        let image = image.expect("at least one frame is rendered");
+        let mut painted = 0usize;
+        let mut max_x = 0usize;
+        for (x, _, pixel) in image.enumerate_pixels() {
+            // Strongly magenta pixels can only come from the probe texture.
+            if pixel[0] > 150 && pixel[1] < 90 && pixel[2] > 150 {
+                painted += 1;
+                max_x = max_x.max(x as usize);
+            }
+        }
+        // The decorative band sits on the left of the central panel; the page
+        // content starts to its right, so the art must stay left of x = 700.
+        assert!(painted > 5_000, "portrait pixels painted: {painted}");
+        assert!(
+            max_x < 700,
+            "portrait must stay inside its band, painted up to x={max_x}"
+        );
+    }
+
+    #[test]
+    fn writes_headless_page_previews() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx, "morimens", true);
+        let mut app = Make5771App::with_context(&ctx);
+        app.profile.background_portrait = true;
+        app.profile.background_portrait_strength = crate::art::PortraitStrength::Medium;
+        let size = [1280usize, 860usize];
+        let preview_dir = std::path::Path::new("target/preview");
+        std::fs::create_dir_all(preview_dir).unwrap();
+        // Real frames of the shipped UI are kept next to the docs so changes to
+        // the decoration can be reviewed without a Windows build.
+        let docs_dir = std::path::Path::new("docs/previews");
+        std::fs::create_dir_all(docs_dir).unwrap();
+        let mut renderer = crate::preview_render::FrameRenderer::new();
+
+        // Animations settle after a couple of frames, and both variants must be
+        // captured at the same settled frame index for the comparison to mean
+        // anything.
+        for (tab, name) in [
+            (AppTab::Run, "run"),
+            (AppTab::Flow, "flow"),
+            (AppTab::Templates, "templates"),
+            (AppTab::Logs, "logs"),
+            (AppTab::Settings, "settings"),
+        ] {
+            app.active_tab = tab;
+            for portrait in [true, false] {
+                // The layout is identical in both variants: only the art itself
+                // is removed, so the comparison isolates the portrait.
+                // The flag stays on in both variants so the reserved band (and
+                // therefore the page layout) is identical; only the artwork is
+                // swapped out.
+                app.profile.background_portrait = true;
+                if portrait {
+                    app.background_art = crate::art::BackgroundArt::load(&ctx);
+                } else {
+                    app.background_art
+                        .make_solid(&ctx, egui::Color32::TRANSPARENT, "transparent");
+                }
+                let mut image = None;
+                for _ in 0..3 {
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                Vec2::new(size[0] as f32, size[1] as f32),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| app.render(ui),
+                    );
+                    image = Some(renderer.draw(&ctx, &output, size));
+                }
+                let suffix = if portrait { "" } else { "-plain" };
+                let image = image.expect("at least one frame is rendered");
+                image
+                    .save(preview_dir.join(format!("{name}{suffix}.png")))
+                    .unwrap();
+                if portrait && matches!(tab, AppTab::Run | AppTab::Flow | AppTab::Settings) {
+                    image.save(docs_dir.join(format!("{name}.png"))).unwrap();
+                }
+            }
+            app.profile.background_portrait = true;
+            app.background_art = crate::art::BackgroundArt::load(&ctx);
+        }
+
+        // A dark frame as well, because that is what most users run.
+        app.profile.dark_mode = true;
+        app.applied_dark = true;
+        theme::install(&ctx, &app.profile.skin_id, true);
+        app.active_tab = AppTab::Run;
+        let mut image = None;
+        for _ in 0..3 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(size[0] as f32, size[1] as f32),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.render(ui),
+            );
+            image = Some(renderer.draw(&ctx, &output, size));
+        }
+        image
+            .expect("at least one frame is rendered")
+            .save(docs_dir.join("run-dark.png"))
+            .unwrap();
     }
 
     #[test]

@@ -6,6 +6,8 @@ mod economy;
 mod mascot;
 mod model;
 mod platform;
+#[cfg(test)]
+mod preview_render;
 mod runner;
 mod storage;
 mod subflow;
